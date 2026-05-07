@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.2.0 — 2026-05-07 (M15.27 — plugin contract stdio loop)
+
+The extension is no longer HTTP-only. It now drives the canonical
+[Phase 81.5 plugin contract](https://github.com/lordmacu/nexo-rs/blob/main/nexo-plugin-contract.md):
+the daemon's plugin discovery walker spawns `nexo-marketing` as a
+subprocess, hands it `tool.invoke` requests over JSON-RPC stdio,
+and routes `plugin.inbound.email.*` broker events into the
+inbound decoder.
+
+The HTTP loopback admin (consumed by the agent-creator microapp's
+`/api/marketing/*` proxy) keeps running alongside on the same
+process — both surfaces share the same per-tenant `LeadStore`.
+
+### Implemented
+
+- New `src/plugin/` module:
+  - `tool_defs.rs` — 6 `ToolDef` entries (`marketing_lead_*`)
+    with strict JSON Schema for the LLM tool catalogue. Lockstep
+    test asserts manifest names == defs == `TOOL_NAMES`.
+  - `dispatch.rs` — single dispatch closure routing by
+    `tool_name` to the existing `crate::tools::*::handle`
+    handlers. Maps `ToolError → ToolInvocationError` per the
+    `-33401..-33405` band; future `#[non_exhaustive]` variants
+    fall through to `ExecutionFailed`.
+  - `broker.rs` — `plugin.inbound.email.*` subscriber. Decodes
+    the email-plugin `InboundEvent` payload via a private
+    deserialise mirror (avoids depending on the email plugin
+    crate), runs `decode_inbound_email`, then either creates a
+    cold lead or bumps the existing thread's activity. Full
+    resolver → router pipeline lands in M22.
+- `src/main.rs` rewritten:
+  - Drives `PluginAdapter::new(MANIFEST).declare_tools(...)
+    .on_tool(...).on_broker_event(...).run_stdio()`.
+  - HTTP admin moved into `tokio::spawn` so the main task owns
+    stdio (the daemon kills the subprocess if stdout closes).
+  - `PluginDeps` shared struct holds `(tenant_id, lead_store,
+    router)`.
+- 13 new unit tests:
+  - 4 `tool_defs.rs` (count match, name match, schema=object,
+    every def requires tenant_id).
+  - 4 `dispatch.rs` (unknown→NotFound, invalid args→
+    ArgumentInvalid, cross-tenant→inline `ok:false`,
+    followup_sweep wires the store).
+  - 5 `broker.rs` (off-topic→Skipped, malformed→Malformed,
+    cold→LeadCreated, repeat→LeadUpdated, bare topic accepted).
+
+### SDK lift
+
+`nexo_microapp_sdk::BrokerEvent` re-exports `nexo_broker::Event`
+so plugin authors don't need to add `nexo-broker` directly. Two
+lines in `proyecto/crates/microapp-sdk/src/lib.rs`.
+
+### Test count
+
+138 unit + 8 cross-tenant + 6 outbound + **13 plugin** =
+**165 green** (was 152).
+
+### Operator note
+
+No operator action required. The dev-daemon path keeps working
+unchanged — the daemon discovers the plugin via the existing
+`nexo-plugin.toml` and handshakes over stdio automatically. The
+HTTP admin port stays at `${MARKETING_HTTP_PORT}` (default
+18766) for the agent-creator UI.
+
 ## 0.1.0 — 2026-05-07
 
 First end-to-end build of the marketing extension. Subprocess

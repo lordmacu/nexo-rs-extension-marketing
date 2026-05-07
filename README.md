@@ -14,20 +14,34 @@ plugin per the [Phase 81.5 plugin contract][contract].
 
 ## Status
 
-✅ **End-to-end pipeline shipped (v0.1.0).**
+✅ **End-to-end plugin shipped (v0.2.0).**
 
-M15 milestones A–I landed: lead state machine + per-tenant
-sqlite store, identity resolver with 5 fallback adapters,
-corporate domain scraper, broker decoder + outbound
-publisher, 6 tool handlers, compliance gate (anti-loop +
-opt-out + PII redactor + rate-limit), HTTP admin axum
-router, agent-creator microapp proxy, and a release-blocker
-cross-tenant isolation suite (8 assertions green).
+The extension is now a real Phase 81.5 plugin: the daemon
+spawns `nexo-marketing` as a subprocess, hands it `tool.invoke`
+calls over JSON-RPC stdio, and routes `plugin.inbound.email.*`
+broker events through to the inbound decoder. The HTTP loopback
+admin (consumed by the agent-creator microapp) keeps running
+alongside on the same process.
 
-**152/152 tests** green (138 unit + 8 integration + 6
-microapp proxy).
+M15 milestones A–I + M15.27 (plugin contract):
+- Lead state machine + per-tenant sqlite store
+- Identity resolver with 5 fallback adapters
+- Corporate domain scraper + 75-personal / 30-disposable list
+- Inbound decoder + outbound publisher with idempotency
+- 6 tool handlers exposed via `marketing_lead_*` (LLM-callable
+  through the daemon's tool catalogue)
+- Compliance gate: anti-loop + opt-out + PII redactor +
+  per-recipient rate-limit
+- HTTP admin axum router → microapp proxy
+- Cross-tenant isolation suite (8 assertions, release-blocker)
+- **Stdio JSON-RPC plugin contract** + broker subscriber
+
+**165/165 tests** green (138 unit + 8 cross-tenant + 6
+microapp proxy + 13 plugin).
 
 Pending follow-ups:
+- Resolver + router fully wired into the broker hop (cold
+  lead today is a placeholder; M22 plumbs the resolver chain).
 - CRUD admin endpoints for rules / mailboxes / vendedores /
   followup_profiles (need YAML write helpers).
 - SSE firehose `/firehose` → tenant-scoped

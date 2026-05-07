@@ -26,6 +26,7 @@ pub mod enrichment;
 pub mod error;
 pub mod identity;
 pub mod lead;
+pub mod plugin;
 pub mod tenant;
 pub mod tools;
 
