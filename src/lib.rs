@@ -24,6 +24,7 @@ pub mod broker;
 pub mod compliance;
 pub mod enrichment;
 pub mod error;
+pub mod firehose;
 pub mod identity;
 pub mod lead;
 pub mod plugin;

@@ -26,6 +26,7 @@ use std::sync::Arc;
 use anyhow::Context;
 
 use nexo_marketing::admin::{self, AdminState};
+use nexo_marketing::firehose::LeadEventBus;
 use nexo_marketing::identity::adapters::{
     display_name::DisplayNameParser, reply_to::ReplyToReader,
 };
@@ -119,8 +120,18 @@ async fn main() -> anyhow::Result<()> {
     let plugin_deps = PluginDeps::new(tenant.clone(), lead_store.clone(), router.clone())
         .with_identity(identity.clone());
 
+    // ─── Lead lifecycle bus (firehose) ────────────────────────
+    // Shared between the broker handler (producer) and the
+    // `/firehose` SSE route (consumer). Same Arc instance —
+    // otherwise events vanish into a parallel universe.
+    let firehose_bus = Arc::new(LeadEventBus::new());
+
     // ─── Surface 1: HTTP admin ────────────────────────────────
-    let admin_state = Arc::new(AdminState::new(bearer).with_store(lead_store.clone()));
+    let admin_state = Arc::new(
+        AdminState::new(bearer)
+            .with_store(lead_store.clone())
+            .with_firehose(firehose_bus.clone()),
+    );
     let app = admin::router(admin_state);
     let bind = format!("{DEFAULT_BIND}:{port}");
     let addr: SocketAddr = bind.parse().context("parse bind addr")?;
@@ -140,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
     let broker_router = router.clone();
     let broker_identity = identity.clone();
     let broker_tenant = tenant.clone();
+    let broker_firehose = firehose_bus.clone();
     PluginAdapter::new(MANIFEST)?
         .with_server_version(version)
         .declare_tools(marketing_tool_defs())
@@ -153,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
                 let router = broker_router.clone();
                 let identity = broker_identity.clone();
                 let tenant = broker_tenant.clone();
+                let firehose = broker_firehose.clone();
                 async move {
                     let _ = handle_inbound_event(
                         &topic,
@@ -161,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
                         &store,
                         Some(&router),
                         Some(&identity),
+                        Some(firehose.as_ref()),
                         Some(broker),
                     )
                     .await;

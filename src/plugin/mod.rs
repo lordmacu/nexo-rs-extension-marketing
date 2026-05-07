@@ -18,6 +18,7 @@ use std::sync::Arc;
 use nexo_microapp_sdk::enrichment::FallbackChain;
 use nexo_microapp_sdk::identity::{PersonEmailStore, PersonStore};
 
+use crate::firehose::LeadEventBus;
 use crate::lead::{LeadRouter, LeadStore};
 use crate::tenant::TenantId;
 

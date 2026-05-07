@@ -18,10 +18,12 @@ use std::sync::Arc;
 use axum::routing::get;
 use axum::Router;
 
+use crate::firehose::LeadEventBus;
 use crate::lead::LeadStore;
 use crate::tenant::TenantId;
 
 pub mod auth;
+pub mod firehose;
 pub mod healthz;
 pub mod leads;
 
@@ -33,6 +35,11 @@ pub use auth::{require_tenant_id, AuthState, AUTH_HEADER, TENANT_HEADER};
 pub struct AdminState {
     pub bearer_token: String,
     pub stores: HashMap<TenantId, Arc<LeadStore>>,
+    /// Lead lifecycle broadcast bus consumed by `/firehose`.
+    /// Default is a no-op bus (zero subscribers, publishes
+    /// drop silently) so unit tests + the older HTTP-only path
+    /// keep compiling without explicit wiring.
+    pub firehose: Arc<LeadEventBus>,
 }
 
 impl AdminState {
@@ -40,12 +47,22 @@ impl AdminState {
         Self {
             bearer_token,
             stores: HashMap::new(),
+            firehose: Arc::new(LeadEventBus::new()),
         }
     }
 
     pub fn with_store(mut self, store: Arc<LeadStore>) -> Self {
         self.stores
             .insert(store.tenant_id().clone(), store);
+        self
+    }
+
+    /// Inject the shared `LeadEventBus`. The broker handler +
+    /// the `/firehose` SSE route MUST resolve to the same bus
+    /// instance — call this with the same Arc the broker
+    /// captured at boot.
+    pub fn with_firehose(mut self, firehose: Arc<LeadEventBus>) -> Self {
+        self.firehose = firehose;
         self
     }
 
@@ -66,6 +83,7 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/healthz", get(healthz::handler))
         .route("/leads", get(leads::list_handler))
         .route("/leads/:lead_id", get(leads::get_handler))
+        .route("/firehose", get(firehose::handler))
         .layer(auth_layer)
         .with_state(state)
 }

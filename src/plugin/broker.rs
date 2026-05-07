@@ -39,6 +39,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::broker::inbound::{decode_inbound_email, ParseError, ParsedInbound};
+use crate::firehose::{LeadEventBus, LeadFirehoseEvent};
 use crate::lead::{LeadRouter, LeadStore, NewLead, RouteInputs, RouteOutcome};
 use crate::plugin::IdentityDeps;
 use crate::tenant::TenantId;
@@ -312,6 +313,7 @@ pub async fn handle_inbound_event(
     store: &LeadStore,
     router: Option<&LeadRouter>,
     identity: Option<&IdentityDeps>,
+    firehose: Option<&LeadEventBus>,
     _broker: Option<BrokerSender>,
 ) -> HandledOutcome {
     if !topic.starts_with("plugin.inbound.email.") && topic != "plugin.inbound.email" {
@@ -366,6 +368,14 @@ pub async fn handle_inbound_event(
             thread_id = %parsed.thread_id,
             "inbound on existing thread"
         );
+        if let Some(bus) = firehose {
+            bus.publish(LeadFirehoseEvent::ThreadBumped {
+                tenant_id: nexo_tool_meta::marketing::TenantIdRef(tenant_id.as_str().into()),
+                lead_id: lead.id.clone(),
+                thread_id: parsed.thread_id.clone(),
+                at_ms: Utc::now().timestamp_millis(),
+            });
+        }
         return HandledOutcome::LeadUpdated {
             lead_id: lead.id.clone(),
             thread_id: parsed.thread_id,
@@ -441,6 +451,21 @@ pub async fn handle_inbound_event(
                 resolver = %resolver_source,
                 "created cold lead from inbound email"
             );
+            if let Some(bus) = firehose {
+                bus.publish(LeadFirehoseEvent::Created {
+                    tenant_id: nexo_tool_meta::marketing::TenantIdRef(
+                        tenant_id.as_str().into(),
+                    ),
+                    lead_id: lead.id.clone(),
+                    thread_id: parsed.thread_id.clone(),
+                    subject: parsed.subject.clone(),
+                    from_email: parsed.from_email.clone(),
+                    vendedor_id: lead.vendedor_id.0.clone(),
+                    state: lead.state,
+                    at_ms: now_ms,
+                    why_routed: lead.why_routed.clone(),
+                });
+            }
             HandledOutcome::LeadCreated {
                 lead_id: lead.id,
                 thread_id: parsed.thread_id,
@@ -555,6 +580,7 @@ mod tests {
             Some(&router),
             Some(&identity),
             None,
+            None,
         )
         .await;
         assert_eq!(out, HandledOutcome::Skipped);
@@ -572,6 +598,7 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
             None,
         )
         .await;
@@ -596,6 +623,7 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
             None,
         )
         .await;
@@ -658,6 +686,7 @@ mod tests {
             Some(&router),
             Some(&identity),
             None,
+            None,
         )
         .await;
         assert!(
@@ -691,6 +720,7 @@ mod tests {
             Some(&router),
             Some(&identity),
             None,
+            None,
         )
         .await;
         let HandledOutcome::LeadCreated {
@@ -706,6 +736,7 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
             None,
         )
         .await;
@@ -740,11 +771,107 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(
             matches!(out, HandledOutcome::LeadCreated { .. }),
             "expected LeadCreated even without identity/router, got {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_thread_publishes_created_event_to_bus() {
+        // Wire a firehose bus and assert the Created frame
+        // lands on the subscriber. End-to-end check that the
+        // broker hop actually writes to the bus.
+        let (store, tenant) = fresh_store("acme").await;
+        let router = unassigned_router(&tenant);
+        let identity = fresh_identity().await;
+        let bus = LeadEventBus::new();
+        let mut rx = bus.subscribe();
+        let payload = json!({
+            "account_id": "acct-1",
+            "instance": "default",
+            "uid": 7_u32,
+            "raw_bytes": raw_email(),
+        });
+        let out = handle_inbound_event(
+            "plugin.inbound.email.default",
+            payload,
+            &tenant,
+            &store,
+            Some(&router),
+            Some(&identity),
+            Some(&bus),
+            None,
+        )
+        .await;
+        assert!(matches!(out, HandledOutcome::LeadCreated { .. }));
+        let frame = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("frame should arrive within 200ms")
+            .expect("recv ok");
+        match frame {
+            LeadFirehoseEvent::Created {
+                tenant_id,
+                from_email,
+                state,
+                ..
+            } => {
+                assert_eq!(tenant_id.0, "acme");
+                assert_eq!(from_email, "cliente@empresa.com");
+                assert_eq!(state, nexo_tool_meta::marketing::LeadState::Cold);
+            }
+            other => panic!("expected Created, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn second_inbound_publishes_thread_bumped_event() {
+        let (store, tenant) = fresh_store("acme").await;
+        let router = unassigned_router(&tenant);
+        let identity = fresh_identity().await;
+        let bus = LeadEventBus::new();
+        let mut rx = bus.subscribe();
+        let payload = json!({
+            "account_id": "acct-1",
+            "instance": "default",
+            "uid": 7_u32,
+            "raw_bytes": raw_email(),
+        });
+        // Prime: first inbound creates the lead → Created frame.
+        let _ = handle_inbound_event(
+            "plugin.inbound.email.default",
+            payload.clone(),
+            &tenant,
+            &store,
+            Some(&router),
+            Some(&identity),
+            Some(&bus),
+            None,
+        )
+        .await;
+        let _consume_created = rx.recv().await;
+        // Second inbound on the same thread → ThreadBumped frame.
+        let _ = handle_inbound_event(
+            "plugin.inbound.email.default",
+            payload,
+            &tenant,
+            &store,
+            Some(&router),
+            Some(&identity),
+            Some(&bus),
+            None,
+        )
+        .await;
+        let bumped = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("frame should arrive")
+            .expect("recv ok");
+        assert!(
+            matches!(bumped, LeadFirehoseEvent::ThreadBumped { .. }),
+            "expected ThreadBumped, got {bumped:?}"
         );
     }
 }

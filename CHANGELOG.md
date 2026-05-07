@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.4.0 — 2026-05-07 (M15.29 — SSE firehose for lead lifecycle)
+
+The extension now publishes a `/firehose` SSE stream of lead
+lifecycle events tagged by tenant. The agent-creator microapp's
+operator UI subscribes (next commit) so the inbox refreshes
+without polling. Stream uses the existing
+`nexo-microapp-http::sse::sse_filtered_broadcast` helper —
+zero new framework code.
+
+### Implemented
+
+- New `src/firehose/mod.rs`:
+  - `LeadFirehoseEvent` tagged enum with `Created`,
+    `ThreadBumped`, `Transitioned` variants. Each frame
+    carries `tenant_id` for the SSE filter.
+  - `LeadEventBus` wraps `tokio::sync::broadcast::Sender`
+    (256-frame buffer) with `publish` + `subscribe` +
+    `receiver_count` helpers.
+  - 6 unit tests covering empty publish, subscriber receive,
+    every-variant tenant accessor, receiver count, lagged path,
+    JSON wire shape (`kind` discriminator).
+- New `src/admin/firehose.rs`:
+  - `GET /firehose` SSE handler bound under the existing
+    bearer + `X-Tenant-Id` middleware. Filters every frame by
+    the auth-stamped tenant — cross-tenant peeking is
+    impossible by construction.
+  - `LaggedBehavior::Emit { event_name: "lagged" }` so the UI
+    can reconcile via REST when frames overflow the buffer.
+  - 3 unit tests: missing bearer → 401, unmounted tenant →
+    403, end-to-end stream filters out other-tenant frames.
+- `AdminState` gains `firehose: Arc<LeadEventBus>` (default-
+  initialised) + `with_firehose` builder. Constructor stays
+  source-compat.
+- `plugin/broker.rs` publishes:
+  - `LeadFirehoseEvent::Created` on cold-thread lead create.
+  - `LeadFirehoseEvent::ThreadBumped` on existing-thread
+    inbound. Both gated on the optional bus param so tests
+    can opt out cheaply.
+- `main.rs` shares one Arc<LeadEventBus> between the broker
+  closure (producer) and the AdminState (consumer surface).
+- `handle_inbound_event` signature gains
+  `firehose: Option<&LeadEventBus>` (8 args now).
+- 2 broker tests for the publish path: `cold_thread_publishes_
+  created_event_to_bus` + `second_inbound_publishes_thread_
+  bumped_event`.
+
+### Test count
+
+138 unit + 8 cross-tenant + 6 microapp proxy + **25 plugin /
+firehose / admin** = **177 green** (was 166).
+
+### Operator note
+
+`scripts/dev-daemon.sh` — no changes; the SSE endpoint
+auto-mounts under the existing admin port. Microapp wiring
+(SSE proxy + frontend EventSource subscription) lands next.
+
 ## 0.3.0 — 2026-05-07 (M15.28 — resolver + router wired into broker hop)
 
 The broker hop is no longer placeholder-only. Each
