@@ -19,6 +19,12 @@
 //! surface is intentionally tiny: the binary is the entry
 //! point, modules are wiring details.
 
+pub mod error;
+pub mod tenant;
+
+pub use error::MarketingError;
+pub use tenant::{TenantId, TenantIdError};
+
 /// Initialise process-wide tracing. Levels read from
 /// `RUST_LOG`; defaults to `info` when unset. Idempotent —
 /// safe to call multiple times.
