@@ -1,0 +1,10 @@
+/target
+/Cargo.lock
+*.db
+*.db-shm
+*.db-wal
+.dev-state/
+.logs/
+*.swp
+*.swo
+.DS_Store
