@@ -14,14 +14,27 @@ plugin per the [Phase 81.5 plugin contract][contract].
 
 ## Status
 
-🚧 **Scaffolded — not feature-complete.**
+✅ **End-to-end pipeline shipped (v0.1.0).**
 
-Phase 0 of the M15 milestone (see
-`agent-creator-microapp/proyecto/PHASES.md` for the 41
-sub-phases). The binary builds + emits a "scaffold only" log
-line; the handshake loop, tool dispatch, broker subscribers,
-identity resolver, scraper, lead store, routing engine, and
-HTTP admin land in subsequent commits.
+M15 milestones A–I landed: lead state machine + per-tenant
+sqlite store, identity resolver with 5 fallback adapters,
+corporate domain scraper, broker decoder + outbound
+publisher, 6 tool handlers, compliance gate (anti-loop +
+opt-out + PII redactor + rate-limit), HTTP admin axum
+router, agent-creator microapp proxy, and a release-blocker
+cross-tenant isolation suite (8 assertions green).
+
+**152/152 tests** green (138 unit + 8 integration + 6
+microapp proxy).
+
+Pending follow-ups:
+- CRUD admin endpoints for rules / mailboxes / vendedores /
+  followup_profiles (need YAML write helpers).
+- SSE firehose `/firehose` → tenant-scoped
+  `agent.lead.transition.*`.
+- E2E smoke against a fake IMAP server (`testcontainers`).
+- `cargo install` from crates.io once the framework SDK lifts
+  publish (currently consumes nexo-microapp-sdk via path).
 
 ## Installation (planned)
 
