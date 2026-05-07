@@ -25,6 +25,7 @@ pub mod error;
 pub mod identity;
 pub mod lead;
 pub mod tenant;
+pub mod tools;
 
 pub use error::MarketingError;
 pub use tenant::{TenantId, TenantIdError};
