@@ -13,6 +13,7 @@
 //! extension hasn't been provisioned for.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::routing::get;
@@ -23,6 +24,7 @@ use crate::lead::LeadStore;
 use crate::tenant::TenantId;
 
 pub mod auth;
+pub mod config;
 pub mod firehose;
 pub mod healthz;
 pub mod leads;
@@ -40,6 +42,11 @@ pub struct AdminState {
     /// drop silently) so unit tests + the older HTTP-only path
     /// keep compiling without explicit wiring.
     pub firehose: Arc<LeadEventBus>,
+    /// Where the per-tenant YAML config files live. Set via
+    /// `with_state_root`; the GET `/config/*` endpoints read
+    /// from `<state_root>/marketing/<tenant_id>/<file>.yaml`.
+    /// Empty → endpoints surface `config_state_root_not_set`.
+    pub state_root: Option<PathBuf>,
 }
 
 impl AdminState {
@@ -48,6 +55,7 @@ impl AdminState {
             bearer_token,
             stores: HashMap::new(),
             firehose: Arc::new(LeadEventBus::new()),
+            state_root: None,
         }
     }
 
@@ -63,6 +71,15 @@ impl AdminState {
     /// captured at boot.
     pub fn with_firehose(mut self, firehose: Arc<LeadEventBus>) -> Self {
         self.firehose = firehose;
+        self
+    }
+
+    /// Set the state root used by the `/config/*` endpoints.
+    /// Call once at boot with the same path the lead store
+    /// + identity DB use; the YAML loaders compute the
+    /// per-tenant subdir internally.
+    pub fn with_state_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.state_root = Some(root.into());
         self
     }
 
@@ -84,6 +101,13 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/leads", get(leads::list_handler))
         .route("/leads/:lead_id", get(leads::get_handler))
         .route("/leads/:lead_id/thread", get(leads::thread_handler))
+        .route("/config/mailboxes", get(config::list_mailboxes))
+        .route("/config/vendedores", get(config::list_vendedores))
+        .route("/config/rules", get(config::get_rules))
+        .route(
+            "/config/followup_profiles",
+            get(config::list_followup_profiles),
+        )
         .route("/firehose", get(firehose::handler))
         .layer(auth_layer)
         .with_state(state)

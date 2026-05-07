@@ -130,7 +130,8 @@ async fn main() -> anyhow::Result<()> {
     let admin_state = Arc::new(
         AdminState::new(bearer)
             .with_store(lead_store.clone())
-            .with_firehose(firehose_bus.clone()),
+            .with_firehose(firehose_bus.clone())
+            .with_state_root(state_root.clone()),
     );
     let app = admin::router(admin_state);
     let bind = format!("{DEFAULT_BIND}:{port}");

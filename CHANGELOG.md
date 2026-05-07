@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.6.0 — 2026-05-07 (M15.31 — read-only YAML config endpoints)
+
+The 4 admin Settings tabs in the agent-creator microapp now
+render real per-tenant YAML data instead of mock fixtures.
+Read-only at this milestone; PUT endpoints + YAML write
+helpers land in M15.32.
+
+### Implemented
+
+- New `src/config/mod.rs`:
+  - `load_mailboxes` / `load_vendedores` /
+    `load_followup_profiles` — generic `load_yaml_list<T>`
+    over `<state_root>/marketing/<tenant_id>/<file>.yaml`.
+  - Missing file → empty `Vec<T>` (operator hasn't
+    configured yet).
+  - Parse failures surface as `MarketingError::Config` so
+    the admin layer 500s with a typed body.
+  - 6 unit tests: missing file, vendedor / mailbox /
+    followup round-trips, parse error typed, cross-tenant
+    isolation via path.
+- New `src/admin/config.rs`:
+  - 4 `GET /config/{mailboxes|vendedores|rules|followup_profiles}`
+    handlers under the existing bearer + `X-Tenant-Id`
+    middleware.
+  - `state_root_missing` typed 500 surface so misconfigured
+    deployments don't return undefined behaviour.
+  - 5 admin tests: missing files → empty lists, rules
+    default-drop, vendedores YAML renders, parse error
+    surfaces typed code, missing state root → typed 500.
+- `AdminState::with_state_root` builder + `state_root: Option<PathBuf>`
+  field; `main.rs` calls it with the same root used for the
+  lead store + identity DB.
+- `Cargo.toml` adds `serde_yaml = "0.9"` (was a transitive
+  dep through the SDK; pinning explicitly so the loader is
+  self-contained).
+
+### Test count
+
+138 unit + 8 cross-tenant + 6 microapp proxy + 25 plugin /
+firehose / admin + 7 thread + **11 config (6 loader + 5
+admin)** = **195 green** (was 184).
+
 ## 0.5.0 — 2026-05-07 (M15.30 — thread persistence + endpoint)
 
 The lead store now persists thread messages — every inbound

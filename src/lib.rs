@@ -22,6 +22,7 @@
 pub mod admin;
 pub mod broker;
 pub mod compliance;
+pub mod config;
 pub mod enrichment;
 pub mod error;
 pub mod firehose;
