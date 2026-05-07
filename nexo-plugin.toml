@@ -1,0 +1,64 @@
+# Out-of-tree subprocess plugin manifest.
+# See nexo-rs/nexo-plugin-contract.md for the wire spec.
+
+[plugin]
+id = "marketing"
+version = "0.1.0"
+name = "Marketing CRM"
+description = "Email marketing extension for Nexo agents — multi-tenant CRM-lite (lead state, identity resolution, AI drafts, routing rules)."
+min_nexo_version = ">=0.1.0"
+
+[plugin.requires]
+# `broker` — extension subscribes to plugin.inbound.email.* and
+#            publishes plugin.outbound.email.* + agent.lead.transition.*
+# `memory` — long-term store for thread history + scraper cache TTL
+nexo_capabilities = ["broker", "memory"]
+
+[plugin.entrypoint]
+# Daemon resolves this relative to the manifest's containing
+# directory. Operators install the binary next to this manifest.
+command = "./bin/nexo-marketing"
+
+[plugin.extends]
+# 6 tools advertised in the initialize-reply. Daemon kills the
+# subprocess at handshake if any name advertised by the binary
+# is NOT in this list (out-of-tree-binary defense, Phase 81.29).
+tools = [
+    "marketing_lead_profile",
+    "marketing_lead_route",
+    "marketing_lead_schedule_followup",
+    "marketing_lead_mark_qualified",
+    "marketing_lead_detect_meeting_intent",
+    "marketing_lead_followup_sweep",
+]
+
+[plugin.subscriptions]
+# NATS subjects the daemon's broker should forward to this
+# plugin's stdin. Pattern matches every email plugin instance
+# the operator wires (per-empresa mailboxes).
+broker_topics = [
+    "plugin.inbound.email.*",
+]
+
+[plugin.sandbox]
+# Phase 81.22 bubblewrap-based v1. The scraper needs network
+# egress for corporate domain enrichment, so network = "host".
+# We do NOT need user-namespace isolation (no nested sandbox
+# inside us), so drop_user can stay default.
+enabled = true
+network = "host"
+fs_read_paths = []
+# Per-tenant sqlite + YAML config live under the daemon's
+# extension state root.
+fs_write_paths = ["${NEXO_EXTENSION_STATE_ROOT}/marketing"]
+
+[plugin.http_server]
+# Loopback admin API consumed by the agent-creator microapp's
+# /api/marketing/* proxy. Bearer auth via env; the microapp
+# stamps X-Tenant-Id from its own bearer auth context so the
+# extension never trusts client-supplied tenant ids.
+port_env     = "MARKETING_HTTP_PORT"
+default_port = 18766
+bind         = "127.0.0.1"
+token_env    = "MARKETING_ADMIN_TOKEN"
+health_path  = "/healthz"
