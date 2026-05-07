@@ -20,6 +20,7 @@
 //! point, modules are wiring details.
 
 pub mod error;
+pub mod identity;
 pub mod lead;
 pub mod tenant;
 
