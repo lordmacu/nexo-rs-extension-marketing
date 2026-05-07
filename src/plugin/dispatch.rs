@@ -61,7 +61,7 @@ pub async fn dispatch(
     let result = match inv.tool_name.as_str() {
         "marketing_lead_profile" => tools::lead_profile::handle(tenant, inv.args).await,
         "marketing_lead_route" => {
-            tools::lead_route::handle(tenant, deps.router.clone(), inv.args).await
+            tools::lead_route::handle(tenant, deps.router.load_full(), inv.args).await
         }
         "marketing_lead_schedule_followup" => {
             tools::lead_schedule_followup::handle(tenant, deps.lead_store.clone(), inv.args).await
@@ -91,7 +91,7 @@ mod tests {
     use nexo_tool_meta::marketing::{RuleSet, TenantIdRef};
     use serde_json::json;
 
-    use crate::lead::{LeadRouter, LeadStore};
+    use crate::lead::{router_handle, LeadRouter, LeadStore};
     use crate::tenant::TenantId;
 
     async fn deps_for(tenant_id: &str) -> PluginDeps {
@@ -107,7 +107,7 @@ mod tests {
             rules: Vec::new(),
             default_target: nexo_tool_meta::marketing::AssignTarget::Drop,
         };
-        let router = Arc::new(LeadRouter::new(tenant.clone(), rule_set));
+        let router = router_handle(LeadRouter::new(tenant.clone(), rule_set));
         PluginDeps::new(tenant, store, router)
     }
 

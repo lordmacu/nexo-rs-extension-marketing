@@ -28,6 +28,7 @@ use crate::config::{
 };
 use crate::error::MarketingError;
 use crate::lead::router::load_rule_set;
+use crate::lead::LeadRouter;
 use crate::tenant::TenantId;
 
 /// `GET /config/mailboxes` — list of `MailboxConfig` rows from
@@ -241,10 +242,50 @@ pub async fn put_rules(
     if let Err(e) = save_rules(root, &tenant_id, &rule_set) {
         return marketing_error(e);
     }
+    // Live reload: rebuild the router with the freshly written
+    // YAML and atomically swap it into the shared handle. The
+    // broker hop's next `load_full()` picks up the new rules.
+    // When the router handle isn't wired (older deployments,
+    // unit tests opting out), surface `restart_required: true`
+    // so the operator UI banners the operator into a manual
+    // restart — graceful degradation rather than dropping the
+    // PUT silently.
+    let reloaded = match &state.router {
+        Some(handle) => {
+            // Re-read from disk so the in-memory router shape
+            // matches whatever the loader would produce on a
+            // fresh boot — covers any post-write coercion (e.g.
+            // missing-field defaults) that `save_rules` might
+            // not have re-applied.
+            match load_rule_set(root, &tenant_id) {
+                Ok(rs) => {
+                    let new_router = LeadRouter::new(tenant_id.clone(), rs);
+                    handle.store(std::sync::Arc::new(new_router));
+                    tracing::info!(
+                        target: "extension.marketing.config",
+                        tenant = %tenant_id.as_str(),
+                        rule_count = rule_set.rules.len(),
+                        "router live-reloaded from rules.yaml"
+                    );
+                    true
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "extension.marketing.config",
+                        tenant = %tenant_id.as_str(),
+                        error = %e,
+                        "rules.yaml saved but router reload failed; restart required"
+                    );
+                    false
+                }
+            }
+        }
+        None => false,
+    };
     ok(json!({
         "rule_set": rule_set,
-        "restart_required": true,
-        "note": "router reloads only on extension restart today; M15.33 wires live reload",
+        "reloaded": reloaded,
+        "restart_required": !reloaded,
     }))
 }
 
@@ -498,7 +539,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_rules_round_trips_with_restart_required_flag() {
+    async fn put_rules_without_router_handle_signals_restart_required() {
+        // No `with_router` → reload path can't run.
         let (state, _tmp) = build_state_with_tenant_dir().await;
         let payload = json!({
             "rule_set": {
@@ -515,7 +557,68 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_to_json(resp).await;
+        assert_eq!(v["result"]["reloaded"], false);
         assert_eq!(v["result"]["restart_required"], true);
+    }
+
+    #[tokio::test]
+    async fn put_rules_with_router_handle_swaps_live() {
+        use crate::lead::{router_handle, LeadRouter};
+        use nexo_tool_meta::marketing::{AssignTarget, RuleSet, TenantIdRef};
+
+        // Build state with a router handle wired in. Initial
+        // router has the default `Drop` target.
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("marketing").join("acme")).unwrap();
+        let store = LeadStore::open(
+            PathBuf::from(":memory:"),
+            TenantId::new("acme").unwrap(),
+        )
+        .await
+        .unwrap();
+        let initial_rule_set = RuleSet {
+            tenant_id: TenantIdRef("acme".into()),
+            version: 0,
+            rules: Vec::new(),
+            default_target: AssignTarget::Drop,
+        };
+        let handle = router_handle(LeadRouter::new(
+            TenantId::new("acme").unwrap(),
+            initial_rule_set,
+        ));
+        let state = Arc::new(
+            AdminState::new("secret".into())
+                .with_store(Arc::new(store))
+                .with_state_root(tmp.path())
+                .with_router(handle.clone()),
+        );
+
+        let app = router(state);
+        // PUT a rule set whose default target picks "pedro".
+        let payload = json!({
+            "rule_set": {
+                "tenant_id": "acme",
+                "version": 2,
+                "rules": [],
+                "default_target": { "kind": "vendedor", "id": "pedro" },
+            }
+        });
+        let resp = app
+            .oneshot(put_req("/config/rules", payload))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["result"]["reloaded"], true, "{v:?}");
+        assert_eq!(v["result"]["restart_required"], false);
+
+        // Inspect the swapped router via the handle. Default
+        // target should now be Vendedor("pedro"), not Drop.
+        let snap = handle.load_full();
+        match &snap.rule_set().default_target {
+            AssignTarget::Vendedor { id } => assert_eq!(id.0, "pedro"),
+            other => panic!("expected Vendedor, got {other:?}"),
+        }
     }
 
     #[tokio::test]

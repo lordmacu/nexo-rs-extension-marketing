@@ -19,7 +19,7 @@ use nexo_microapp_sdk::enrichment::FallbackChain;
 use nexo_microapp_sdk::identity::{PersonEmailStore, PersonStore};
 
 use crate::firehose::LeadEventBus;
-use crate::lead::{LeadRouter, LeadStore};
+use crate::lead::{LeadStore, RouterHandle};
 use crate::tenant::TenantId;
 
 pub mod broker;
@@ -57,7 +57,11 @@ impl IdentityDeps {
 pub struct PluginDeps {
     pub tenant_id: TenantId,
     pub lead_store: Arc<LeadStore>,
-    pub router: Arc<LeadRouter>,
+    /// `RouterHandle` instead of `Arc<LeadRouter>` so the
+    /// dispatch + broker paths see swaps committed by
+    /// `PUT /config/rules` without a process restart. Each
+    /// call site loads a snapshot via `router.load_full()`.
+    pub router: RouterHandle,
     /// `None` means "identity disabled" — the broker hop falls
     /// back to placeholder ids. Production deployments always
     /// have it; some tests opt out to keep the fixture small.
@@ -68,7 +72,7 @@ impl PluginDeps {
     pub fn new(
         tenant_id: TenantId,
         lead_store: Arc<LeadStore>,
-        router: Arc<LeadRouter>,
+        router: RouterHandle,
     ) -> Self {
         Self {
             tenant_id,

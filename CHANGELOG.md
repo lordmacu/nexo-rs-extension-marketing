@@ -1,5 +1,77 @@
 # Changelog
 
+## 0.8.0 — 2026-05-07 (M15.33 — live router reload)
+
+`PUT /config/rules` no longer requires an extension restart.
+The router now lives behind an `arc_swap::ArcSwap<LeadRouter>`
+shared between the broker hop (reader) and the admin handler
+(writer). After a successful YAML write the handler rebuilds
+the router from disk and atomically swaps it into the handle;
+the next broker event picks up the new rules without a
+process bounce.
+
+`load_full()` is a single atomic Arc bump → ~10 ns per
+broker hop, no contention on the read path.
+
+### Implemented
+
+- `Cargo.toml` adds `arc-swap = "1"`.
+- `lead/router.rs`:
+  - New `RouterHandle = Arc<ArcSwap<LeadRouter>>` typedef.
+  - `router_handle(router)` builder function.
+- `lead/mod.rs` re-exports `RouterHandle` + `router_handle`.
+- `plugin/mod.rs::PluginDeps.router` switches from
+  `Arc<LeadRouter>` to `RouterHandle`.
+- `plugin/dispatch.rs`: `lead_route::handle` now receives a
+  `load_full()` snapshot per call so dispatched tools see
+  the same generation the broker hop saw.
+- `main.rs`: `router_handle(LeadRouter::new(...))` at boot;
+  the broker closure does `router_handle.load_full()` per
+  event for a snapshot Arc that survives concurrent stores.
+- `admin/mod.rs::AdminState`:
+  - New `router: Option<RouterHandle>` field.
+  - `with_router(handle)` builder.
+  - `main.rs` calls it with the same Arc the broker hop
+    captured.
+- `admin/config.rs::put_rules`:
+  - After atomic YAML write, re-reads the file via
+    `load_rule_set` so the in-memory router shape matches
+    a fresh-boot view (covers any post-write coercion the
+    serde defaults might apply).
+  - Builds `LeadRouter::new(...)` + `handle.store(Arc::new(...))`.
+  - Response gains `reloaded: true` + flips
+    `restart_required` to `false`.
+  - When the router handle isn't wired (older deployments,
+    test fixtures opting out), surface
+    `restart_required: true` + `reloaded: false` so the
+    operator UI banners the manual-restart workflow —
+    graceful degradation.
+- `admin/config.rs` tests:
+  - Renamed previous `put_rules_round_trips_with_restart_required_flag`
+    → `put_rules_without_router_handle_signals_restart_required`.
+  - New `put_rules_with_router_handle_swaps_live`: PUTs a
+    rule set whose `default_target = Vendedor("pedro")`,
+    asserts the handle's `load_full()` returns the new
+    target after the request returns. End-to-end live-swap
+    proof.
+
+### Test count
+
+138 unit + 8 cross-tenant + 6 microapp proxy + 25 plugin /
+firehose / admin + 7 thread + 23 config + **1 live reload**
+= **208 green** (was 207).
+
+### Operator note
+
+After upgrading to 0.8.0, every `PUT /config/rules` returns
+`reloaded: true` (not `restart_required: true`). Existing
+deployments wired through `main.rs` will pick up the
+`with_router` call automatically; custom embedders building
+their own `AdminState` need to add `with_router(handle)` to
+unlock live reload, otherwise the older `restart_required`
+flag continues to surface and the workflow degrades to
+manual restart.
+
 ## 0.7.0 — 2026-05-07 (M15.32 — config WRITE endpoints)
 
 CRUD loop closes: `PUT /config/{mailboxes|vendedores|rules|

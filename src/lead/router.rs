@@ -75,6 +75,20 @@ pub struct LeadRouter {
     rr_cursor: std::sync::atomic::AtomicUsize,
 }
 
+/// Lock-free atomic `Arc<LeadRouter>` — used to swap a freshly
+/// built router under the broker handler's nose when
+/// `PUT /config/rules` lands. Readers (`load_full()`) get a
+/// snapshot Arc, immune to concurrent stores. The whole
+/// extension shares one handle through `PluginDeps`.
+pub type RouterHandle = std::sync::Arc<arc_swap::ArcSwap<LeadRouter>>;
+
+/// Build a fresh `RouterHandle` from a `LeadRouter`. Callers
+/// that already hold an `Arc<LeadRouter>` can swap into the
+/// handle directly via `handle.store(arc)`.
+pub fn router_handle(router: LeadRouter) -> RouterHandle {
+    std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(router))
+}
+
 impl LeadRouter {
     pub fn new(tenant_id: TenantId, rule_set: RuleSet) -> Self {
         Self {

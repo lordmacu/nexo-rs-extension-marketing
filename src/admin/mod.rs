@@ -20,7 +20,7 @@ use axum::routing::get;
 use axum::Router;
 
 use crate::firehose::LeadEventBus;
-use crate::lead::LeadStore;
+use crate::lead::{LeadStore, RouterHandle};
 use crate::tenant::TenantId;
 
 pub mod auth;
@@ -47,6 +47,13 @@ pub struct AdminState {
     /// from `<state_root>/marketing/<tenant_id>/<file>.yaml`.
     /// Empty → endpoints surface `config_state_root_not_set`.
     pub state_root: Option<PathBuf>,
+    /// Router handle for the live-reload pipeline. Same Arc
+    /// the broker hop captured at boot — `PUT /config/rules`
+    /// rebuilds the `LeadRouter` from the freshly written YAML
+    /// and swaps it into this handle so subsequent broker
+    /// events route through the new rules without a process
+    /// restart.
+    pub router: Option<RouterHandle>,
 }
 
 impl AdminState {
@@ -56,6 +63,7 @@ impl AdminState {
             stores: HashMap::new(),
             firehose: Arc::new(LeadEventBus::new()),
             state_root: None,
+            router: None,
         }
     }
 
@@ -80,6 +88,15 @@ impl AdminState {
     /// per-tenant subdir internally.
     pub fn with_state_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.state_root = Some(root.into());
+        self
+    }
+
+    /// Inject the router handle the broker hop captured at
+    /// boot. `PUT /config/rules` swaps a freshly built
+    /// `LeadRouter` into this Arc; subsequent broker events
+    /// pick up the new rules without a process restart.
+    pub fn with_router(mut self, router: RouterHandle) -> Self {
+        self.router = Some(router);
         self
     }
 

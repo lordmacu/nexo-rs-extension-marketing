@@ -9,7 +9,9 @@ pub mod score;
 pub mod state;
 pub mod store;
 
-pub use router::{load_rule_set, LeadRouter, RouteInputs, RouteOutcome};
+pub use router::{
+    load_rule_set, router_handle, LeadRouter, RouteInputs, RouteOutcome, RouterHandle,
+};
 pub use score::{score_lead, ScoreContribution, ScoreInputs, ScoreOutput};
 pub use state::{validate_transition, LegalTransitions};
 pub use store::{

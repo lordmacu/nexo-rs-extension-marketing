@@ -14,7 +14,7 @@ plugin per the [Phase 81.5 plugin contract][contract].
 
 ## Status
 
-✅ **End-to-end pipeline shipped (v0.7.0).**
+✅ **End-to-end pipeline shipped (v0.8.0).**
 
 The extension is now a real Phase 81.5 plugin: the daemon
 spawns `nexo-marketing` as a subprocess, hands it `tool.invoke`
@@ -36,13 +36,14 @@ M15 milestones A–I + M15.27 (plugin contract):
 - Cross-tenant isolation suite (8 assertions, release-blocker)
 - **Stdio JSON-RPC plugin contract** + broker subscriber
 
-**207/207 tests** green (138 unit + 8 cross-tenant + 6
+**208/208 tests** green (138 unit + 8 cross-tenant + 6
 microapp proxy + 25 plugin / firehose / admin + 7 thread +
-23 config GET + WRITE). Lead lifecycle streams live via
-`/firehose` SSE; threads persist + serve through
+24 config CRUD + live-reload). Lead lifecycle streams live
+via `/firehose` SSE; threads persist + serve through
 `GET /leads/:lead_id/thread`; the 4 `/config/*` endpoints
-serve full CRUD on the per-tenant YAML — operator UI no
-longer needs SSH to edit the routing rules.
+serve full CRUD on the per-tenant YAML; **`PUT /config/rules`
+hot-swaps the router via `arc_swap` — no extension restart
+needed when operators edit routing rules**.
 
 The broker hop now drives the full pipeline: each inbound runs
 the SDK `FallbackChain` (with `display_name` + `reply_to`

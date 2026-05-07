@@ -30,7 +30,7 @@ use nexo_marketing::firehose::LeadEventBus;
 use nexo_marketing::identity::adapters::{
     display_name::DisplayNameParser, reply_to::ReplyToReader,
 };
-use nexo_marketing::lead::{router::load_rule_set, LeadRouter, LeadStore};
+use nexo_marketing::lead::{router::load_rule_set, router_handle, LeadRouter, LeadStore};
 use nexo_marketing::plugin::{
     broker::handle_inbound_event, dispatch::dispatch as plugin_dispatch,
     tool_defs::marketing_tool_defs, IdentityDeps, PluginDeps,
@@ -84,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
 
     let rule_set = load_rule_set(&state_root, &tenant)
         .with_context(|| format!("load rule set for {tenant}"))?;
-    let router = Arc::new(LeadRouter::new(tenant.clone(), rule_set));
+    let router = router_handle(LeadRouter::new(tenant.clone(), rule_set));
 
     // ─── Identity stores + resolver chain ─────────────────────
     // One pool per tenant; backs Person + PersonEmail + Company
@@ -131,7 +131,8 @@ async fn main() -> anyhow::Result<()> {
         AdminState::new(bearer)
             .with_store(lead_store.clone())
             .with_firehose(firehose_bus.clone())
-            .with_state_root(state_root.clone()),
+            .with_state_root(state_root.clone())
+            .with_router(router.clone()),
     );
     let app = admin::router(admin_state);
     let bind = format!("{DEFAULT_BIND}:{port}");
@@ -163,17 +164,22 @@ async fn main() -> anyhow::Result<()> {
         .on_broker_event(
             move |topic: String, event: BrokerEvent, broker: BrokerSender| {
                 let store = broker_store.clone();
-                let router = broker_router.clone();
+                let router_handle = broker_router.clone();
                 let identity = broker_identity.clone();
                 let tenant = broker_tenant.clone();
                 let firehose = broker_firehose.clone();
                 async move {
+                    // `load_full()` is a lock-free atomic Arc
+                    // bump — we get a snapshot of the current
+                    // router that won't disappear under us
+                    // even if `PUT /config/rules` swaps.
+                    let router_snapshot = router_handle.load_full();
                     let _ = handle_inbound_event(
                         &topic,
                         event.payload,
                         &tenant,
                         &store,
-                        Some(&router),
+                        Some(router_snapshot.as_ref()),
                         Some(&identity),
                         Some(firehose.as_ref()),
                         Some(broker),
