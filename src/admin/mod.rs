@@ -83,6 +83,7 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/healthz", get(healthz::handler))
         .route("/leads", get(leads::list_handler))
         .route("/leads/:lead_id", get(leads::get_handler))
+        .route("/leads/:lead_id/thread", get(leads::thread_handler))
         .route("/firehose", get(firehose::handler))
         .layer(auth_layer)
         .with_state(state)

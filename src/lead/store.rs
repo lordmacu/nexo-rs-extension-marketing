@@ -62,6 +62,20 @@ CREATE INDEX IF NOT EXISTS idx_leads_person          ON leads(tenant_id, person_
 CREATE INDEX IF NOT EXISTS idx_leads_vendedor_state  ON leads(tenant_id, vendedor_id, state);
 CREATE INDEX IF NOT EXISTS idx_leads_next_check      ON leads(tenant_id, next_check_at_ms)
     WHERE next_check_at_ms IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS thread_messages (
+    tenant_id    TEXT NOT NULL,
+    lead_id      TEXT NOT NULL,
+    message_id   TEXT NOT NULL,
+    direction    TEXT NOT NULL,
+    from_label   TEXT NOT NULL,
+    body         TEXT NOT NULL,
+    at_ms        INTEGER NOT NULL,
+    draft_status TEXT,
+    PRIMARY KEY (tenant_id, lead_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_thread_messages_lead
+    ON thread_messages(tenant_id, lead_id, at_ms);
 "#;
 
 /// Per-tenant lead store. The struct holds its tenant id +
@@ -263,6 +277,154 @@ impl LeadStore {
         .fetch_one(&self.pool)
         .await?;
         Ok(row.0)
+    }
+
+    /// Append a message to a lead's thread. Idempotent on
+    /// `(tenant_id, lead_id, message_id)` — re-running with the
+    /// same message id is a no-op so the broker hop's natural
+    /// at-least-once delivery doesn't duplicate rows. The
+    /// caller's responsibility to make `message_id` stable
+    /// (RFC 5322 `Message-Id` for inbound, draft uuid for
+    /// drafts).
+    pub async fn append_thread_message(
+        &self,
+        lead_id: &LeadId,
+        msg: NewThreadMessage,
+    ) -> Result<(), MarketingError> {
+        sqlx::query(
+            "INSERT INTO thread_messages \
+             (tenant_id, lead_id, message_id, direction, from_label, body, at_ms, draft_status) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(tenant_id, lead_id, message_id) DO NOTHING",
+        )
+        .bind(self.tenant_id.as_str())
+        .bind(&lead_id.0)
+        .bind(&msg.message_id)
+        .bind(direction_str(msg.direction))
+        .bind(&msg.from_label)
+        .bind(&msg.body)
+        .bind(msg.at_ms)
+        .bind(msg.draft_status.map(draft_status_str))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Load a lead's thread in chronological order (oldest
+    /// first). Empty vec when the lead has no messages yet
+    /// (placeholder leads created before thread persistence
+    /// landed). Tenant-scoped — cross-tenant access impossible.
+    pub async fn list_thread(
+        &self,
+        lead_id: &LeadId,
+    ) -> Result<Vec<ThreadMessage>, MarketingError> {
+        let rows: Vec<ThreadMessageRow> = sqlx::query_as(
+            "SELECT message_id, direction, from_label, body, at_ms, draft_status \
+             FROM thread_messages \
+             WHERE tenant_id = ? AND lead_id = ? \
+             ORDER BY at_ms ASC, message_id ASC",
+        )
+        .bind(self.tenant_id.as_str())
+        .bind(&lead_id.0)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(ThreadMessage::from).collect())
+    }
+}
+
+/// Caller-provided message payload for `append_thread_message`.
+/// `message_id` is the dedupe key — stable across delivery
+/// retries.
+#[derive(Debug, Clone)]
+pub struct NewThreadMessage {
+    pub message_id: String,
+    pub direction: MessageDirection,
+    pub from_label: String,
+    pub body: String,
+    pub at_ms: i64,
+    pub draft_status: Option<DraftStatus>,
+}
+
+/// Wire-equivalent thread message exposed via `/leads/:id/thread`.
+/// Mirrors `frontend/src/api/marketing.ts ThreadMessage`. Drop
+/// in `nexo-tool-meta::marketing` if this lifts to multiple
+/// extensions; today the extension owns the storage.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ThreadMessage {
+    pub id: String,
+    pub direction: MessageDirection,
+    pub from_label: String,
+    pub body: String,
+    pub at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft_status: Option<DraftStatus>,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDirection {
+    Inbound,
+    Outbound,
+    Draft,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftStatus {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+fn direction_str(d: MessageDirection) -> &'static str {
+    match d {
+        MessageDirection::Inbound => "inbound",
+        MessageDirection::Outbound => "outbound",
+        MessageDirection::Draft => "draft",
+    }
+}
+
+fn draft_status_str(s: DraftStatus) -> &'static str {
+    match s {
+        DraftStatus::Pending => "pending",
+        DraftStatus::Approved => "approved",
+        DraftStatus::Rejected => "rejected",
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ThreadMessageRow {
+    message_id: String,
+    direction: String,
+    from_label: String,
+    body: String,
+    at_ms: i64,
+    draft_status: Option<String>,
+}
+
+impl From<ThreadMessageRow> for ThreadMessage {
+    fn from(r: ThreadMessageRow) -> Self {
+        Self {
+            id: r.message_id,
+            direction: match r.direction.as_str() {
+                "inbound" => MessageDirection::Inbound,
+                "outbound" => MessageDirection::Outbound,
+                _ => MessageDirection::Draft,
+            },
+            from_label: r.from_label,
+            body: r.body,
+            at_ms: r.at_ms,
+            draft_status: r.draft_status.and_then(|s| match s.as_str() {
+                "pending" => Some(DraftStatus::Pending),
+                "approved" => Some(DraftStatus::Approved),
+                "rejected" => Some(DraftStatus::Rejected),
+                _ => None,
+            }),
+        }
     }
 }
 
@@ -544,5 +706,76 @@ mod tests {
         sqlx::query(MIGRATION_SQL).execute(s.pool()).await.unwrap();
         let n = s.count_by_state(LeadState::Cold).await.unwrap();
         assert_eq!(n, 0);
+    }
+
+    fn nm(id: &str, dir: MessageDirection, body: &str, at: i64) -> NewThreadMessage {
+        NewThreadMessage {
+            message_id: id.into(),
+            direction: dir,
+            from_label: "Cliente".into(),
+            body: body.into(),
+            at_ms: at,
+            draft_status: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_append_then_list_returns_chronological() {
+        let s = fresh_store("acme").await;
+        let lead = s.create(input("l-th-1", "p-1", "v-1")).await.unwrap();
+        s.append_thread_message(&lead.id, nm("m1", MessageDirection::Inbound, "first", 100))
+            .await
+            .unwrap();
+        s.append_thread_message(&lead.id, nm("m3", MessageDirection::Inbound, "third", 300))
+            .await
+            .unwrap();
+        s.append_thread_message(&lead.id, nm("m2", MessageDirection::Outbound, "second", 200))
+            .await
+            .unwrap();
+        let thread = s.list_thread(&lead.id).await.unwrap();
+        let bodies: Vec<&str> = thread.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies, vec!["first", "second", "third"]);
+        assert_eq!(thread[1].direction, MessageDirection::Outbound);
+    }
+
+    #[tokio::test]
+    async fn thread_append_idempotent_on_message_id() {
+        let s = fresh_store("acme").await;
+        let lead = s.create(input("l-th-2", "p-1", "v-1")).await.unwrap();
+        let m = nm("dup", MessageDirection::Inbound, "hi", 1);
+        s.append_thread_message(&lead.id, m.clone()).await.unwrap();
+        s.append_thread_message(&lead.id, m).await.unwrap();
+        let thread = s.list_thread(&lead.id).await.unwrap();
+        assert_eq!(thread.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn thread_list_empty_for_new_lead() {
+        let s = fresh_store("acme").await;
+        let lead = s.create(input("l-th-3", "p-1", "v-1")).await.unwrap();
+        let thread = s.list_thread(&lead.id).await.unwrap();
+        assert!(thread.is_empty());
+    }
+
+    #[tokio::test]
+    async fn draft_status_round_trips() {
+        let s = fresh_store("acme").await;
+        let lead = s.create(input("l-th-4", "p-1", "v-1")).await.unwrap();
+        s.append_thread_message(
+            &lead.id,
+            NewThreadMessage {
+                message_id: "draft-1".into(),
+                direction: MessageDirection::Draft,
+                from_label: "AI".into(),
+                body: "draft body".into(),
+                at_ms: 5,
+                draft_status: Some(DraftStatus::Pending),
+            },
+        )
+        .await
+        .unwrap();
+        let thread = s.list_thread(&lead.id).await.unwrap();
+        assert_eq!(thread[0].direction, MessageDirection::Draft);
+        assert_eq!(thread[0].draft_status, Some(DraftStatus::Pending));
     }
 }

@@ -106,6 +106,44 @@ pub async fn get_handler(
     }
 }
 
+/// `GET /leads/:lead_id/thread` — chronological message list
+/// for the lead. 404 when the lead doesn't exist (so the UI can
+/// distinguish "no thread yet" from "lead missing"). Empty
+/// thread is a legitimate `200` with `messages: []` — leads
+/// created before persistence landed have no rows.
+pub async fn thread_handler(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path(lead_id): Path<String>,
+) -> Response {
+    let store = match state.lookup_store(&tenant_id) {
+        Some(s) => s,
+        None => return server_error("store_missing", "tenant store not mounted"),
+    };
+    let id = LeadId(lead_id.clone());
+    // Verify the lead exists in this tenant first — defense-in-
+    // depth + clearer 404 surface for the UI.
+    match store.get(&id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return error(
+                StatusCode::NOT_FOUND,
+                "lead_not_found",
+                &format!("no lead with id {lead_id:?} for the active tenant"),
+            );
+        }
+        Err(e) => return marketing_error(e),
+    }
+    match store.list_thread(&id).await {
+        Ok(messages) => ok(json!({
+            "lead_id": lead_id,
+            "messages": messages,
+            "count": messages.len(),
+        })),
+        Err(e) => marketing_error(e),
+    }
+}
+
 fn parse_state(s: &str) -> Option<LeadState> {
     match s {
         "cold" => Some(LeadState::Cold),
@@ -235,5 +273,69 @@ mod tests {
         let v = body_to_json(resp).await;
         assert!(v["result"]["leads"].is_array());
         assert!(v["result"]["limit"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn thread_returns_chronological_messages() {
+        use crate::lead::{MessageDirection, NewThreadMessage};
+        let state = build_state_with_lead().await;
+        // Reach in via the same Arc to seed messages.
+        let store = state.lookup_store(&TenantId::new("acme").unwrap()).unwrap();
+        store
+            .append_thread_message(
+                &LeadId("l-1".into()),
+                NewThreadMessage {
+                    message_id: "m1".into(),
+                    direction: MessageDirection::Inbound,
+                    from_label: "Cliente".into(),
+                    body: "Hola".into(),
+                    at_ms: 100,
+                    draft_status: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append_thread_message(
+                &LeadId("l-1".into()),
+                NewThreadMessage {
+                    message_id: "m2".into(),
+                    direction: MessageDirection::Outbound,
+                    from_label: "Pedro".into(),
+                    body: "Saludos".into(),
+                    at_ms: 200,
+                    draft_status: None,
+                },
+            )
+            .await
+            .unwrap();
+        let app = router(state);
+        let resp = app.oneshot(req("/leads/l-1/thread")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["count"], 2);
+        let msgs = v["result"]["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["body"], "Hola");
+        assert_eq!(msgs[1]["direction"], "outbound");
+    }
+
+    #[tokio::test]
+    async fn thread_returns_empty_for_lead_with_no_messages() {
+        let state = build_state_with_lead().await;
+        let app = router(state);
+        let resp = app.oneshot(req("/leads/l-1/thread")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["result"]["count"], 0);
+        assert_eq!(v["result"]["messages"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn thread_for_missing_lead_returns_404() {
+        let state = build_state_with_lead().await;
+        let app = router(state);
+        let resp = app.oneshot(req("/leads/ghost/thread")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

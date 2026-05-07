@@ -40,7 +40,10 @@ use uuid::Uuid;
 
 use crate::broker::inbound::{decode_inbound_email, ParseError, ParsedInbound};
 use crate::firehose::{LeadEventBus, LeadFirehoseEvent};
-use crate::lead::{LeadRouter, LeadStore, NewLead, RouteInputs, RouteOutcome};
+use crate::lead::{
+    LeadRouter, LeadStore, MessageDirection, NewLead, NewThreadMessage, RouteInputs,
+    RouteOutcome,
+};
 use crate::plugin::IdentityDeps;
 use crate::tenant::TenantId;
 
@@ -262,6 +265,27 @@ fn route_inbound(
     })
 }
 
+/// Build a `NewThreadMessage` from a parsed inbound. Uses the
+/// RFC 5322 `Message-Id` as the dedupe key; falls back to the
+/// thread id + timestamp combo when the header is missing
+/// (rare — most servers stamp one).
+fn inbound_message_from_parsed(parsed: &ParsedInbound, fallback_at_ms: i64) -> NewThreadMessage {
+    NewThreadMessage {
+        message_id: parsed
+            .message_id
+            .clone()
+            .unwrap_or_else(|| format!("synth:{}-{}", parsed.thread_id, fallback_at_ms)),
+        direction: MessageDirection::Inbound,
+        from_label: parsed
+            .from_display_name
+            .clone()
+            .unwrap_or_else(|| parsed.from_email.clone()),
+        body: parsed.body_excerpt.clone(),
+        at_ms: fallback_at_ms,
+        draft_status: None,
+    }
+}
+
 /// Persist the resolved person + email link. Errors are logged
 /// + downgraded to a placeholder id so a transient store
 /// failure doesn't lose the inbound (the lead still gets
@@ -368,12 +392,22 @@ pub async fn handle_inbound_event(
             thread_id = %parsed.thread_id,
             "inbound on existing thread"
         );
+        // Persist the inbound message — broker delivery is at-
+        // least-once but `append_thread_message` is idempotent
+        // on `(tenant, lead, message_id)` so replays are safe.
+        let now_ms = Utc::now().timestamp_millis();
+        let _ = store
+            .append_thread_message(
+                &lead.id,
+                inbound_message_from_parsed(&parsed, now_ms),
+            )
+            .await;
         if let Some(bus) = firehose {
             bus.publish(LeadFirehoseEvent::ThreadBumped {
                 tenant_id: nexo_tool_meta::marketing::TenantIdRef(tenant_id.as_str().into()),
                 lead_id: lead.id.clone(),
                 thread_id: parsed.thread_id.clone(),
-                at_ms: Utc::now().timestamp_millis(),
+                at_ms: now_ms,
             });
         }
         return HandledOutcome::LeadUpdated {
@@ -451,6 +485,15 @@ pub async fn handle_inbound_event(
                 resolver = %resolver_source,
                 "created cold lead from inbound email"
             );
+            // Seed the thread with the inbound that triggered
+            // creation — the operator opens the lead detail and
+            // sees the original email immediately.
+            let _ = store
+                .append_thread_message(
+                    &lead.id,
+                    inbound_message_from_parsed(&parsed, now_ms),
+                )
+                .await;
             if let Some(bus) = firehose {
                 bus.publish(LeadFirehoseEvent::Created {
                     tenant_id: nexo_tool_meta::marketing::TenantIdRef(

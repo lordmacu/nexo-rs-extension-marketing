@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.5.0 — 2026-05-07 (M15.30 — thread persistence + endpoint)
+
+The lead store now persists thread messages — every inbound
+broker hop appends an immutable `(message_id, direction,
+from_label, body, at_ms)` row, idempotent on the RFC 5322
+Message-Id. New `GET /leads/:lead_id/thread` returns the
+chronological message list. The agent-creator microapp's
+`LeadDetail` UI swaps its placeholder for the live thread.
+
+### Implemented
+
+- `lead/store.rs`:
+  - New `thread_messages` table in the same per-tenant
+    `leads.db` migration. `(tenant_id, lead_id, message_id)`
+    primary key + `(tenant_id, lead_id, at_ms)` index for the
+    chronological list query.
+  - `LeadStore::append_thread_message` (idempotent ON CONFLICT
+    DO NOTHING) + `LeadStore::list_thread` (ORDER BY at_ms ASC).
+  - `ThreadMessage` / `MessageDirection` (`inbound` /
+    `outbound` / `draft`) / `DraftStatus` typed surface,
+    serde-tagged for the wire shape.
+  - 4 unit tests: chronological append/list, idempotent on
+    duplicate message_id, empty thread for new lead, draft
+    status round-trip.
+- `plugin/broker.rs`:
+  - Both broker paths (cold-thread create + existing-thread
+    bump) now `append_thread_message(...)` with the parsed
+    inbound. Helper `inbound_message_from_parsed` falls back
+    to a synthetic id when the email lacks a Message-Id.
+- `admin/leads.rs`:
+  - New `thread_handler` mounted at `GET /leads/:lead_id/thread`.
+    404 when the lead doesn't exist; 200 with `{lead_id,
+    messages, count}` envelope. Messages serialise as
+    `inbound|outbound|draft` strings.
+  - 3 admin tests: thread returns chronological, empty thread
+    is 200, missing lead is 404.
+
+### Test count
+
+138 unit + 8 cross-tenant + 6 microapp proxy + 25 plugin /
+firehose / admin + **7 thread (4 store + 3 admin)** =
+**184 green** (was 177).
+
 ## 0.4.0 — 2026-05-07 (M15.29 — SSE firehose for lead lifecycle)
 
 The extension now publishes a `/firehose` SSE stream of lead

@@ -12,4 +12,6 @@ pub mod store;
 pub use router::{load_rule_set, LeadRouter, RouteInputs, RouteOutcome};
 pub use score::{score_lead, ScoreContribution, ScoreInputs, ScoreOutput};
 pub use state::{validate_transition, LegalTransitions};
-pub use store::{LeadStore, NewLead};
+pub use store::{
+    DraftStatus, LeadStore, MessageDirection, NewLead, NewThreadMessage, ThreadMessage,
+};
