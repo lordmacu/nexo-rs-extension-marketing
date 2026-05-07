@@ -44,6 +44,9 @@ use crate::lead::{
     LeadRouter, LeadStore, MessageDirection, NewLead, NewThreadMessage, RouteInputs,
     RouteOutcome,
 };
+use crate::notification::{
+    maybe_notify_lead_created, NotificationOutcome, VendedorLookup,
+};
 use crate::plugin::IdentityDeps;
 use crate::tenant::TenantId;
 
@@ -338,7 +341,8 @@ pub async fn handle_inbound_event(
     router: Option<&LeadRouter>,
     identity: Option<&IdentityDeps>,
     firehose: Option<&LeadEventBus>,
-    _broker: Option<BrokerSender>,
+    vendedores: Option<&VendedorLookup>,
+    broker: Option<BrokerSender>,
 ) -> HandledOutcome {
     if !topic.starts_with("plugin.inbound.email.") && topic != "plugin.inbound.email" {
         return HandledOutcome::Skipped;
@@ -509,6 +513,46 @@ pub async fn handle_inbound_event(
                     why_routed: lead.why_routed.clone(),
                 });
             }
+            // M15.38 — operator notification routed to the
+            // bound agent's WA / email channel. Pure decision
+            // happens inline; the broker.publish is fire-and-
+            // forget so a transient daemon hiccup doesn't
+            // sink the lead-create itself.
+            if let (Some(lookup), Some(broker_sender)) = (vendedores, broker.as_ref()) {
+                match maybe_notify_lead_created(tenant_id, lookup, &lead, &parsed) {
+                    NotificationOutcome::Publish { topic, payload } => {
+                        let json_payload = serde_json::to_value(&payload)
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                        let event = nexo_microapp_sdk::BrokerEvent::new(
+                            topic.clone(),
+                            "marketing.notification",
+                            json_payload,
+                        );
+                        if let Err(e) = broker_sender.publish(&topic, event).await {
+                            tracing::warn!(
+                                target: "plugin.marketing.broker",
+                                error = %e,
+                                topic = %topic,
+                                "notification publish failed (non-fatal)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                target: "plugin.marketing.broker",
+                                topic = %topic,
+                                channel = ?payload.channel,
+                                "lead_created notification published"
+                            );
+                        }
+                    }
+                    other => {
+                        tracing::trace!(
+                            target: "plugin.marketing.broker",
+                            outcome = ?other,
+                            "lead_created notification skipped"
+                        );
+                    }
+                }
+            }
             HandledOutcome::LeadCreated {
                 lead_id: lead.id,
                 thread_id: parsed.thread_id,
@@ -624,6 +668,7 @@ mod tests {
             Some(&identity),
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(out, HandledOutcome::Skipped);
@@ -641,6 +686,7 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
             None,
             None,
         )
@@ -666,6 +712,7 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
             None,
             None,
         )
@@ -730,6 +777,7 @@ mod tests {
             Some(&identity),
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -764,6 +812,7 @@ mod tests {
             Some(&identity),
             None,
             None,
+            None,
         )
         .await;
         let HandledOutcome::LeadCreated {
@@ -779,6 +828,7 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
             None,
             None,
         )
@@ -815,6 +865,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -847,6 +898,7 @@ mod tests {
             Some(&router),
             Some(&identity),
             Some(&bus),
+            None,
             None,
         )
         .await;
@@ -893,6 +945,7 @@ mod tests {
             Some(&identity),
             Some(&bus),
             None,
+            None,
         )
         .await;
         let _consume_created = rx.recv().await;
@@ -905,6 +958,7 @@ mod tests {
             Some(&router),
             Some(&identity),
             Some(&bus),
+            None,
             None,
         )
         .await;

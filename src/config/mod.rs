@@ -214,6 +214,7 @@ mod tests {
             preferred_language: Some("es".into()),
             agent_id: None,
             model_override: None,
+            notification_settings: None,
         }
     }
 

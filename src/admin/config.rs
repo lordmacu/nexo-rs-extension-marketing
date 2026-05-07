@@ -168,6 +168,23 @@ pub async fn put_vendedores(
     if let Err(e) = save_vendedores(root, &tenant_id, &rows) {
         return marketing_error(e);
     }
+    // M15.38 — live-reload the vendedor lookup so the broker
+    // hop's next notification publish reads the fresh
+    // `notification_settings`. Same `arc_swap` pattern as
+    // `put_rules` (M15.33). When the handle isn't wired
+    // (legacy embedders) the save still lands but
+    // notifications use stale settings until restart.
+    if let Some(handle) = &state.vendedor_lookup {
+        let map: std::collections::HashMap<_, _> =
+            rows.iter().map(|v| (v.id.clone(), v.clone())).collect();
+        handle.store(std::sync::Arc::new(map));
+        tracing::debug!(
+            target: "extension.marketing.config",
+            tenant = %tenant_id.as_str(),
+            count = rows.len(),
+            "vendedor lookup live-reloaded after PUT /config/vendedores"
+        );
+    }
     ok(json!({ "vendedores": rows, "count": rows.len() }))
 }
 

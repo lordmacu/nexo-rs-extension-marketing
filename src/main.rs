@@ -86,6 +86,15 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("load rule set for {tenant}"))?;
     let router = router_handle(LeadRouter::new(tenant.clone(), rule_set));
 
+    // ─── Vendedor lookup (M15.38) ─────────────────────────────
+    // Boot snapshot from vendedores.yaml; PUT
+    // /config/vendedores rebuilds + swaps under the broker
+    // hop's nose.
+    let vendedores_initial =
+        nexo_marketing::config::load_vendedores(&state_root, &tenant).unwrap_or_default();
+    let vendedor_lookup =
+        nexo_marketing::notification::vendedor_lookup_from_list(vendedores_initial);
+
     // ─── Identity stores + resolver chain ─────────────────────
     // One pool per tenant; backs Person + PersonEmail + Company
     // stores. Migration runs eagerly (the SDK's open_pool calls
@@ -118,7 +127,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(tenant = %tenant, "identity stores + resolver chain ready");
 
     let plugin_deps = PluginDeps::new(tenant.clone(), lead_store.clone(), router.clone())
-        .with_identity(identity.clone());
+        .with_identity(identity.clone())
+        .with_vendedores(vendedor_lookup.clone());
 
     // ─── Lead lifecycle bus (firehose) ────────────────────────
     // Shared between the broker handler (producer) and the
@@ -132,7 +142,8 @@ async fn main() -> anyhow::Result<()> {
             .with_store(lead_store.clone())
             .with_firehose(firehose_bus.clone())
             .with_state_root(state_root.clone())
-            .with_router(router.clone()),
+            .with_router(router.clone())
+            .with_vendedor_lookup(vendedor_lookup.clone()),
     );
     let app = admin::router(admin_state);
     let bind = format!("{DEFAULT_BIND}:{port}");
@@ -154,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
     let broker_identity = identity.clone();
     let broker_tenant = tenant.clone();
     let broker_firehose = firehose_bus.clone();
+    let broker_vendedores = vendedor_lookup.clone();
     PluginAdapter::new(MANIFEST)?
         .with_server_version(version)
         .declare_tools(marketing_tool_defs())
@@ -168,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
                 let identity = broker_identity.clone();
                 let tenant = broker_tenant.clone();
                 let firehose = broker_firehose.clone();
+                let vendedores = broker_vendedores.clone();
                 async move {
                     // `load_full()` is a lock-free atomic Arc
                     // bump — we get a snapshot of the current
@@ -182,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
                         Some(router_snapshot.as_ref()),
                         Some(&identity),
                         Some(firehose.as_ref()),
+                        Some(&vendedores),
                         Some(broker),
                     )
                     .await;

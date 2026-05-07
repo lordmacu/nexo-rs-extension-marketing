@@ -20,6 +20,7 @@ use nexo_microapp_sdk::identity::{PersonEmailStore, PersonStore};
 
 use crate::firehose::LeadEventBus;
 use crate::lead::{LeadStore, RouterHandle};
+use crate::notification::VendedorLookup;
 use crate::tenant::TenantId;
 
 pub mod broker;
@@ -66,6 +67,11 @@ pub struct PluginDeps {
     /// back to placeholder ids. Production deployments always
     /// have it; some tests opt out to keep the fixture small.
     pub identity: Option<IdentityDeps>,
+    /// Vendedor index for notification routing. `None` =
+    /// notifications disabled. PUT `/config/vendedores`
+    /// rebuilds + swaps under the broker hop's nose
+    /// (same `arc_swap` pattern as the router live-reload).
+    pub vendedores: Option<VendedorLookup>,
 }
 
 impl PluginDeps {
@@ -79,7 +85,16 @@ impl PluginDeps {
             lead_store,
             router,
             identity: None,
+            vendedores: None,
         }
+    }
+
+    /// Builder-style wiring for the vendedor lookup. The same
+    /// `Arc` is captured by the broker hop closure (read path)
+    /// + the admin handler (PUT vendedores rebuild path).
+    pub fn with_vendedores(mut self, lookup: VendedorLookup) -> Self {
+        self.vendedores = Some(lookup);
+        self
     }
 
     /// Builder-style wiring for the identity stores + resolver

@@ -21,6 +21,7 @@ use axum::Router;
 
 use crate::firehose::LeadEventBus;
 use crate::lead::{LeadStore, RouterHandle};
+use crate::notification::VendedorLookup;
 use crate::tenant::TenantId;
 
 pub mod auth;
@@ -54,6 +55,12 @@ pub struct AdminState {
     /// events route through the new rules without a process
     /// restart.
     pub router: Option<RouterHandle>,
+    /// M15.38 — vendedor lookup for notification routing.
+    /// `PUT /config/vendedores` rebuilds the `HashMap` from
+    /// disk + swaps it into this handle so the broker hop's
+    /// next notification publish routes via the fresh
+    /// `agent_id` / `notification_settings`.
+    pub vendedor_lookup: Option<VendedorLookup>,
 }
 
 impl AdminState {
@@ -64,6 +71,7 @@ impl AdminState {
             firehose: Arc::new(LeadEventBus::new()),
             state_root: None,
             router: None,
+            vendedor_lookup: None,
         }
     }
 
@@ -97,6 +105,16 @@ impl AdminState {
     /// pick up the new rules without a process restart.
     pub fn with_router(mut self, router: RouterHandle) -> Self {
         self.router = Some(router);
+        self
+    }
+
+    /// Inject the vendedor lookup the broker hop captured at
+    /// boot. `PUT /config/vendedores` swaps a freshly loaded
+    /// `HashMap<VendedorId, Vendedor>` into this Arc so the
+    /// next notification publish reads the updated
+    /// `notification_settings`.
+    pub fn with_vendedor_lookup(mut self, lookup: VendedorLookup) -> Self {
+        self.vendedor_lookup = Some(lookup);
         self
     }
 

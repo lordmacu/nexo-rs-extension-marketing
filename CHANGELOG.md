@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.9.0 — 2026-05-07 (M15.38 — operator notifications via agent)
+
+Marketing publishes typed `EmailNotification` frames to
+`agent.email.notification.<agent_id>` whenever a lead-
+lifecycle event matches the bound vendedor's per-event
+toggles. The agent's runtime / sidecar subscribes and
+forwards via the configured channel — WhatsApp (default,
+reuses agent's existing inbound binding), email (to an
+arbitrary address), or disabled (publish without forward).
+
+This commit ships the publisher side: wire shape consumed,
+vendedor lookup with `arc_swap` live-reload, broker hop
+gates the publish on settings + agent_id presence, classifier
+tested across the 6 short-circuit branches.
+
+### Implemented
+
+- `Cargo.toml`: no new deps — `arc-swap` already present
+  from M15.33.
+- New `src/notification.rs`:
+  - `VendedorLookup = Arc<ArcSwap<HashMap<VendedorId, Vendedor>>>`
+    + `vendedor_lookup_from_list(rows)` builder.
+  - `NotificationOutcome` enum: `VendedorMissing`,
+    `NotConfigured`, `EventDisabled`, `NoAgentBound`,
+    `ChannelDisabled`, `Publish { topic, payload }`.
+  - `maybe_notify_lead_created(tenant, lookup, lead, parsed)`
+    classifies inline — pure decision separated from the
+    broker.publish IO so unit tests don't need a broker
+    mock.
+  - `render_summary` composes the operator-facing line
+    localised to the vendedor's `preferred_language`
+    (Spanish default, English when set).
+  - 9 unit tests cover every short-circuit branch + the
+    happy path + the en-locale path + email channel
+    pass-through + arc_swap live-reload.
+- `plugin/mod.rs::PluginDeps`:
+  - New `vendedores: Option<VendedorLookup>` field.
+  - `with_vendedores(lookup)` builder.
+- `plugin/broker.rs::handle_inbound_event`:
+  - Signature gains `vendedores: Option<&VendedorLookup>`
+    + uses the broker sender (was `_broker`) to publish.
+  - On `LeadCreated`, resolves the vendedor via lookup,
+    runs `maybe_notify_lead_created`, fire-and-forget
+    publish via `BrokerSender::publish` with a typed
+    `nexo_microapp_sdk::BrokerEvent`. Failures log
+    warn but don't sink the broker hop.
+- `admin/mod.rs::AdminState`:
+  - New `vendedor_lookup: Option<VendedorLookup>` +
+    `with_vendedor_lookup` builder.
+- `admin/config.rs::put_vendedores`:
+  - After atomic YAML write, rebuilds the `HashMap` from
+    the freshly persisted rows + `handle.store(Arc::new)`
+    — same pattern as `put_rules` (M15.33).
+- `main.rs`:
+  - Loads `vendedores.yaml` at boot via
+    `config::load_vendedores`, builds the lookup, threads
+    it through both `PluginDeps` (broker hop) +
+    `AdminState` (PUT live-reload).
+
+### Test count
+
+138 unit + 8 cross-tenant + 6 microapp proxy + 25 plugin /
+firehose / admin + 7 thread + 23 config + 1 live-reload +
+**9 notification** = **217 green** (was 208).
+
+### Operator note
+
+The agent's runtime today doesn't ship a generic forwarder
+that subscribes to `agent.email.notification.<id>` — the
+publisher side is wired so the topic is live; operators
+can hand-roll a small bridge service or wait for the
+framework forwarder (M22+ scope). Empty subscriber list
+is fine: marketing's `BrokerSender::publish` succeeds even
+with zero consumers (logged at debug, not warn).
+
 ## 0.8.1 — 2026-05-07 (M15.35 — Vendedor agent binding wire shape)
 
 Picks up the framework's `nexo-tool-meta::marketing::Vendedor`

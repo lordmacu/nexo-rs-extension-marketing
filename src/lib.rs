@@ -28,6 +28,7 @@ pub mod error;
 pub mod firehose;
 pub mod identity;
 pub mod lead;
+pub mod notification;
 pub mod plugin;
 pub mod tenant;
 pub mod tools;
