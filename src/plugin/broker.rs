@@ -45,7 +45,8 @@ use crate::lead::{
     RouteOutcome,
 };
 use crate::notification::{
-    maybe_notify_lead_created, NotificationOutcome, VendedorLookup,
+    maybe_notify_lead_created, maybe_notify_lead_replied, NotificationOutcome,
+    VendedorLookup,
 };
 use crate::plugin::IdentityDeps;
 use crate::tenant::TenantId;
@@ -413,6 +414,47 @@ pub async fn handle_inbound_event(
                 thread_id: parsed.thread_id.clone(),
                 at_ms: now_ms,
             });
+        }
+        // M15.40 — operator notification on existing-thread
+        // reply. Same publish path as LeadCreated: classifier
+        // gates on vendedor.notification_settings.on_lead_replied
+        // + agent_id presence; the forwarder (M15.39) routes to
+        // WA / email outbound. Fire-and-forget — never blocks
+        // the broker hop on a transient daemon hiccup.
+        if let (Some(lookup), Some(broker_sender)) = (vendedores, broker.as_ref()) {
+            match maybe_notify_lead_replied(tenant_id, lookup, &lead, &parsed) {
+                NotificationOutcome::Publish { topic, payload } => {
+                    let json_payload = serde_json::to_value(&payload)
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    let event = nexo_microapp_sdk::BrokerEvent::new(
+                        topic.clone(),
+                        "marketing.notification",
+                        json_payload,
+                    );
+                    if let Err(e) = broker_sender.publish(&topic, event).await {
+                        tracing::warn!(
+                            target: "plugin.marketing.broker",
+                            error = %e,
+                            topic = %topic,
+                            "lead_replied notification publish failed (non-fatal)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            target: "plugin.marketing.broker",
+                            topic = %topic,
+                            channel = ?payload.channel,
+                            "lead_replied notification published"
+                        );
+                    }
+                }
+                other => {
+                    tracing::trace!(
+                        target: "plugin.marketing.broker",
+                        outcome = ?other,
+                        "lead_replied notification skipped"
+                    );
+                }
+            }
         }
         return HandledOutcome::LeadUpdated {
             lead_id: lead.id.clone(),

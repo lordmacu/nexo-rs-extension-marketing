@@ -5,22 +5,36 @@ Each entry: origin milestone · estimated effort · acceptance criteria.
 
 ## 🟠 High · UX visible
 
-### F2 · Publish notifications for the 3 remaining kinds
+### F2.a · Publish `LeadReplied` ✅ — done in M15.40
+
+### F2.b · `LeadTransitioned` + `MeetingIntent` (blocked on SDK lift)
 
 - **Origin:** M15.38
-- **Status:** wire shape defines `LeadCreated`, `LeadTransitioned`,
-  `DraftPending`, `MeetingIntent` — only `LeadCreated` publishes today.
-- **Impact:** operator enables "Transición de estado" toggle + never
-  receives anything → broken expectation.
-- **Plan:**
-  - `LeadTransitioned` — fire from `LeadStore::transition()` after
-    the new state lands. Wire `maybe_notify_transitioned`
-    classifier in `notification.rs`.
-  - `MeetingIntent` — fire from `tools::lead_detect_meeting_intent`
-    when `confidence >= 0.7`.
-  - `DraftPending` — defer to M22 (draft pipeline doesn't ship
-    until then).
-- **Effort:** ~120 LOC + 3 new classifier tests.
+- **Status:** classifiers blocked because tools don't have
+  `BrokerSender` access in the current `nexo-microapp-sdk`
+  `on_tool` signature. Marketing's `lead_mark_qualified` +
+  `lead_detect_meeting_intent` tools fire transitions /
+  intents but can't publish to the broker.
+- **Plan (in order):**
+  1. **SDK lift** in `nexo-microapp-sdk`:
+     - `#[derive(Clone)]` on `BrokerSender` (single line).
+     - New `PluginAdapter::on_tool_with_context(handler)` method
+       where `handler: Fn(ToolInvocation, ToolContext) -> Fut`
+       and `ToolContext` carries `broker: BrokerSender` +
+       extensible. Backwards-compatible alongside `on_tool`.
+     - Wire SDK to construct ToolContext in `dispatch_loop`
+       at `tool.invoke` handling (already has writer/pending/
+       next_id Arcs in scope).
+  2. **Marketing extension migration**:
+     - `plugin/dispatch.rs` switches to `on_tool_with_context`.
+     - `tools::lead_mark_qualified::handle` accepts
+       `broker: &BrokerSender, vendedores: Option<&VendedorLookup>`,
+       publishes notification post-transition.
+     - `tools::lead_detect_meeting_intent::handle` similar
+       when `confidence >= 0.7`.
+  3. **`DraftPending`** — defer to M22 (draft pipeline doesn't
+     exist yet).
+- **Effort:** ~80 LOC SDK + ~120 LOC marketing + 5 new tests.
 
 ### F4 · Reconciliation race condition (M15.37)
 
@@ -46,18 +60,7 @@ Each entry: origin milestone · estimated effort · acceptance criteria.
   - VendedorForm's agent dropdown filters `active=true`.
 - **Effort:** ~80 LOC.
 
-### F8 · `notify_on_thread_bumped` missing
-
-- **Origin:** M15.38
-- **Status:** broker hop fires `LeadFirehoseEvent::ThreadBumped`
-  for inbound on existing threads — no notification kind
-  corresponding.
-- **Impact:** operator misses "client replied" pings —
-  conversation-in-progress UX gap.
-- **Plan:** add `EmailNotificationKind::LeadReplied` (or rename
-  ThreadBumped). Toggle `on_lead_replied` in settings. Publish
-  from the existing thread-bump branch in `broker.rs`.
-- **Effort:** ~80 LOC + 1 form checkbox.
+### F8 · `LeadReplied` notification ✅ — done in M15.40
 
 ## 🟡 Medium · technical debt
 

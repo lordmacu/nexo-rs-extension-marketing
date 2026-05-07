@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.10.1 — 2026-05-07 (M15.40 — LeadReplied notification)
+
+Adds the "client replied to an active thread" notification —
+fires from the broker hop's existing-thread branch. Same
+architecture as `LeadCreated` (M15.38) so no SDK changes
+needed. Closes F8 + half of F2 (the half that lands without
+SDK lift).
+
+### Implemented
+
+- `notification.rs`:
+  - Refactored shared `classify` helper used by both
+    `maybe_notify_lead_created` + new `maybe_notify_lead_replied`.
+    DRY — same gates (vendedor-missing / not-configured /
+    event-disabled / no-agent / channel-disabled) factored
+    out, only the per-event `is_enabled` closure differs.
+  - `render_summary` adds ES + EN templates for `LeadReplied`:
+    - ES: `💬 {from} respondió\nHilo: {subj}\nVendedor: {ve}`
+    - EN: `💬 {from} replied\nThread: {subj}\nVendedor: {ve}`
+  - 3 new tests: dedicated toggle short-circuits, happy path
+    publishes with distinct kind, EN summary uses `replied`.
+- `plugin/broker.rs`:
+  - Existing-thread branch now publishes the notification
+    after the firehose `ThreadBumped` frame. Fire-and-forget
+    via `BrokerSender::publish` — failures log warn.
+- `FOLLOWUPS.md`:
+  - F8 marked resolved.
+  - F2 split into F2.a (LeadReplied — done) + F2.b
+    (LeadTransitioned + MeetingIntent — blocked on SDK lift).
+
+### Test count
+
+138 unit + 8 cross-tenant + 6 microapp proxy + 25 plugin /
+firehose / admin + 7 thread + 23 config + 1 live-reload +
+9 forwarder + **12 notification (was 9, +3 LeadReplied)** =
+**229 green** (was 226).
+
 ## 0.10.0 — 2026-05-07 (M15.39 — notification forwarder · cierra end-to-end)
 
 The notification publisher (M15.38) now has a consumer: the

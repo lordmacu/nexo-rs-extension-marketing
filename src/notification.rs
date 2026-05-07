@@ -80,6 +80,50 @@ pub fn maybe_notify_lead_created(
     lead: &Lead,
     parsed: &ParsedInbound,
 ) -> NotificationOutcome {
+    classify(
+        tenant_id,
+        vendedores,
+        lead,
+        parsed,
+        EmailNotificationKind::LeadCreated,
+        |s| s.on_lead_created,
+    )
+}
+
+/// M15.40 — same shape as `maybe_notify_lead_created` but for
+/// the existing-thread reply event. The broker hop fires this
+/// from the `find_by_thread → Some(lead)` branch.
+pub fn maybe_notify_lead_replied(
+    tenant_id: &TenantId,
+    vendedores: &VendedorLookup,
+    lead: &Lead,
+    parsed: &ParsedInbound,
+) -> NotificationOutcome {
+    classify(
+        tenant_id,
+        vendedores,
+        lead,
+        parsed,
+        EmailNotificationKind::LeadReplied,
+        |s| s.on_lead_replied,
+    )
+}
+
+/// Common classifier shared between `lead_created` +
+/// `lead_replied` (and future kinds). Reads the per-event
+/// toggle via `is_enabled` closure so the call sites stay
+/// declarative.
+fn classify<F>(
+    tenant_id: &TenantId,
+    vendedores: &VendedorLookup,
+    lead: &Lead,
+    parsed: &ParsedInbound,
+    kind: EmailNotificationKind,
+    is_enabled: F,
+) -> NotificationOutcome
+where
+    F: FnOnce(&nexo_tool_meta::marketing::VendedorNotificationSettings) -> bool,
+{
     let map = vendedores.load();
     let v = match map.get(&lead.vendedor_id) {
         Some(v) => v,
@@ -89,7 +133,7 @@ pub fn maybe_notify_lead_created(
         Some(s) => s,
         None => return NotificationOutcome::NotConfigured,
     };
-    if !settings.on_lead_created {
+    if !is_enabled(settings) {
         return NotificationOutcome::EventDisabled;
     }
     let agent_id = match &v.agent_id {
@@ -100,9 +144,9 @@ pub fn maybe_notify_lead_created(
         return NotificationOutcome::ChannelDisabled;
     }
 
-    let summary = render_summary(EmailNotificationKind::LeadCreated, parsed, v);
+    let summary = render_summary(kind.clone(), parsed, v);
     let payload = EmailNotification {
-        kind: EmailNotificationKind::LeadCreated,
+        kind,
         tenant_id: TenantIdRef(tenant_id.as_str().into()),
         agent_id: agent_id.clone(),
         lead_id: lead.id.clone(),
@@ -145,8 +189,20 @@ fn render_summary(
             subj = parsed.subject,
             ve = v.primary_email,
         ),
-        // Future kinds — fall through with a generic stub
-        // that the WA forwarder can still display.
+        (EmailNotificationKind::LeadReplied, "en") => format!(
+            "💬 {from} replied\nThread: {subj}\nVendedor: {ve}",
+            subj = parsed.subject,
+            ve = v.primary_email,
+        ),
+        (EmailNotificationKind::LeadReplied, _) => format!(
+            "💬 {from} respondió\nHilo: {subj}\nVendedor: {ve}",
+            subj = parsed.subject,
+            ve = v.primary_email,
+        ),
+        // Future kinds (Transitioned, DraftPending, MeetingIntent)
+        // — fall through with a generic stub that the WA
+        // forwarder can still display while we wire publish
+        // points (F2 in FOLLOWUPS).
         (other, _) => format!(
             "📧 {other:?} · {from} · {subj}",
             subj = parsed.subject,
@@ -387,6 +443,78 @@ mod tests {
                 }
                 other => panic!("expected Email channel, got {other:?}"),
             },
+            other => panic!("expected Publish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lead_replied_classifier_uses_dedicated_toggle() {
+        // Settings has on_lead_created=true, on_lead_replied=false.
+        // Classifier for replied should short-circuit
+        // EventDisabled while created would fire normally.
+        let mut s = VendedorNotificationSettings::default();
+        s.on_lead_replied = false;
+        let v = vendedor_with("pedro", Some("pedro-agent"), Some(s));
+        let lk = lookup(vec![v]);
+        let out = maybe_notify_lead_replied(
+            &TenantId::new("acme").unwrap(),
+            &lk,
+            &lead_with("pedro"),
+            &parsed_inbound(),
+        );
+        assert_eq!(out, NotificationOutcome::EventDisabled);
+    }
+
+    #[test]
+    fn lead_replied_happy_path_publishes_with_distinct_kind() {
+        let s = VendedorNotificationSettings::default();
+        let v = vendedor_with("pedro", Some("pedro-agent"), Some(s));
+        let lk = lookup(vec![v]);
+        let out = maybe_notify_lead_replied(
+            &TenantId::new("acme").unwrap(),
+            &lk,
+            &lead_with("pedro"),
+            &parsed_inbound(),
+        );
+        match out {
+            NotificationOutcome::Publish { topic, payload } => {
+                assert_eq!(topic, "agent.email.notification.pedro-agent");
+                assert_eq!(payload.kind, EmailNotificationKind::LeadReplied);
+                // ES default: replied summary uses 💬 + "respondió"
+                assert!(
+                    payload.summary.contains("respondió"),
+                    "ES summary should use 'respondió': {}",
+                    payload.summary
+                );
+                assert!(payload.summary.starts_with("💬"));
+            }
+            other => panic!("expected Publish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lead_replied_english_summary_uses_replied_verb() {
+        let mut v = vendedor_with(
+            "pedro",
+            Some("pedro-agent"),
+            Some(VendedorNotificationSettings::default()),
+        );
+        v.preferred_language = Some("en".into());
+        let lk = lookup(vec![v]);
+        let out = maybe_notify_lead_replied(
+            &TenantId::new("acme").unwrap(),
+            &lk,
+            &lead_with("pedro"),
+            &parsed_inbound(),
+        );
+        match out {
+            NotificationOutcome::Publish { payload, .. } => {
+                assert!(
+                    payload.summary.contains("replied"),
+                    "EN summary should use 'replied': {}",
+                    payload.summary
+                );
+            }
             other => panic!("expected Publish, got {other:?}"),
         }
     }
