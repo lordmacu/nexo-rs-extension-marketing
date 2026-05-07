@@ -1,5 +1,89 @@
 # Changelog
 
+## 0.10.0 — 2026-05-07 (M15.39 — notification forwarder · cierra end-to-end)
+
+The notification publisher (M15.38) now has a consumer: the
+same marketing extension subscribes to its own
+`agent.email.notification.*` topic and forwards to
+`plugin.outbound.{whatsapp,email}.<instance>`. End-to-end
+operator notification works without framework changes — the
+forwarder lives in the plugin subprocess + uses topic-prefix
+dispatch in the existing broker hop.
+
+### Architecture decision
+
+The plugin subprocess CANNOT call admin RPC, so it cannot
+resolve `agent.inbound_bindings` at notification time. The
+frontend resolves the WA / email plugin instance at vendedor
+save-time and bakes the resolved string into
+`vendedor.notification_settings.channel`. The marketing
+extension's publisher (M15.38) propagates the channel
+verbatim into the `EmailNotification` payload; the forwarder
+reads from there. Stale bindings (operator re-pairs WA
+post-save) require a vendedor re-save — form surfaces the
+warning.
+
+### Implemented
+
+- New `src/forwarder.rs`:
+  - `classify_forward(topic, payload)` returns
+    `ForwardOutcome { Skipped | Malformed | NoChannel |
+    UnresolvedInstance{kind} | Forward{topic, body} }` —
+    pure classifier, no IO.
+  - `handle_notification_event(topic, payload, broker)`
+    drives the outcome through `BrokerSender::publish`.
+    Failures log warn — never bubble.
+  - `whatsapp_outbound_body` builds a
+    `{kind: "send_text", to: "agent:<id>", body, metadata}`
+    envelope the wabridge plugin consumes.
+  - `email_outbound_body` builds a
+    `{kind: "send", from_instance, to, subject, body_text,
+    metadata}` envelope the email plugin consumes.
+  - 9 unit tests cover off-topic skip, malformed payload,
+    happy WA path, empty instance short-circuit, happy
+    email path, empty `to` short-circuit, Disabled
+    pass-through, dotted agent ids, bare topic.
+- `nexo-plugin.toml` adds
+  `agent.email.notification.*` to `[plugin.subscriptions].broker_topics`.
+- `main.rs` broker closure dispatches by topic prefix:
+  - `agent.email.notification.*` →
+    `forwarder::handle_notification_event`.
+  - `plugin.inbound.email.*` → existing inbound pipeline.
+- `notification.rs` test fixtures updated for the new
+  channel shape (`Whatsapp { instance }` /
+  `Email { from_instance, to }`).
+- New `FOLLOWUPS.md` tracks F2-F17 with severity + effort
+  estimates.
+
+### Test count
+
+138 unit + 8 cross-tenant + 6 microapp proxy + 25 plugin /
+firehose / admin + 7 thread + 23 config + 1 live-reload +
+9 notification + **9 forwarder** = **226 green** (was 217).
+
+### End-to-end flow now works
+
+1. Inbound email → broker hop creates lead.
+2. `maybe_notify_lead_created` builds `EmailNotification`
+   with the baked channel (e.g. `Whatsapp { instance: "personal" }`).
+3. `BrokerSender::publish("agent.email.notification.pedro-agent", …)`.
+4. NATS broker delivers the event back to the marketing
+   extension (same plugin, declared subscription).
+5. `forwarder::handle_notification_event` decodes, classifies,
+   publishes `plugin.outbound.whatsapp.personal` with the
+   summary as `body`.
+6. The wabridge plugin (subscribed to its own outbound topic)
+   sends the message to the operator's phone.
+
+### Operator setup
+
+The forwarder runs automatically — no extra config beyond
+the existing M15.38 vendedor save flow. Frontend (M15.39)
+auto-resolves the WA instance from `agent.inbound_bindings`
+when the operator picks the `Whatsapp` channel. For email,
+operator types the `from_instance` (mailbox id from
+`/m/marketing/settings/mailboxes`) + `to`.
+
 ## 0.9.0 — 2026-05-07 (M15.38 — operator notifications via agent)
 
 Marketing publishes typed `EmailNotification` frames to

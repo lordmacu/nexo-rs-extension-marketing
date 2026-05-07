@@ -318,7 +318,14 @@ mod tests {
                 assert_eq!(payload.agent_id, "pedro-agent");
                 assert_eq!(payload.vendedor_id.0, "pedro");
                 assert_eq!(payload.from_email, "cliente@empresa.com");
-                assert_eq!(payload.channel, NotificationChannel::Whatsapp);
+                match &payload.channel {
+                    NotificationChannel::Whatsapp { instance } => {
+                        // Default-built settings carry an empty
+                        // instance — frontend resolves before save.
+                        assert_eq!(instance, "");
+                    }
+                    other => panic!("expected Whatsapp, got {other:?}"),
+                }
                 assert!(
                     payload.summary.contains("Nuevo lead"),
                     "summary should be ES by default: {}",
@@ -361,6 +368,7 @@ mod tests {
     fn email_channel_passes_through_to_payload() {
         let mut s = VendedorNotificationSettings::default();
         s.channel = NotificationChannel::Email {
+            from_instance: "ventas-acme".into(),
             to: "ops@acme.com".into(),
         };
         let v = vendedor_with("pedro", Some("pedro-agent"), Some(s));
@@ -373,7 +381,8 @@ mod tests {
         );
         match out {
             NotificationOutcome::Publish { payload, .. } => match payload.channel {
-                NotificationChannel::Email { to } => {
+                NotificationChannel::Email { from_instance, to } => {
+                    assert_eq!(from_instance, "ventas-acme");
                     assert_eq!(to, "ops@acme.com");
                 }
                 other => panic!("expected Email channel, got {other:?}"),

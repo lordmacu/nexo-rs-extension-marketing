@@ -34,10 +34,15 @@ tools = [
 
 [plugin.subscriptions]
 # NATS subjects the daemon's broker should forward to this
-# plugin's stdin. Pattern matches every email plugin instance
-# the operator wires (per-empresa mailboxes).
+# plugin's stdin. Two prefixes:
+#  - `plugin.inbound.email.*` — operator's mailboxes (M15 inbound).
+#  - `agent.email.notification.*` — operator notifications the
+#    extension itself published (M15.38) routed back to the
+#    forwarder module (M15.39). Same plugin process consumes
+#    both via topic-prefix dispatch in `plugin/broker.rs`.
 broker_topics = [
     "plugin.inbound.email.*",
+    "agent.email.notification.*",
 ]
 
 [plugin.sandbox]

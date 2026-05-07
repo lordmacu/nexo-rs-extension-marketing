@@ -182,6 +182,21 @@ async fn main() -> anyhow::Result<()> {
                 let firehose = broker_firehose.clone();
                 let vendedores = broker_vendedores.clone();
                 async move {
+                    // M15.39 — single broker subscriber, two
+                    // dispatchers. Topic prefix routes between:
+                    //   - inbound email pipeline (lead create /
+                    //     bump / firehose / notify publish)
+                    //   - notification forwarder (route to WA /
+                    //     email outbound based on baked target)
+                    if topic.starts_with("agent.email.notification") {
+                        let _ = nexo_marketing::forwarder::handle_notification_event(
+                            &topic,
+                            event.payload,
+                            &broker,
+                        )
+                        .await;
+                        return;
+                    }
                     // `load_full()` is a lock-free atomic Arc
                     // bump — we get a snapshot of the current
                     // router that won't disappear under us
