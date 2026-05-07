@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.7.0 — 2026-05-07 (M15.32 — config WRITE endpoints)
+
+CRUD loop closes: `PUT /config/{mailboxes|vendedores|rules|
+followup_profiles}` accept the typed list / single document,
+validate via serde, and atomically replace the per-tenant
+YAML file on disk.
+
+Atomic write: serialise → write to `.<file>.tmp` in the same
+directory → fsync → rename. Same-fs rename is a single inode
+swap; a crash mid-write leaves either the old file intact
+OR the new file complete, never half-written.
+
+Reload semantics: rules.yaml drives a `LeadRouter` instantiated
+at boot; the router doesn't re-read the file yet. PUT
+`/config/rules` returns `restart_required: true` so the
+operator UI can surface a banner. Live reload (file watcher
++ atomic-swap of the Arc) lands in M15.33.
+
+### Implemented
+
+- `src/config/mod.rs`:
+  - `write_yaml_atomic(path, value)` — temp-file +
+    fsync + rename helper. Creates the per-tenant subdir
+    (and `state_root`) if missing so first-save doesn't
+    fail.
+  - `save_mailboxes` / `save_vendedores` / `save_followup_profiles`
+    over the generic `save_yaml_list` helper.
+  - `save_rules` for the single-document RuleSet shape.
+  - 6 new write tests: round-trips for the 3 list configs,
+    `mkdir -p` on missing dir, atomic-overwrite leaves no
+    `.<file>.tmp` stragglers, rules round-trip via direct
+    file inspection.
+- `src/admin/config.rs`:
+  - `extract_list<T>` helper — pull `key` out of the JSON
+    envelope + deserialise as `Vec<T>` (or 400 with
+    `invalid_payload` / `missing_field`).
+  - 4 PUT handlers: `put_mailboxes`, `put_vendedores`,
+    `put_followup_profiles`, `put_rules`. Each validates,
+    writes, and returns the parsed payload back so the
+    operator UI can re-seed without an extra GET.
+  - `put_rules` enforces tenant_id matches the auth-stamped
+    tenant — defense-in-depth against a misconfigured client
+    sending a body with a different tenant id (403
+    `tenant_mismatch`).
+  - 6 new admin tests: vendedor PUT round-trips through
+    GET, missing field 400, invalid payload 400, rules PUT
+    flag, cross-tenant 403, followups round-trip.
+- `src/admin/mod.rs` mounts each `/config/*` path with both
+  GET + PUT via `MethodRouter::put`.
+
+### Test count
+
+138 unit + 8 cross-tenant + 6 microapp proxy + 25 plugin /
+firehose / admin + 7 thread + 11 config GET + **12 config
+WRITE (6 store + 6 admin)** = **207 green** (was 195).
+
 ## 0.6.0 — 2026-05-07 (M15.31 — read-only YAML config endpoints)
 
 The 4 admin Settings tabs in the agent-creator microapp now

@@ -101,12 +101,21 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/leads", get(leads::list_handler))
         .route("/leads/:lead_id", get(leads::get_handler))
         .route("/leads/:lead_id/thread", get(leads::thread_handler))
-        .route("/config/mailboxes", get(config::list_mailboxes))
-        .route("/config/vendedores", get(config::list_vendedores))
-        .route("/config/rules", get(config::get_rules))
+        .route(
+            "/config/mailboxes",
+            get(config::list_mailboxes).put(config::put_mailboxes),
+        )
+        .route(
+            "/config/vendedores",
+            get(config::list_vendedores).put(config::put_vendedores),
+        )
+        .route(
+            "/config/rules",
+            get(config::get_rules).put(config::put_rules),
+        )
         .route(
             "/config/followup_profiles",
-            get(config::list_followup_profiles),
+            get(config::list_followup_profiles).put(config::put_followup_profiles),
         )
         .route("/firehose", get(firehose::handler))
         .layer(auth_layer)
