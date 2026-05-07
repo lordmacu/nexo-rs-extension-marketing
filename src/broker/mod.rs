@@ -6,5 +6,9 @@
 //! DKIM / anti-loop stay in the email plugin's hands.
 
 pub mod inbound;
+pub mod outbound;
 
 pub use inbound::{decode_inbound_email, ParsedInbound, ParseError, TenantResolver};
+pub use outbound::{
+    DispatchInput, OutboundDispatchResult, OutboundEmail, OutboundPublisher,
+};
