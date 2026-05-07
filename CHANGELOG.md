@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.8.1 — 2026-05-07 (M15.35 — Vendedor agent binding wire shape)
+
+Picks up the framework's `nexo-tool-meta::marketing::Vendedor`
+lift: `agent_id: Option<String>` + `model_override:
+Option<ModelRef>`. Backward compatible — existing
+`vendedores.yaml` files without the new fields parse cleanly.
+
+### Implemented
+
+- `src/config/mod.rs::tests::fresh_vendedor` adds
+  `agent_id: None, model_override: None` to the test fixture
+  so the `Vendedor` constructor stays exhaustive after the
+  framework change.
+
+No behaviour change yet — the LLM-call pipeline that consumes
+`agent_id` lands in M15.36 (LLM extractor adapter switching
+to `BrokerSender::complete_llm` driven by the bound agent's
+`ModelRef`).
+
 ## 0.8.0 — 2026-05-07 (M15.33 — live router reload)
 
 `PUT /config/rules` no longer requires an extension restart.

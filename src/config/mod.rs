@@ -212,6 +212,8 @@ mod tests {
             on_vacation: false,
             vacation_until: None,
             preferred_language: Some("es".into()),
+            agent_id: None,
+            model_override: None,
         }
     }
 
