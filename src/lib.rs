@@ -20,6 +20,7 @@
 //! point, modules are wiring details.
 
 pub mod broker;
+pub mod compliance;
 pub mod enrichment;
 pub mod error;
 pub mod identity;
