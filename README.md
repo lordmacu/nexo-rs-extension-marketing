@@ -14,7 +14,7 @@ plugin per the [Phase 81.5 plugin contract][contract].
 
 ## Status
 
-✅ **End-to-end plugin shipped (v0.2.0).**
+✅ **End-to-end pipeline shipped (v0.3.0).**
 
 The extension is now a real Phase 81.5 plugin: the daemon
 spawns `nexo-marketing` as a subprocess, hands it `tool.invoke`
@@ -36,12 +36,20 @@ M15 milestones A–I + M15.27 (plugin contract):
 - Cross-tenant isolation suite (8 assertions, release-blocker)
 - **Stdio JSON-RPC plugin contract** + broker subscriber
 
-**165/165 tests** green (138 unit + 8 cross-tenant + 6
-microapp proxy + 13 plugin).
+**166/166 tests** green (138 unit + 8 cross-tenant + 6
+microapp proxy + 14 plugin).
+
+The broker hop now drives the full pipeline: each inbound runs
+the SDK `FallbackChain` (with `display_name` + `reply_to`
+adapters today) → upserts via the SDK identity stores → routes
+through the YAML rule set → creates the lead with real
+`why_routed` audit. LLM extractor + scraper adapters arrive in
+M22 once the operator's LLM client + scraper config land.
 
 Pending follow-ups:
-- Resolver + router fully wired into the broker hop (cold
-  lead today is a placeholder; M22 plumbs the resolver chain).
+- LLM extractor + scraper adapters wired into the chain
+  (M22) — pure additive, no changes to the broker hop's
+  contract.
 - CRUD admin endpoints for rules / mailboxes / vendedores /
   followup_profiles (need YAML write helpers).
 - SSE firehose `/firehose` → tenant-scoped

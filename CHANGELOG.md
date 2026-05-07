@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.3.0 — 2026-05-07 (M15.28 — resolver + router wired into broker hop)
+
+The broker hop is no longer placeholder-only. Each
+`plugin.inbound.email.*` event now drives the full
+resolver → router pipeline: the SDK identity stores get a
+deterministic Person row, the YAML rule set picks a vendedor,
+and the lead lands with a real `why_routed` audit trail.
+
+### Implemented
+
+- `src/plugin/mod.rs`:
+  - New `IdentityDeps { persons, person_emails, chain }`
+    bundle (3 Arcs).
+  - `PluginDeps::with_identity` builder so tests can opt out
+    while production deployments wire it eagerly.
+- `src/plugin/broker.rs` rewritten:
+  - `resolve_person` runs the SDK `FallbackChain` against the
+    parsed inbound, extracting `EnrichmentResult.source` for
+    audit + mapping it to typed `EnrichmentStatus`
+    (`signature` / `display_name` / `reply_to` →
+    `SignatureParsed`, `llm_extractor` → `LlmExtracted`,
+    `cross_thread` → `CrossLinked`).
+  - `route_inbound` calls the YAML dispatcher; `Vendedor`
+    outcomes use the picked id, `Drop` aborts with
+    `HandledOutcome::DroppedByRule`, `NoTarget` (empty
+    round-robin pool) falls back to `unassigned`.
+  - `persist_person` upserts via `PersonStore::upsert`
+    + `PersonEmailStore::add` so subsequent inbounds from
+    the same address cross-thread-link cleanly. Errors
+    downgrade to placeholder ids — never lose the inbound.
+  - `HandledOutcome` gains `DroppedByRule { rule_id }` +
+    `LeadCreated.resolver_source` for unit-test introspection.
+- `src/main.rs`:
+  - Opens the per-tenant identity SQLite pool at
+    `${state_root}/marketing/<tenant>/identity.db`,
+    instantiates the 3 stores, builds a chain with
+    `DisplayNameParser` + `ReplyToReader` (LLM extractor +
+    scraper plug in next milestone), and threads
+    `IdentityDeps` through `PluginDeps`.
+  - Broker subscriber closure captures `(tenant, store,
+    router, identity)` Arcs and calls the new
+    `handle_inbound_event` signature.
+- 6 broker tests (was 5):
+  - off-topic skipped, malformed payload, cold-thread create
+    with real person id + person_email link verification,
+    drop-rule aborts before lead, second inbound bumps thread,
+    placeholder path stays functional when identity / router
+    are absent.
+- Net **+1 test, 166/166 green**.
+
+### Operator note
+
+A new SQLite file lives at
+`${state_root}/marketing/<tenant>/identity.db`. The dev-daemon
+flow auto-creates it; existing operators upgrading don't need
+to migrate state — the file is created on first inbound.
+
 ## 0.2.0 — 2026-05-07 (M15.27 — plugin contract stdio loop)
 
 The extension is no longer HTTP-only. It now drives the canonical

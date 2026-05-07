@@ -26,12 +26,20 @@ use std::sync::Arc;
 use anyhow::Context;
 
 use nexo_marketing::admin::{self, AdminState};
+use nexo_marketing::identity::adapters::{
+    display_name::DisplayNameParser, reply_to::ReplyToReader,
+};
 use nexo_marketing::lead::{router::load_rule_set, LeadRouter, LeadStore};
 use nexo_marketing::plugin::{
     broker::handle_inbound_event, dispatch::dispatch as plugin_dispatch,
-    tool_defs::marketing_tool_defs, PluginDeps,
+    tool_defs::marketing_tool_defs, IdentityDeps, PluginDeps,
 };
 use nexo_marketing::tenant::TenantId;
+use nexo_microapp_sdk::enrichment::FallbackChain;
+use nexo_microapp_sdk::identity::{
+    open_pool, PersonEmailStore, PersonStore, SqliteCompanyStore, SqlitePersonEmailStore,
+    SqlitePersonStore,
+};
 use nexo_microapp_sdk::plugin::{BrokerSender, PluginAdapter, ToolInvocation};
 use nexo_microapp_sdk::BrokerEvent;
 
@@ -77,7 +85,39 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("load rule set for {tenant}"))?;
     let router = Arc::new(LeadRouter::new(tenant.clone(), rule_set));
 
-    let plugin_deps = PluginDeps::new(tenant.clone(), lead_store.clone(), router);
+    // ─── Identity stores + resolver chain ─────────────────────
+    // One pool per tenant; backs Person + PersonEmail + Company
+    // stores. Migration runs eagerly (the SDK's open_pool calls
+    // it). Today's chain is the cheap deterministic adapters
+    // (`display_name` + `reply_to`); the LLM extractor + scraper
+    // adapters wire in M22 once the LLM client + scraper config
+    // come from the operator's YAML.
+    let identity_db_path = tenant.state_dir(&state_root).join("identity.db");
+    if let Some(parent) = identity_db_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+    let identity_pool = open_pool(&identity_db_path)
+        .await
+        .with_context(|| format!("open identity pool at {}", identity_db_path.display()))?;
+    // Touch the companies store so its tables migrate (the
+    // resolver path doesn't write to it yet, but the schema
+    // must be present for downstream company enrichment).
+    let _ = SqliteCompanyStore::new(identity_pool.clone());
+    let persons: Arc<dyn PersonStore> =
+        Arc::new(SqlitePersonStore::new(identity_pool.clone()));
+    let person_emails: Arc<dyn PersonEmailStore> =
+        Arc::new(SqlitePersonEmailStore::new(identity_pool));
+    let chain = Arc::new(FallbackChain::new(
+        vec![Box::new(DisplayNameParser), Box::new(ReplyToReader)],
+        0.7,
+    ));
+    let identity = IdentityDeps::new(persons, person_emails, chain);
+    tracing::info!(tenant = %tenant, "identity stores + resolver chain ready");
+
+    let plugin_deps = PluginDeps::new(tenant.clone(), lead_store.clone(), router.clone())
+        .with_identity(identity.clone());
 
     // ─── Surface 1: HTTP admin ────────────────────────────────
     let admin_state = Arc::new(AdminState::new(bearer).with_store(lead_store.clone()));
@@ -97,6 +137,9 @@ async fn main() -> anyhow::Result<()> {
     // ─── Surface 2: stdio JSON-RPC plugin contract ────────────
     let dispatch_deps = plugin_deps.clone();
     let broker_store = lead_store.clone();
+    let broker_router = router.clone();
+    let broker_identity = identity.clone();
+    let broker_tenant = tenant.clone();
     PluginAdapter::new(MANIFEST)?
         .with_server_version(version)
         .declare_tools(marketing_tool_defs())
@@ -107,10 +150,20 @@ async fn main() -> anyhow::Result<()> {
         .on_broker_event(
             move |topic: String, event: BrokerEvent, broker: BrokerSender| {
                 let store = broker_store.clone();
+                let router = broker_router.clone();
+                let identity = broker_identity.clone();
+                let tenant = broker_tenant.clone();
                 async move {
-                    let _ =
-                        handle_inbound_event(&topic, event.payload, &store, Some(broker))
-                            .await;
+                    let _ = handle_inbound_event(
+                        &topic,
+                        event.payload,
+                        &tenant,
+                        &store,
+                        Some(&router),
+                        Some(&identity),
+                        Some(broker),
+                    )
+                    .await;
                 }
             },
         )

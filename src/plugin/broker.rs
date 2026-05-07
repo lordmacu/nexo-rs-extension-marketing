@@ -13,24 +13,35 @@
 //!    plugin crate; we use our own private deserialise struct
 //!    so the marketing extension stays decoupled.
 //! 3. Run `decode_inbound_email` (RFC 5322) → `ParsedInbound`.
-//! 4. Look up or create a lead in the per-tenant store.
-//!    Existing thread → bump `last_activity_ms`. Cold thread
-//!    → create with placeholder person/vendedor ids until the
-//!    resolver + router pipeline lands (M22).
+//! 4. Run the identity resolver chain → upsert Person via the
+//!    SDK identity stores. Disposable senders short-circuit
+//!    here. Pending outcomes still create a lead with a
+//!    deterministic `placeholder-<uuid5>` person id so the
+//!    operator can confirm in the UI.
+//! 5. Run the YAML routing dispatcher → pick a vendedor.
+//!    `Drop` rule outcome aborts; `NoTarget` (empty
+//!    round-robin pool) falls back to `unassigned`.
+//! 6. Look up or create a lead in the per-tenant store.
 //!
-//! The full pipeline (resolver → router → draft generation
-//! → outbound dispatch) lands in M22; this commit wires the
-//! foundational broker hop so the extension stops being an
-//! HTTP-only service.
+//! Full draft generation + outbound dispatch lives downstream
+//! (M22) — this commit lands the resolver + router so the
+//! pipeline is real end-to-end up to lead creation.
 
 use chrono::Utc;
+use nexo_microapp_sdk::enrichment::{EnrichmentInput, FallbackChain, FallbackOutcome};
+use nexo_microapp_sdk::identity::{Person, PersonEmailStore, PersonStore};
 use nexo_microapp_sdk::plugin::BrokerSender;
-use nexo_tool_meta::marketing::{LeadId, PersonId, VendedorId};
+use nexo_tool_meta::marketing::{
+    EnrichmentResult, EnrichmentStatus, LeadId, PersonId, PersonInferred, TenantIdRef,
+    VendedorId,
+};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::broker::inbound::{decode_inbound_email, ParsedInbound, ParseError};
-use crate::lead::{LeadStore, NewLead};
+use crate::broker::inbound::{decode_inbound_email, ParseError, ParsedInbound};
+use crate::lead::{LeadRouter, LeadStore, NewLead, RouteInputs, RouteOutcome};
+use crate::plugin::IdentityDeps;
+use crate::tenant::TenantId;
 
 /// Wire-shape mirror of `nexo_plugin_email::events::InboundEvent`,
 /// kept private so the extension doesn't depend on the email
@@ -58,20 +69,249 @@ pub enum HandledOutcome {
     /// Logged + dropped — disposables go through this path on
     /// purpose so the audit trail captures them.
     DecodeFailed(String),
+    /// Routing rule dropped the inbound (operator-configured).
+    DroppedByRule { rule_id: Option<String> },
     /// Existing thread already tracked — bumped activity stamp.
     LeadUpdated { lead_id: LeadId, thread_id: String },
-    /// Cold thread → new lead created with placeholder ids.
-    LeadCreated { lead_id: LeadId, thread_id: String },
+    /// Cold thread → new lead created. `resolver_source` is
+    /// the chain adapter that produced the hit (`"placeholder"`
+    /// when the chain returned Pending and we used the
+    /// deterministic uuid5 fallback).
+    LeadCreated {
+        lead_id: LeadId,
+        thread_id: String,
+        resolver_source: String,
+    },
 }
 
-/// Handle one inbound-email broker event. Pure logic — the
-/// `BrokerSender` parameter is reserved for the full pipeline
-/// (publishing `agent.lead.transition.*` after creation) and
-/// goes unused here so unit tests can pass a no-op.
+/// Deterministic person id from a lowercased email — same
+/// algorithm as `tools::lead_profile::derive_placeholder_person_id`.
+/// Stable across calls so the same sender keeps the same id
+/// when the resolver lands a Pending verdict.
+fn placeholder_person_id(email: &str) -> PersonId {
+    let ns = Uuid::NAMESPACE_DNS;
+    let v5 = Uuid::new_v5(&ns, email.to_ascii_lowercase().as_bytes());
+    PersonId(format!("placeholder-{v5}"))
+}
+
+/// Build a `Person` record from a resolver hit. `inferred` may
+/// carry the name extracted by an adapter; we fall back to the
+/// email's local part when not.
+fn person_from_resolver_hit(
+    tenant_id: &TenantId,
+    email: &str,
+    display_name: Option<&str>,
+    result: &EnrichmentResult,
+) -> Person {
+    let now_ms = Utc::now().timestamp_millis();
+    let person_inferred = result.person_inferred.clone();
+    // Prefer (resolver inferred name) > (display name from From) > (email local part).
+    let primary_name = person_inferred
+        .as_ref()
+        .and_then(|p: &PersonInferred| p.name.clone())
+        .or_else(|| display_name.map(|s| s.to_string()))
+        .unwrap_or_else(|| {
+            email
+                .split_once('@')
+                .map(|(local, _)| local.to_string())
+                .unwrap_or_else(|| email.to_string())
+        });
+    Person {
+        id: placeholder_person_id(email),
+        tenant_id: TenantIdRef(tenant_id.as_str().into()),
+        primary_name,
+        primary_email: email.to_ascii_lowercase(),
+        alt_emails: Vec::new(),
+        company_id: None,
+        // Map the resolver source label onto the typed enum.
+        // `signature` / `display_name` / `llm_extractor` / cross-
+        // thread are the supported branches; anything else lands
+        // as `None` (the operator confirms manually).
+        enrichment_status: match result.source.as_str() {
+            "signature" | "display_name" => EnrichmentStatus::SignatureParsed,
+            "llm_extractor" => EnrichmentStatus::LlmExtracted,
+            "cross_thread" => EnrichmentStatus::CrossLinked,
+            "reply_to" => EnrichmentStatus::SignatureParsed,
+            _ => EnrichmentStatus::None,
+        },
+        enrichment_confidence: result.confidence,
+        tags: Vec::new(),
+        created_at_ms: now_ms,
+        last_seen_at_ms: now_ms,
+    }
+}
+
+/// Build a Person record for the Pending resolver path — no
+/// adapter cleared the threshold but we still want a stable
+/// identity row so cross-thread linking works on subsequent
+/// inbounds from the same address.
+fn person_from_pending(
+    tenant_id: &TenantId,
+    email: &str,
+    display_name: Option<&str>,
+) -> Person {
+    let now_ms = Utc::now().timestamp_millis();
+    Person {
+        id: placeholder_person_id(email),
+        tenant_id: TenantIdRef(tenant_id.as_str().into()),
+        primary_name: display_name
+            .map(|s| s.to_string())
+            .or_else(|| {
+                email
+                    .split_once('@')
+                    .map(|(local, _)| local.to_string())
+            })
+            .unwrap_or_else(|| email.to_string()),
+        primary_email: email.to_ascii_lowercase(),
+        alt_emails: Vec::new(),
+        company_id: None,
+        enrichment_status: EnrichmentStatus::None,
+        enrichment_confidence: 0.0,
+        tags: Vec::new(),
+        created_at_ms: now_ms,
+        last_seen_at_ms: now_ms,
+    }
+}
+
+/// Run the resolver chain against the parsed email. Returns
+/// `(person, source_label)`. Disposable detection happens
+/// upstream in `decode_inbound_email`, so we don't re-check
+/// here — every parsed email is already a non-disposable.
+async fn resolve_person(
+    tenant_id: &TenantId,
+    parsed: &ParsedInbound,
+    chain: &FallbackChain,
+) -> (Person, String) {
+    let input = EnrichmentInput {
+        from_email: &parsed.from_email,
+        from_display_name: parsed.from_display_name.as_deref(),
+        subject: &parsed.subject,
+        body_excerpt: &parsed.body_excerpt,
+        reply_to: parsed.reply_to.as_deref(),
+    };
+    match chain.run(&input).await {
+        FallbackOutcome::Hit { result, .. } => {
+            let label = result.source.clone();
+            (
+                person_from_resolver_hit(
+                    tenant_id,
+                    &parsed.from_email,
+                    parsed.from_display_name.as_deref(),
+                    &result,
+                ),
+                label,
+            )
+        }
+        FallbackOutcome::AllExhausted { .. } => (
+            person_from_pending(
+                tenant_id,
+                &parsed.from_email,
+                parsed.from_display_name.as_deref(),
+            ),
+            "placeholder".into(),
+        ),
+    }
+}
+
+/// Run the routing dispatcher against the parsed email + the
+/// resolved person's hint metadata. Returns the chosen
+/// `VendedorId` + the audit `why_routed` chain.
+fn route_inbound(
+    parsed: &ParsedInbound,
+    router: &LeadRouter,
+) -> Result<(Option<VendedorId>, Vec<String>), crate::error::MarketingError> {
+    let inputs = RouteInputs {
+        sender_email: Some(parsed.from_email.clone()),
+        sender_domain_kind: Some(parsed.from_domain_kind),
+        company_industry: None,
+        person_tags: Vec::new(),
+        score: None,
+        body: Some(parsed.body_excerpt.clone()),
+        subject: Some(parsed.subject.clone()),
+    };
+    let outcome = router.route(&inputs)?;
+    Ok(match outcome {
+        RouteOutcome::Vendedor {
+            vendedor_id,
+            matched_rule_id,
+            why,
+        } => {
+            let mut audit = why;
+            if let Some(r) = matched_rule_id {
+                audit.push(format!("rule:{r}"));
+            }
+            (Some(vendedor_id), audit)
+        }
+        RouteOutcome::Drop {
+            matched_rule_id,
+            why,
+        } => {
+            let mut audit = why;
+            audit.push("drop_by_rule".into());
+            if let Some(r) = matched_rule_id {
+                audit.push(format!("rule:{r}"));
+            }
+            (None, audit)
+        }
+        RouteOutcome::NoTarget { why, .. } => {
+            let mut audit = why;
+            audit.push("no_target_fallback_unassigned".into());
+            (Some(VendedorId("unassigned".into())), audit)
+        }
+    })
+}
+
+/// Persist the resolved person + email link. Errors are logged
+/// + downgraded to a placeholder id so a transient store
+/// failure doesn't lose the inbound (the lead still gets
+/// created; the operator can resolve later).
+async fn persist_person(
+    tenant_id: &TenantId,
+    person: Person,
+    identity: &IdentityDeps,
+) -> PersonId {
+    match identity.persons.upsert(tenant_id.as_str(), &person).await {
+        Ok(p) => {
+            // Best-effort link the email → person. Already-linked
+            // is a no-op; cross-tenant impossible by primary key.
+            if let Err(e) = identity
+                .person_emails
+                .add(tenant_id.as_str(), &p.id, &p.primary_email, false)
+                .await
+            {
+                tracing::warn!(
+                    target: "plugin.marketing.broker",
+                    error = %e,
+                    person_id = %p.id.0,
+                    email = %p.primary_email,
+                    "person_email link failed (non-fatal)"
+                );
+            }
+            p.id
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "plugin.marketing.broker",
+                error = %e,
+                "person upsert failed; using placeholder id"
+            );
+            placeholder_person_id(&person.primary_email)
+        }
+    }
+}
+
+/// Handle one inbound-email broker event. The full pipeline:
+/// decode → resolve → route → upsert person → create / bump
+/// lead. Each stage logs at appropriate level + the outcome
+/// surfaces structured for unit tests + future firehose
+/// publishing.
 pub async fn handle_inbound_event(
     topic: &str,
     payload: serde_json::Value,
+    tenant_id: &TenantId,
     store: &LeadStore,
+    router: Option<&LeadRouter>,
+    identity: Option<&IdentityDeps>,
     _broker: Option<BrokerSender>,
 ) -> HandledOutcome {
     if !topic.starts_with("plugin.inbound.email.") && topic != "plugin.inbound.email" {
@@ -116,67 +356,95 @@ pub async fn handle_inbound_event(
         }
     };
 
-    // Look up by thread id first — followups stay on the same lead.
-    match store.find_by_thread(&parsed.thread_id).await {
-        Ok(Some(lead)) => {
-            // Existing thread — bump last_activity_ms via a
-            // lightweight transition no-op. The full pipeline (M22)
-            // will compute sentiment + intent here and publish
-            // `agent.lead.transition.engaged` when state actually
-            // changes; for now the broker hop just logs the touch.
-            tracing::debug!(
+    // Existing thread short-circuits everything below — fastest
+    // path. Resolver + router are skipped because the lead is
+    // already attributed.
+    if let Ok(Some(lead)) = store.find_by_thread(&parsed.thread_id).await {
+        tracing::debug!(
+            target: "plugin.marketing.broker",
+            lead_id = %lead.id.0,
+            thread_id = %parsed.thread_id,
+            "inbound on existing thread"
+        );
+        return HandledOutcome::LeadUpdated {
+            lead_id: lead.id.clone(),
+            thread_id: parsed.thread_id,
+        };
+    }
+
+    // ─── Resolver pass ────────────────────────────────────────
+    let (person_id, resolver_source) = match identity {
+        Some(deps) => {
+            let (person, source) = resolve_person(tenant_id, &parsed, &deps.chain).await;
+            (persist_person(tenant_id, person, deps).await, source)
+        }
+        None => (
+            placeholder_person_id(&parsed.from_email),
+            "no_identity_deps".into(),
+        ),
+    };
+
+    // ─── Router pass ──────────────────────────────────────────
+    let (vendedor_id, mut why_routed) = match router {
+        Some(r) => match route_inbound(&parsed, r) {
+            Ok((Some(v), why)) => (v, why),
+            Ok((None, why)) => {
+                tracing::info!(
+                    target: "plugin.marketing.broker",
+                    from = %parsed.from_email,
+                    why = ?why,
+                    "rule dropped inbound"
+                );
+                let rule_id = why
+                    .iter()
+                    .find_map(|s| s.strip_prefix("rule:").map(str::to_string));
+                return HandledOutcome::DroppedByRule { rule_id };
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "plugin.marketing.broker",
+                    error = %e,
+                    "router error; falling back to unassigned"
+                );
+                (
+                    VendedorId("unassigned".into()),
+                    vec!["router_error_fallback".into()],
+                )
+            }
+        },
+        None => (
+            VendedorId("unassigned".into()),
+            vec!["no_router_deps".into()],
+        ),
+    };
+
+    // ─── Lead create ──────────────────────────────────────────
+    why_routed.push(format!("resolver:{resolver_source}"));
+    let lead_id = LeadId(Uuid::new_v4().to_string());
+    let now_ms = Utc::now().timestamp_millis();
+    let new_lead = NewLead {
+        id: lead_id.clone(),
+        thread_id: parsed.thread_id.clone(),
+        subject: parsed.subject.clone(),
+        person_id,
+        vendedor_id,
+        last_activity_ms: now_ms,
+        why_routed,
+    };
+    match store.create(new_lead).await {
+        Ok(lead) => {
+            tracing::info!(
                 target: "plugin.marketing.broker",
                 lead_id = %lead.id.0,
                 thread_id = %parsed.thread_id,
-                "inbound on existing thread"
+                from = %parsed.from_email,
+                resolver = %resolver_source,
+                "created cold lead from inbound email"
             );
-            HandledOutcome::LeadUpdated {
-                lead_id: lead.id.clone(),
+            HandledOutcome::LeadCreated {
+                lead_id: lead.id,
                 thread_id: parsed.thread_id,
-            }
-        }
-        Ok(None) => {
-            // Cold thread — create a placeholder lead. The resolver
-            // + router pipeline (M22) will replace the placeholder
-            // ids with the real PersonId / VendedorId; today the
-            // operator UI shows the lead with the synthetic ids
-            // and the routed-from email + subject.
-            let lead_id = LeadId(Uuid::new_v4().to_string());
-            let now_ms = Utc::now().timestamp_millis();
-            let placeholder_person = PersonId(format!("placeholder:{}", parsed.from_email));
-            let placeholder_vendedor = VendedorId("unassigned".into());
-            let new_lead = NewLead {
-                id: lead_id.clone(),
-                thread_id: parsed.thread_id.clone(),
-                subject: parsed.subject.clone(),
-                person_id: placeholder_person,
-                vendedor_id: placeholder_vendedor,
-                last_activity_ms: now_ms,
-                why_routed: vec!["inbound_no_resolver_yet".into()],
-            };
-            match store.create(new_lead).await {
-                Ok(lead) => {
-                    tracing::info!(
-                        target: "plugin.marketing.broker",
-                        lead_id = %lead.id.0,
-                        thread_id = %parsed.thread_id,
-                        from = %parsed.from_email,
-                        "created cold lead from inbound email"
-                    );
-                    HandledOutcome::LeadCreated {
-                        lead_id: lead.id,
-                        thread_id: parsed.thread_id,
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(
-                        target: "plugin.marketing.broker",
-                        thread_id = %parsed.thread_id,
-                        error = %e,
-                        "lead create failed"
-                    );
-                    HandledOutcome::DecodeFailed(e.to_string())
-                }
+                resolver_source,
             }
         }
         Err(e) => {
@@ -184,7 +452,7 @@ pub async fn handle_inbound_event(
                 target: "plugin.marketing.broker",
                 thread_id = %parsed.thread_id,
                 error = %e,
-                "find_by_thread failed"
+                "lead create failed"
             );
             HandledOutcome::DecodeFailed(e.to_string())
         }
@@ -196,20 +464,74 @@ mod tests {
     use super::*;
 
     use std::path::PathBuf;
+    use std::sync::Arc;
 
+    use nexo_microapp_sdk::identity::{
+        open_pool, SqliteCompanyStore, SqlitePersonEmailStore, SqlitePersonStore,
+    };
+    use nexo_tool_meta::marketing::{AssignTarget, RuleSet};
     use serde_json::json;
 
+    use crate::identity::adapters::display_name::DisplayNameParser;
+    use crate::identity::adapters::reply_to::ReplyToReader;
     use crate::tenant::TenantId;
 
-    async fn fresh_store() -> LeadStore {
-        LeadStore::open(PathBuf::from(":memory:"), TenantId::new("acme").unwrap())
+    async fn fresh_store(tenant: &str) -> (LeadStore, TenantId) {
+        let t = TenantId::new(tenant).unwrap();
+        let s = LeadStore::open(PathBuf::from(":memory:"), t.clone())
             .await
-            .expect("open lead store")
+            .expect("open lead store");
+        (s, t)
+    }
+
+    async fn fresh_identity() -> IdentityDeps {
+        let pool = open_pool(":memory:").await.expect("open identity pool");
+        // The companies store is created so the pool is migrated
+        // even though this test path doesn't upsert companies.
+        let _ = SqliteCompanyStore::new(pool.clone());
+        let persons: Arc<dyn PersonStore> = Arc::new(SqlitePersonStore::new(pool.clone()));
+        let person_emails: Arc<dyn PersonEmailStore> =
+            Arc::new(SqlitePersonEmailStore::new(pool));
+        let chain = Arc::new(FallbackChain::new(
+            vec![
+                Box::new(DisplayNameParser),
+                Box::new(ReplyToReader),
+            ],
+            0.7,
+        ));
+        IdentityDeps::new(persons, person_emails, chain)
+    }
+
+    fn drop_all_router(t: &TenantId) -> LeadRouter {
+        LeadRouter::new(
+            t.clone(),
+            RuleSet {
+                tenant_id: TenantIdRef(t.as_str().into()),
+                version: 0,
+                rules: Vec::new(),
+                default_target: AssignTarget::Drop,
+            },
+        )
+    }
+
+    fn unassigned_router(t: &TenantId) -> LeadRouter {
+        // A router whose default fires `Vendedor { id: "unassigned" }`
+        // so a no-rule tenant still creates leads (operator picks up
+        // from the inbox manually).
+        LeadRouter::new(
+            t.clone(),
+            RuleSet {
+                tenant_id: TenantIdRef(t.as_str().into()),
+                version: 0,
+                rules: Vec::new(),
+                default_target: AssignTarget::Vendedor {
+                    id: VendedorId("unassigned".into()),
+                },
+            },
+        )
     }
 
     fn raw_email() -> Vec<u8> {
-        // Minimal valid RFC 5322 message — From + Subject +
-        // Message-Id + body. Enough for decode_inbound_email.
         b"From: =?utf-8?Q?Cliente?= <cliente@empresa.com>\r\n\
           To: ventas@miempresa.com\r\n\
           Subject: Cotizaci\xc3\xb3n CRM\r\n\
@@ -222,11 +544,16 @@ mod tests {
 
     #[tokio::test]
     async fn off_topic_event_is_skipped() {
-        let store = fresh_store().await;
+        let (store, tenant) = fresh_store("acme").await;
+        let router = unassigned_router(&tenant);
+        let identity = fresh_identity().await;
         let out = handle_inbound_event(
             "plugin.outbound.whatsapp.ack",
             json!({}),
+            &tenant,
             &store,
+            Some(&router),
+            Some(&identity),
             None,
         )
         .await;
@@ -235,11 +562,16 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_payload_returns_malformed() {
-        let store = fresh_store().await;
+        let (store, tenant) = fresh_store("acme").await;
+        let router = unassigned_router(&tenant);
+        let identity = fresh_identity().await;
         let out = handle_inbound_event(
             "plugin.inbound.email.acme",
             json!({ "no_fields": true }),
+            &tenant,
             &store,
+            Some(&router),
+            Some(&identity),
             None,
         )
         .await;
@@ -247,8 +579,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cold_thread_creates_lead() {
-        let store = fresh_store().await;
+    async fn cold_thread_creates_lead_with_real_person_id() {
+        let (store, tenant) = fresh_store("acme").await;
+        let router = unassigned_router(&tenant);
+        let identity = fresh_identity().await;
         let payload = json!({
             "account_id": "acct-1",
             "instance": "default",
@@ -258,21 +592,91 @@ mod tests {
         let out = handle_inbound_event(
             "plugin.inbound.email.default",
             payload,
+            &tenant,
             &store,
+            Some(&router),
+            Some(&identity),
             None,
         )
         .await;
-        match out {
-            HandledOutcome::LeadCreated { thread_id, .. } => {
-                assert!(!thread_id.is_empty());
-            }
-            other => panic!("expected LeadCreated, got {other:?}"),
-        }
+        let HandledOutcome::LeadCreated {
+            lead_id,
+            resolver_source,
+            ..
+        } = out
+        else {
+            panic!("expected LeadCreated, got {out:?}");
+        };
+        // Person should be persisted with deterministic id.
+        let owner = identity
+            .person_emails
+            .find_owner("acme", "cliente@empresa.com")
+            .await
+            .expect("person_emails query");
+        assert!(
+            owner.is_some(),
+            "person_email link missing after lead create"
+        );
+        let pid = owner.unwrap();
+        assert!(pid.0.starts_with("placeholder-"));
+
+        // why_routed carries the resolver source.
+        let lead = store.get(&lead_id).await.unwrap().expect("lead row");
+        assert_eq!(
+            lead.vendedor_id.0, "unassigned",
+            "default_target should pin to unassigned"
+        );
+        assert!(
+            lead.why_routed
+                .iter()
+                .any(|s| s.starts_with("resolver:")),
+            "why_routed missing resolver: tag → {:?}",
+            lead.why_routed
+        );
+        assert!(
+            !resolver_source.is_empty(),
+            "resolver_source label must be populated"
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_drops_inbound_when_default_target_is_drop() {
+        let (store, tenant) = fresh_store("acme").await;
+        let router = drop_all_router(&tenant);
+        let identity = fresh_identity().await;
+        let payload = json!({
+            "account_id": "acct-1",
+            "instance": "default",
+            "uid": 42_u32,
+            "raw_bytes": raw_email(),
+        });
+        let out = handle_inbound_event(
+            "plugin.inbound.email.default",
+            payload,
+            &tenant,
+            &store,
+            Some(&router),
+            Some(&identity),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(out, HandledOutcome::DroppedByRule { .. }),
+            "expected DroppedByRule, got {out:?}"
+        );
+        // No lead should have been written.
+        assert_eq!(
+            store.count_by_state(nexo_tool_meta::marketing::LeadState::Cold).await.unwrap(),
+            0,
+            "drop rule should not create a lead row"
+        );
     }
 
     #[tokio::test]
     async fn second_inbound_on_same_thread_updates_existing_lead() {
-        let store = fresh_store().await;
+        let (store, tenant) = fresh_store("acme").await;
+        let router = unassigned_router(&tenant);
+        let identity = fresh_identity().await;
         let payload = json!({
             "account_id": "acct-1",
             "instance": "default",
@@ -282,19 +686,26 @@ mod tests {
         let first = handle_inbound_event(
             "plugin.inbound.email.default",
             payload.clone(),
+            &tenant,
             &store,
+            Some(&router),
+            Some(&identity),
             None,
         )
         .await;
-        let HandledOutcome::LeadCreated { lead_id, thread_id } = first else {
+        let HandledOutcome::LeadCreated {
+            lead_id, thread_id, ..
+        } = first
+        else {
             panic!("first call should create lead, got {first:?}");
         };
-        // Second event with same Message-Id stays on the same
-        // thread → LeadUpdated.
         let second = handle_inbound_event(
             "plugin.inbound.email.default",
             payload,
+            &tenant,
             &store,
+            Some(&router),
+            Some(&identity),
             None,
         )
         .await;
@@ -311,21 +722,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bare_inbound_email_topic_also_handled() {
-        // Some daemons publish on the un-suffixed root topic
-        // when there's only one instance. Verify we accept it.
-        let store = fresh_store().await;
+    async fn placeholder_path_works_when_identity_disabled() {
+        // Tests that the optional identity / router path keeps
+        // the broker hop functional during tests / minimal setups.
+        let (store, tenant) = fresh_store("acme").await;
         let payload = json!({
             "account_id": "acct-1",
             "instance": "default",
             "uid": 99_u32,
             "raw_bytes": raw_email(),
         });
-        let out =
-            handle_inbound_event("plugin.inbound.email", payload, &store, None).await;
+        let out = handle_inbound_event(
+            "plugin.inbound.email.default",
+            payload,
+            &tenant,
+            &store,
+            None,
+            None,
+            None,
+        )
+        .await;
         assert!(
             matches!(out, HandledOutcome::LeadCreated { .. }),
-            "expected LeadCreated on bare topic, got {out:?}"
+            "expected LeadCreated even without identity/router, got {out:?}"
         );
     }
 }
