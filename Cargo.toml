@@ -74,6 +74,7 @@ nexo-compliance-primitives = { path = "../proyecto/crates/compliance-primitives"
 [dev-dependencies]
 tempfile          = "3"
 mockito           = "1"
+tower             = { version = "0.5", features = ["util"] }
 
 [profile.release]
 opt-level     = 3

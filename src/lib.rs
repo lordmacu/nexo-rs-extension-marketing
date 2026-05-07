@@ -19,6 +19,7 @@
 //! surface is intentionally tiny: the binary is the entry
 //! point, modules are wiring details.
 
+pub mod admin;
 pub mod broker;
 pub mod compliance;
 pub mod enrichment;
