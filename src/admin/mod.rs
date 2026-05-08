@@ -21,7 +21,7 @@ use axum::Router;
 
 use crate::firehose::LeadEventBus;
 use crate::lead::{LeadStore, RouterHandle};
-use crate::notification::SellerLookup;
+use crate::notification::{SellerLookup, TemplateLookup};
 use crate::tenant::TenantId;
 
 pub mod auth;
@@ -61,6 +61,12 @@ pub struct AdminState {
     /// next notification publish routes via the fresh
     /// `agent_id` / `notification_settings`.
     pub seller_lookup: Option<SellerLookup>,
+    /// M15.44 — template lookup for operator-supplied
+    /// notification summaries. PUT
+    /// `/config/notification_templates` rebuilds + swaps the
+    /// inner Arc so the broker hop's next render picks up
+    /// the override without a process restart.
+    pub template_lookup: Option<TemplateLookup>,
 }
 
 impl AdminState {
@@ -72,6 +78,7 @@ impl AdminState {
             state_root: None,
             router: None,
             seller_lookup: None,
+            template_lookup: None,
         }
     }
 
@@ -118,6 +125,15 @@ impl AdminState {
         self
     }
 
+    /// Inject the template lookup the broker hop + tools
+    /// captured at boot. `PUT /config/notification_templates`
+    /// swaps a freshly loaded `NotificationTemplates` into
+    /// this Arc so subsequent renders pick up the override.
+    pub fn with_template_lookup(mut self, lookup: TemplateLookup) -> Self {
+        self.template_lookup = Some(lookup);
+        self
+    }
+
     pub fn lookup_store(&self, tenant_id: &TenantId) -> Option<Arc<LeadStore>> {
         self.stores.get(tenant_id).cloned()
     }
@@ -151,6 +167,11 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route(
             "/config/followup_profiles",
             get(config::list_followup_profiles).put(config::put_followup_profiles),
+        )
+        .route(
+            "/config/notification_templates",
+            get(config::get_notification_templates)
+                .put(config::put_notification_templates),
         )
         .route("/firehose", get(firehose::handler))
         .layer(auth_layer)

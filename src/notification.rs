@@ -18,8 +18,10 @@ use std::sync::Arc;
 use chrono::Utc;
 use nexo_tool_meta::marketing::{
     EmailNotification, EmailNotificationKind, Lead, LeadState, NotificationChannel,
-    TenantIdRef, Seller, SellerId,
+    NotificationTemplates, Seller, SellerId, TenantIdRef,
 };
+use nexo_tool_meta::template::render_template;
+use serde_json::json;
 
 use crate::broker::inbound::ParsedInbound;
 use crate::tenant::TenantId;
@@ -39,6 +41,19 @@ pub type SellerLookup = Arc<arc_swap::ArcSwap<HashMap<SellerId, Seller>>>;
 pub fn seller_lookup_from_list(rows: Vec<Seller>) -> SellerLookup {
     let map = rows.into_iter().map(|v| (v.id.clone(), v)).collect();
     Arc::new(arc_swap::ArcSwap::from_pointee(map))
+}
+
+/// M15.44 — lock-free atomic notification template overrides.
+/// `PUT /config/notification_templates` swaps a freshly loaded
+/// `NotificationTemplates` into this Arc; the broker hop's
+/// next render reads the updated strings without a process
+/// restart. `None` (or empty templates) → renderers fall back
+/// to the framework's hardcoded ES/EN strings.
+pub type TemplateLookup = Arc<arc_swap::ArcSwap<NotificationTemplates>>;
+
+/// Build a `TemplateLookup` from a typed templates record.
+pub fn template_lookup_from(templates: NotificationTemplates) -> TemplateLookup {
+    Arc::new(arc_swap::ArcSwap::from_pointee(templates))
 }
 
 /// Decision returned by [`maybe_notify_lead_created`]. Pure
@@ -77,12 +92,14 @@ pub enum NotificationOutcome {
 pub fn maybe_notify_lead_created(
     tenant_id: &TenantId,
     sellers: &SellerLookup,
+    templates: Option<&TemplateLookup>,
     lead: &Lead,
     parsed: &ParsedInbound,
 ) -> NotificationOutcome {
     classify(
         tenant_id,
         sellers,
+        templates,
         lead,
         parsed,
         EmailNotificationKind::LeadCreated,
@@ -96,12 +113,14 @@ pub fn maybe_notify_lead_created(
 pub fn maybe_notify_lead_replied(
     tenant_id: &TenantId,
     sellers: &SellerLookup,
+    templates: Option<&TemplateLookup>,
     lead: &Lead,
     parsed: &ParsedInbound,
 ) -> NotificationOutcome {
     classify(
         tenant_id,
         sellers,
+        templates,
         lead,
         parsed,
         EmailNotificationKind::LeadReplied,
@@ -118,6 +137,7 @@ pub fn maybe_notify_lead_replied(
 pub fn maybe_notify_lead_transitioned(
     tenant_id: &TenantId,
     sellers: &SellerLookup,
+    templates: Option<&TemplateLookup>,
     lead: &Lead,
     from: LeadState,
     to: LeadState,
@@ -143,7 +163,15 @@ pub fn maybe_notify_lead_transitioned(
         return NotificationOutcome::ChannelDisabled;
     }
 
-    let summary = render_transition_summary(from, to, reason, v);
+    let templates_snap = templates.map(|t| t.load());
+    let summary = render_transition_summary(
+        from,
+        to,
+        reason,
+        v,
+        templates_snap.as_ref().map(|s| s.as_ref()),
+        lead,
+    );
     let payload = EmailNotification {
         kind: EmailNotificationKind::LeadTransitioned,
         tenant_id: TenantIdRef(tenant_id.as_str().into()),
@@ -170,6 +198,7 @@ pub fn maybe_notify_lead_transitioned(
 pub fn maybe_notify_meeting_intent(
     tenant_id: &TenantId,
     sellers: &SellerLookup,
+    templates: Option<&TemplateLookup>,
     lead: &Lead,
     confidence: f32,
     evidence_span: &str,
@@ -194,7 +223,14 @@ pub fn maybe_notify_meeting_intent(
         return NotificationOutcome::ChannelDisabled;
     }
 
-    let summary = render_intent_summary(confidence, evidence_span, v);
+    let templates_snap = templates.map(|t| t.load());
+    let summary = render_intent_summary(
+        confidence,
+        evidence_span,
+        v,
+        templates_snap.as_ref().map(|s| s.as_ref()),
+        lead,
+    );
     let payload = EmailNotification {
         kind: EmailNotificationKind::MeetingIntent,
         tenant_id: TenantIdRef(tenant_id.as_str().into()),
@@ -219,8 +255,26 @@ fn render_transition_summary(
     to: LeadState,
     reason: &str,
     v: &Seller,
+    templates: Option<&NotificationTemplates>,
+    lead: &Lead,
 ) -> String {
     let lang = v.preferred_language.as_deref().unwrap_or("es");
+    // M15.44 — operator-supplied template overrides the
+    // hardcoded ES/EN strings when set.
+    if let Some(t) = templates {
+        if let Some(tpl) = t.lead_transitioned.as_ref().and_then(|set| set.for_lang(lang)) {
+            let ctx = json!({
+                "state_from": format!("{from:?}"),
+                "state_to": format!("{to:?}"),
+                "reason": reason,
+                "seller": v.name,
+                "seller_email": v.primary_email,
+                "lead_id": lead.id.0,
+                "subject": lead.subject,
+            });
+            return render_template(tpl, &ctx);
+        }
+    }
     let arrow = format!("{from:?} → {to:?}");
     if lang == "en" {
         format!("🔄 Lead transitioned · {arrow}\nReason: {reason}\nSeller: {ve}", ve = v.primary_email)
@@ -229,9 +283,28 @@ fn render_transition_summary(
     }
 }
 
-fn render_intent_summary(confidence: f32, evidence: &str, v: &Seller) -> String {
+fn render_intent_summary(
+    confidence: f32,
+    evidence: &str,
+    v: &Seller,
+    templates: Option<&NotificationTemplates>,
+    lead: &Lead,
+) -> String {
     let lang = v.preferred_language.as_deref().unwrap_or("es");
     let pct = (confidence * 100.0).round() as i32;
+    if let Some(t) = templates {
+        if let Some(tpl) = t.meeting_intent.as_ref().and_then(|set| set.for_lang(lang)) {
+            let ctx = json!({
+                "confidence_pct": pct,
+                "evidence": evidence,
+                "seller": v.name,
+                "seller_email": v.primary_email,
+                "lead_id": lead.id.0,
+                "subject": lead.subject,
+            });
+            return render_template(tpl, &ctx);
+        }
+    }
     if lang == "en" {
         format!(
             "📅 Meeting intent detected ({pct}%)\nEvidence: {evidence}\nSeller: {ve}",
@@ -252,6 +325,7 @@ fn render_intent_summary(confidence: f32, evidence: &str, v: &Seller) -> String 
 fn classify<F>(
     tenant_id: &TenantId,
     sellers: &SellerLookup,
+    templates: Option<&TemplateLookup>,
     lead: &Lead,
     parsed: &ParsedInbound,
     kind: EmailNotificationKind,
@@ -280,7 +354,14 @@ where
         return NotificationOutcome::ChannelDisabled;
     }
 
-    let summary = render_summary(kind.clone(), parsed, v);
+    let templates_snap = templates.map(|t| t.load());
+    let summary = render_summary(
+        kind.clone(),
+        parsed,
+        v,
+        templates_snap.as_ref().map(|s| s.as_ref()),
+        lead,
+    );
     let payload = EmailNotification {
         kind,
         tenant_id: TenantIdRef(tenant_id.as_str().into()),
@@ -308,12 +389,39 @@ fn render_summary(
     kind: EmailNotificationKind,
     parsed: &ParsedInbound,
     v: &Seller,
+    templates: Option<&NotificationTemplates>,
+    lead: &Lead,
 ) -> String {
     let lang = v.preferred_language.as_deref().unwrap_or("es");
     let from = parsed
         .from_display_name
         .as_deref()
         .unwrap_or(&parsed.from_email);
+    // M15.44 — operator-supplied template overrides hardcoded
+    // ES/EN strings when set. Pick by kind + locale; missing
+    // template → fall through to the hardcoded match below.
+    if let Some(t) = templates {
+        let set = match kind {
+            EmailNotificationKind::LeadCreated => t.lead_created.as_ref(),
+            EmailNotificationKind::LeadReplied => t.lead_replied.as_ref(),
+            // Transitioned + MeetingIntent + DraftPending get
+            // their own render_* fns; they shouldn't reach
+            // here, but defensive None keeps the fall-through
+            // safe.
+            _ => None,
+        };
+        if let Some(tpl) = set.and_then(|s| s.for_lang(lang)) {
+            let ctx = json!({
+                "from": from,
+                "from_email": parsed.from_email,
+                "subject": parsed.subject,
+                "seller": v.name,
+                "seller_email": v.primary_email,
+                "lead_id": lead.id.0,
+            });
+            return render_template(tpl, &ctx);
+        }
+    }
     match (kind, lang) {
         (EmailNotificationKind::LeadCreated, "en") => format!(
             "📧 New lead from {from}\nSubject: {subj}\nSeller: {ve}",
@@ -426,6 +534,7 @@ mod tests {
         let out = maybe_notify_lead_created(
             &TenantId::new("acme").unwrap(),
             &lk,
+            None,
             &lead_with("ghost"),
             &parsed_inbound(),
         );
@@ -439,6 +548,7 @@ mod tests {
         let out = maybe_notify_lead_created(
             &TenantId::new("acme").unwrap(),
             &lk,
+            None,
             &lead_with("pedro"),
             &parsed_inbound(),
         );
@@ -454,6 +564,7 @@ mod tests {
         let out = maybe_notify_lead_created(
             &TenantId::new("acme").unwrap(),
             &lk,
+            None,
             &lead_with("pedro"),
             &parsed_inbound(),
         );
@@ -471,6 +582,7 @@ mod tests {
         let out = maybe_notify_lead_created(
             &TenantId::new("acme").unwrap(),
             &lk,
+            None,
             &lead_with("pedro"),
             &parsed_inbound(),
         );
@@ -486,6 +598,7 @@ mod tests {
         let out = maybe_notify_lead_created(
             &TenantId::new("acme").unwrap(),
             &lk,
+            None,
             &lead_with("pedro"),
             &parsed_inbound(),
         );
@@ -500,6 +613,7 @@ mod tests {
         let out = maybe_notify_lead_created(
             &TenantId::new("acme").unwrap(),
             &lk,
+            None,
             &lead_with("pedro"),
             &parsed_inbound(),
         );
@@ -541,6 +655,7 @@ mod tests {
         let out = maybe_notify_lead_created(
             &TenantId::new("acme").unwrap(),
             &lk,
+            None,
             &lead_with("pedro"),
             &parsed_inbound(),
         );
@@ -568,6 +683,7 @@ mod tests {
         let out = maybe_notify_lead_created(
             &TenantId::new("acme").unwrap(),
             &lk,
+            None,
             &lead_with("pedro"),
             &parsed_inbound(),
         );
@@ -595,6 +711,7 @@ mod tests {
         let out = maybe_notify_lead_replied(
             &TenantId::new("acme").unwrap(),
             &lk,
+            None,
             &lead_with("pedro"),
             &parsed_inbound(),
         );
@@ -609,6 +726,7 @@ mod tests {
         let out = maybe_notify_lead_replied(
             &TenantId::new("acme").unwrap(),
             &lk,
+            None,
             &lead_with("pedro"),
             &parsed_inbound(),
         );
@@ -640,6 +758,7 @@ mod tests {
         let out = maybe_notify_lead_replied(
             &TenantId::new("acme").unwrap(),
             &lk,
+            None,
             &lead_with("pedro"),
             &parsed_inbound(),
         );
@@ -666,6 +785,7 @@ mod tests {
         let out = maybe_notify_lead_transitioned(
             &TenantId::new("acme").unwrap(),
             &lk,
+            None,
             &lead_with("pedro"),
             LeadState::MeetingScheduled,
             LeadState::Qualified,
@@ -683,6 +803,7 @@ mod tests {
         let out = maybe_notify_lead_transitioned(
             &TenantId::new("acme").unwrap(),
             &lk,
+            None,
             &lead_with("pedro"),
             LeadState::MeetingScheduled,
             LeadState::Qualified,
@@ -712,6 +833,7 @@ mod tests {
         let out = maybe_notify_meeting_intent(
             &TenantId::new("acme").unwrap(),
             &lk,
+            None,
             &lead_with("pedro"),
             0.85,
             "Yes, Tuesday at 3pm",
@@ -727,6 +849,7 @@ mod tests {
         let out = maybe_notify_meeting_intent(
             &TenantId::new("acme").unwrap(),
             &lk,
+            None,
             &lead_with("pedro"),
             0.85,
             "Yes, Tuesday at 3pm",
@@ -761,6 +884,7 @@ mod tests {
         let out = maybe_notify_lead_created(
             &TenantId::new("acme").unwrap(),
             &lk,
+            None,
             &lead_with("pedro"),
             &parsed_inbound(),
         );

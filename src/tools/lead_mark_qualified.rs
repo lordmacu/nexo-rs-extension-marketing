@@ -39,6 +39,7 @@ pub async fn handle(
     expected_tenant: &TenantId,
     store: Arc<LeadStore>,
     sellers: Option<&SellerLookup>,
+    templates: Option<&crate::notification::TemplateLookup>,
     broker: Option<&BrokerSender>,
     args: Value,
 ) -> Result<ToolReply, ToolError> {
@@ -72,6 +73,7 @@ pub async fn handle(
                 match maybe_notify_lead_transitioned(
                     expected_tenant,
                     lookup,
+                    templates,
                     &updated,
                     from,
                     LeadState::Qualified,
@@ -170,7 +172,7 @@ mod tests {
     #[tokio::test]
     async fn meeting_to_qualified_persists() {
         let s = store_with_lead_in(LeadState::MeetingScheduled).await;
-        let r = handle(&TenantId::new("acme").unwrap(), s, None, None, args())
+        let r = handle(&TenantId::new("acme").unwrap(), s, None, None, None, args())
             .await
             .unwrap();
         let v = r.as_value();
@@ -182,7 +184,7 @@ mod tests {
     #[tokio::test]
     async fn cold_to_qualified_invalid_transition() {
         let s = store_with_lead_in(LeadState::Cold).await;
-        let r = handle(&TenantId::new("acme").unwrap(), s, None, None, args())
+        let r = handle(&TenantId::new("acme").unwrap(), s, None, None, None, args())
             .await
             .unwrap();
         let v = r.as_value();

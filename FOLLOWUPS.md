@@ -60,15 +60,16 @@ in the confirm modal. Dropdown filters inactive agents.
   in a `sled` cache 1h; lookup before publish.
 - **Effort:** ~80 LOC, 1 new dep.
 
-### F10 · Hardcoded ES/EN summary template
+### F10 · Operator-supplied summary templates ✅ — done in M15.44
 
-- **Origin:** M15.38
-- **Status:** `render_summary` has hardcoded strings; no
-  operator-supplied template per kind / locale.
-- **Plan:** template in `marketing.yaml` with placeholders
-  `{from}`, `{subject}`, `{seller}`. Render via
-  `nexo-tool-meta::template`.
-- **Effort:** ~100 LOC.
+`notification_templates.yaml` per tenant, loaded via
+`load_notification_templates`, threaded through every
+classifier as `Option<&TemplateLookup>`. Render functions try
+the operator template first via `nexo-tool-meta::template`'s
+`{{path}}` syntax, fall back to hardcoded ES/EN. Live-reload
+via `arc_swap` on `PUT /config/notification_templates`.
+Frontend Settings tab "Templates" lets operators edit via
+JSON editor (M15.34 pattern).
 
 ### F15 · No integration test for seller lookup live-reload
 

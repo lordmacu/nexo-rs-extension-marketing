@@ -20,7 +20,7 @@ use nexo_microapp_sdk::identity::{PersonEmailStore, PersonStore};
 
 use crate::firehose::LeadEventBus;
 use crate::lead::{LeadStore, RouterHandle};
-use crate::notification::SellerLookup;
+use crate::notification::{SellerLookup, TemplateLookup};
 use crate::tenant::TenantId;
 
 pub mod broker;
@@ -72,6 +72,11 @@ pub struct PluginDeps {
     /// rebuilds + swaps under the broker hop's nose
     /// (same `arc_swap` pattern as the router live-reload).
     pub sellers: Option<SellerLookup>,
+    /// M15.44 — operator-supplied notification templates.
+    /// `None` = renderers fall back to framework defaults.
+    /// PUT `/config/notification_templates` rebuilds + swaps
+    /// the inner Arc using the same arc_swap pattern.
+    pub templates: Option<TemplateLookup>,
 }
 
 impl PluginDeps {
@@ -86,6 +91,7 @@ impl PluginDeps {
             router,
             identity: None,
             sellers: None,
+            templates: None,
         }
     }
 
@@ -94,6 +100,14 @@ impl PluginDeps {
     /// + the admin handler (PUT sellers rebuild path).
     pub fn with_sellers(mut self, lookup: SellerLookup) -> Self {
         self.sellers = Some(lookup);
+        self
+    }
+
+    /// Builder-style wiring for the templates lookup. Captured
+    /// by the broker hop + tools dispatch + PUT
+    /// /config/notification_templates rebuild path.
+    pub fn with_templates(mut self, lookup: TemplateLookup) -> Self {
+        self.templates = Some(lookup);
         self
     }
 

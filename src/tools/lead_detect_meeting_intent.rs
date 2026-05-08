@@ -52,6 +52,7 @@ pub async fn handle(
     expected_tenant: &TenantId,
     store: Arc<LeadStore>,
     sellers: Option<&SellerLookup>,
+    templates: Option<&crate::notification::TemplateLookup>,
     broker: Option<&BrokerSender>,
     args: Value,
 ) -> Result<ToolReply, ToolError> {
@@ -84,6 +85,7 @@ pub async fn handle(
                 match maybe_notify_meeting_intent(
                     expected_tenant,
                     lookup,
+                    templates,
                     &lead,
                     outcome.confidence,
                     &outcome.evidence,
@@ -239,6 +241,7 @@ mod tests {
             s,
             None,
             None,
+            None,
             args("acme", "Yes, Tuesday at 3pm works for me."),
         )
         .await
@@ -257,6 +260,7 @@ mod tests {
             s,
             None,
             None,
+            None,
             args("acme", "Perfecto, el martes a las 15:00 me sirve."),
         )
         .await
@@ -271,6 +275,7 @@ mod tests {
         let r = handle(
             &TenantId::new("acme").unwrap(),
             s,
+            None,
             None,
             None,
             args("acme", "Te paso link: https://calendly.com/luis/30min."),
@@ -294,6 +299,7 @@ mod tests {
             s,
             None,
             None,
+            None,
             args("acme", "Gracias por la información, lo voy a revisar."),
         )
         .await
@@ -309,6 +315,7 @@ mod tests {
         let r = handle(
             &TenantId::new("acme").unwrap(),
             s,
+            None,
             None,
             None,
             args("globex", "Yes Tuesday"),

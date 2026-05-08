@@ -95,6 +95,16 @@ async fn main() -> anyhow::Result<()> {
     let seller_lookup =
         nexo_marketing::notification::seller_lookup_from_list(sellers_initial);
 
+    // ─── Notification templates lookup (M15.44) ─────────────
+    // Boot snapshot from notification_templates.yaml; PUT
+    // /config/notification_templates rebuilds + swaps. None
+    // entries → renderers fall back to framework defaults.
+    let templates_initial =
+        nexo_marketing::config::load_notification_templates(&state_root, &tenant)
+            .unwrap_or_default();
+    let template_lookup =
+        nexo_marketing::notification::template_lookup_from(templates_initial);
+
     // ─── Identity stores + resolver chain ─────────────────────
     // One pool per tenant; backs Person + PersonEmail + Company
     // stores. Migration runs eagerly (the SDK's open_pool calls
@@ -128,7 +138,8 @@ async fn main() -> anyhow::Result<()> {
 
     let plugin_deps = PluginDeps::new(tenant.clone(), lead_store.clone(), router.clone())
         .with_identity(identity.clone())
-        .with_sellers(seller_lookup.clone());
+        .with_sellers(seller_lookup.clone())
+        .with_templates(template_lookup.clone());
 
     // ─── Lead lifecycle bus (firehose) ────────────────────────
     // Shared between the broker handler (producer) and the
@@ -143,7 +154,8 @@ async fn main() -> anyhow::Result<()> {
             .with_firehose(firehose_bus.clone())
             .with_state_root(state_root.clone())
             .with_router(router.clone())
-            .with_seller_lookup(seller_lookup.clone()),
+            .with_seller_lookup(seller_lookup.clone())
+            .with_template_lookup(template_lookup.clone()),
     );
     let app = admin::router(admin_state);
     let bind = format!("{DEFAULT_BIND}:{port}");
@@ -166,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
     let broker_tenant = tenant.clone();
     let broker_firehose = firehose_bus.clone();
     let broker_sellers = seller_lookup.clone();
+    let broker_templates = template_lookup.clone();
     PluginAdapter::new(MANIFEST)?
         .with_server_version(version)
         .declare_tools(marketing_tool_defs())
@@ -187,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
                 let tenant = broker_tenant.clone();
                 let firehose = broker_firehose.clone();
                 let sellers = broker_sellers.clone();
+                let templates = broker_templates.clone();
                 async move {
                     // M15.39 — single broker subscriber, two
                     // dispatchers. Topic prefix routes between:
@@ -217,6 +231,7 @@ async fn main() -> anyhow::Result<()> {
                         Some(&identity),
                         Some(firehose.as_ref()),
                         Some(&sellers),
+                        Some(&templates),
                         Some(broker),
                     )
                     .await;

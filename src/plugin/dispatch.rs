@@ -77,6 +77,7 @@ pub async fn dispatch(
                 tenant,
                 deps.lead_store.clone(),
                 deps.sellers.as_ref(),
+                deps.templates.as_ref(),
                 ctx.map(|c| &c.broker),
                 inv.args,
             )
@@ -89,6 +90,7 @@ pub async fn dispatch(
                 tenant,
                 deps.lead_store.clone(),
                 deps.sellers.as_ref(),
+                deps.templates.as_ref(),
                 ctx.map(|c| &c.broker),
                 inv.args,
             )

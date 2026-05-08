@@ -18,13 +18,16 @@ use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use nexo_tool_meta::marketing::{FollowupProfile, MailboxConfig, RuleSet, Seller};
+use nexo_tool_meta::marketing::{
+    FollowupProfile, MailboxConfig, NotificationTemplates, RuleSet, Seller,
+};
 use serde_json::{json, Value};
 
 use super::AdminState;
 use crate::config::{
-    load_followup_profiles, load_mailboxes, load_sellers, save_followup_profiles,
-    save_mailboxes, save_rules, save_sellers,
+    load_followup_profiles, load_mailboxes, load_notification_templates, load_sellers,
+    save_followup_profiles, save_mailboxes, save_notification_templates, save_rules,
+    save_sellers,
 };
 use crate::error::MarketingError;
 use crate::lead::router::load_rule_set;
@@ -336,6 +339,84 @@ fn marketing_error(e: MarketingError) -> Response {
         "config_load_failed",
         &e.to_string(),
     )
+}
+
+/// `GET /config/notification_templates` — full
+/// `NotificationTemplates` document. Empty (every locale set
+/// `None`) when missing — `render_summary` falls back to the
+/// framework's hardcoded ES/EN strings.
+pub async fn get_notification_templates(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+) -> Response {
+    let root = match &state.state_root {
+        Some(r) => r,
+        None => return state_root_missing(),
+    };
+    match load_notification_templates(root, &tenant_id) {
+        Ok(templates) => ok(json!({ "templates": templates })),
+        Err(e) => marketing_error(e),
+    }
+}
+
+/// `PUT /config/notification_templates`. Body: `{ "templates":
+/// { ...NotificationTemplates... } }`. Live-reloads the
+/// in-memory template lookup so the next render sees the new
+/// strings without a restart (same `arc_swap` pattern as
+/// `put_rules` / `put_sellers`).
+pub async fn put_notification_templates(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+    Json(body): Json<Value>,
+) -> Response {
+    let root = match &state.state_root {
+        Some(r) => r,
+        None => return state_root_missing(),
+    };
+    let templates_value = match body.get("templates") {
+        Some(v) => v.clone(),
+        None => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "missing_field",
+                "body must carry a 'templates' field",
+            );
+        }
+    };
+    let templates: NotificationTemplates = match serde_json::from_value(templates_value) {
+        Ok(v) => v,
+        Err(e) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_payload",
+                &format!("templates failed validation: {e}"),
+            );
+        }
+    };
+    if let Err(e) = save_notification_templates(root, &tenant_id, &templates) {
+        return marketing_error(e);
+    }
+    // Live-reload the in-memory lookup. When the handle isn't
+    // wired (legacy embedders), the file IS persisted but the
+    // current process keeps using the old templates — operator
+    // sees `reloaded: false` + restarts manually.
+    let reloaded = match &state.template_lookup {
+        Some(handle) => {
+            handle.store(std::sync::Arc::new(templates.clone()));
+            tracing::info!(
+                target: "extension.marketing.config",
+                tenant = %tenant_id.as_str(),
+                "notification templates live-reloaded"
+            );
+            true
+        }
+        None => false,
+    };
+    ok(json!({
+        "templates": templates,
+        "reloaded": reloaded,
+        "restart_required": !reloaded,
+    }))
 }
 
 #[cfg(test)]

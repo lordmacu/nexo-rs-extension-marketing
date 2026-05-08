@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.13.0 — 2026-05-08 (M15.44 — operator-supplied notification templates)
+
+Closes F10. Operators now author per-tenant template overrides
+for the 5 notification kinds (LeadCreated · LeadReplied ·
+LeadTransitioned · MeetingIntent · DraftPending) in
+`notification_templates.yaml`. Templates use
+`nexo-tool-meta::template`'s `{{path}}` syntax + ES/EN per
+kind. Missing template → fall through to framework defaults
+(no behaviour regression for tenants who don't customise).
+
+### Implemented
+
+- Framework lift in `nexo-tool-meta::marketing`:
+  - `NotificationTemplates` document (per-kind
+    `Option<TemplateLocaleSet>`).
+  - `TemplateLocaleSet { es, en }` with `for_lang` accessor
+    that falls through to the other locale when one is
+    missing.
+- `crate::config`:
+  - `load_notification_templates` (missing file → default).
+  - `save_notification_templates` (atomic write same as
+    `save_rules`).
+  - 3 tests (missing file, save round-trip, partial yaml).
+- `crate::notification`:
+  - `TemplateLookup = Arc<ArcSwap<NotificationTemplates>>`
+    + `template_lookup_from` builder.
+  - Every classifier (`maybe_notify_lead_*`,
+    `maybe_notify_meeting_intent`,
+    `maybe_notify_lead_transitioned`) gains a
+    `templates: Option<&TemplateLookup>` arg.
+  - Render fns check the operator template first via
+    `render_template`; fall back to hardcoded strings when
+    the override is `None` for that kind/locale.
+- `plugin/mod.rs::PluginDeps.templates` +
+  `with_templates` builder; `plugin/dispatch.rs` threads
+  through to the 2 ctx-aware tools.
+- `plugin/broker.rs::handle_inbound_event` signature gains
+  `templates: Option<&TemplateLookup>`; both publish paths
+  (Created / Replied) pick it up.
+- `tools::lead_mark_qualified` + `tools::lead_detect_meeting_intent`
+  signatures gain templates arg.
+- `admin/mod.rs::AdminState.template_lookup` +
+  `with_template_lookup` builder + new
+  `GET/PUT /config/notification_templates` routes.
+- `admin/config.rs::get_notification_templates` +
+  `put_notification_templates` (live-reload via
+  `handle.store(Arc::new)`, same arc_swap pattern as
+  `put_rules`).
+- `main.rs` boots templates lookup from
+  `notification_templates.yaml` + threads through
+  `PluginDeps`, `AdminState`, broker closure.
+
+### Test count
+
+138 unit + 8 cross-tenant + 6 microapp proxy + 25 plugin /
+firehose / admin + 7 thread + **26 config (was 23, +3
+templates)** + 1 live-reload + 9 forwarder + 16 notification
+= **236 green** (was 233).
+
 ## 0.12.0 — 2026-05-08 (M15.43 — domain rename `Vendedor` → `Seller`)
 
 Mass rename across every code identifier, file name, route,

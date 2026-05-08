@@ -23,7 +23,9 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use nexo_tool_meta::marketing::{FollowupProfile, MailboxConfig, Seller};
+use nexo_tool_meta::marketing::{
+    FollowupProfile, MailboxConfig, NotificationTemplates, Seller,
+};
 
 use crate::error::MarketingError;
 use crate::tenant::TenantId;
@@ -182,6 +184,38 @@ pub fn save_rules(
 ) -> Result<(), MarketingError> {
     let path = config_path(state_root.as_ref(), tenant, "rules.yaml");
     write_yaml_atomic(&path, rule_set)
+}
+
+/// Read `notification_templates.yaml` (M15.44). Missing file →
+/// `NotificationTemplates::default()` (every locale set None;
+/// `render_summary` falls through to the framework's
+/// hardcoded ES/EN strings).
+pub fn load_notification_templates(
+    state_root: impl AsRef<Path>,
+    tenant: &TenantId,
+) -> Result<NotificationTemplates, MarketingError> {
+    let path = config_path(state_root.as_ref(), tenant, "notification_templates.yaml");
+    if !path.exists() {
+        return Ok(NotificationTemplates::default());
+    }
+    let yaml = std::fs::read_to_string(&path)
+        .map_err(|e| MarketingError::Config(format!("read {}: {e}", path.display())))?;
+    serde_yaml::from_str::<NotificationTemplates>(&yaml)
+        .map_err(|e| MarketingError::Config(format!("parse {}: {e}", path.display())))
+}
+
+/// Write `notification_templates.yaml`. Single-document write —
+/// same atomic-rename pattern as `save_rules`. Caller passes
+/// the post-edit `NotificationTemplates`; missing fields stay
+/// `None` and the publisher falls through to framework
+/// defaults at render-time.
+pub fn save_notification_templates(
+    state_root: impl AsRef<Path>,
+    tenant: &TenantId,
+    templates: &NotificationTemplates,
+) -> Result<(), MarketingError> {
+    let path = config_path(state_root.as_ref(), tenant, "notification_templates.yaml");
+    write_yaml_atomic(&path, templates)
 }
 
 #[cfg(test)]
@@ -403,5 +437,45 @@ mod tests {
         // empty + carries the tenant id.
         assert!(yaml.contains("acme"));
         assert!(yaml.contains("pedro"));
+    }
+
+    #[test]
+    fn missing_notification_templates_yaml_returns_default() {
+        let tmp = tempdir().unwrap();
+        let got = load_notification_templates(tmp.path(), &tenant()).unwrap();
+        assert_eq!(got, NotificationTemplates::default());
+    }
+
+    #[test]
+    fn save_then_load_notification_templates_round_trips() {
+        use nexo_tool_meta::marketing::TemplateLocaleSet;
+        let tmp = tempdir().unwrap();
+        let templates = NotificationTemplates {
+            lead_created: Some(TemplateLocaleSet {
+                es: Some("🚀 [Acme] Lead caliente: {{from}}".into()),
+                en: Some("🚀 [Acme] Hot lead: {{from}}".into()),
+            }),
+            ..Default::default()
+        };
+        save_notification_templates(tmp.path(), &tenant(), &templates).unwrap();
+        let got = load_notification_templates(tmp.path(), &tenant()).unwrap();
+        assert_eq!(got, templates);
+    }
+
+    #[test]
+    fn notification_templates_partial_yaml_parses_with_serde_defaults() {
+        let tmp = tempdir().unwrap();
+        write_yaml(
+            tmp.path(),
+            "notification_templates.yaml",
+            "lead_created:\n  es: \"hola {{from}}\"\n",
+        );
+        let got = load_notification_templates(tmp.path(), &tenant()).unwrap();
+        assert!(got.lead_created.is_some());
+        assert_eq!(
+            got.lead_created.as_ref().unwrap().es.as_deref(),
+            Some("hola {{from}}")
+        );
+        assert!(got.lead_replied.is_none());
     }
 }

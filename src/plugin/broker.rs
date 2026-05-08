@@ -343,6 +343,7 @@ pub async fn handle_inbound_event(
     identity: Option<&IdentityDeps>,
     firehose: Option<&LeadEventBus>,
     sellers: Option<&SellerLookup>,
+    templates: Option<&crate::notification::TemplateLookup>,
     broker: Option<BrokerSender>,
 ) -> HandledOutcome {
     if !topic.starts_with("plugin.inbound.email.") && topic != "plugin.inbound.email" {
@@ -422,7 +423,7 @@ pub async fn handle_inbound_event(
         // WA / email outbound. Fire-and-forget — never blocks
         // the broker hop on a transient daemon hiccup.
         if let (Some(lookup), Some(broker_sender)) = (sellers, broker.as_ref()) {
-            match maybe_notify_lead_replied(tenant_id, lookup, &lead, &parsed) {
+            match maybe_notify_lead_replied(tenant_id, lookup, templates, &lead, &parsed) {
                 NotificationOutcome::Publish { topic, payload } => {
                     let json_payload = serde_json::to_value(&payload)
                         .unwrap_or_else(|_| serde_json::json!({}));
@@ -561,7 +562,7 @@ pub async fn handle_inbound_event(
             // forget so a transient daemon hiccup doesn't
             // sink the lead-create itself.
             if let (Some(lookup), Some(broker_sender)) = (sellers, broker.as_ref()) {
-                match maybe_notify_lead_created(tenant_id, lookup, &lead, &parsed) {
+                match maybe_notify_lead_created(tenant_id, lookup, templates, &lead, &parsed) {
                     NotificationOutcome::Publish { topic, payload } => {
                         let json_payload = serde_json::to_value(&payload)
                             .unwrap_or_else(|_| serde_json::json!({}));
@@ -711,6 +712,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(out, HandledOutcome::Skipped);
@@ -728,6 +730,7 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
             None,
             None,
             None,
@@ -754,6 +757,7 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
             None,
             None,
             None,
@@ -820,6 +824,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -855,6 +860,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         let HandledOutcome::LeadCreated {
@@ -870,6 +876,7 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
             None,
             None,
             None,
@@ -908,6 +915,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -940,6 +948,7 @@ mod tests {
             Some(&router),
             Some(&identity),
             Some(&bus),
+            None,
             None,
             None,
         )
@@ -988,6 +997,7 @@ mod tests {
             Some(&bus),
             None,
             None,
+            None,
         )
         .await;
         let _consume_created = rx.recv().await;
@@ -1000,6 +1010,7 @@ mod tests {
             Some(&router),
             Some(&identity),
             Some(&bus),
+            None,
             None,
             None,
         )
