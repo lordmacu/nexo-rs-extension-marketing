@@ -7,7 +7,7 @@
 //!
 //! M15.41 — when the optional `lead_id` arg is present + the
 //! classifier hits confidence ≥ 0.7 + the tool ctx provides
-//! a `BrokerSender` + the vendedor opted in via
+//! a `BrokerSender` + the seller opted in via
 //! `on_meeting_intent`, publishes a `MeetingIntent`
 //! notification. Fire-and-forget — never sinks the tool reply.
 
@@ -22,7 +22,7 @@ use nexo_tool_meta::marketing::{LeadId, MeetingIntent, TenantIdRef};
 
 use crate::lead::LeadStore;
 use crate::notification::{
-    maybe_notify_meeting_intent, NotificationOutcome, VendedorLookup,
+    maybe_notify_meeting_intent, NotificationOutcome, SellerLookup,
 };
 use crate::tenant::TenantId;
 
@@ -51,7 +51,7 @@ struct Args {
 pub async fn handle(
     expected_tenant: &TenantId,
     store: Arc<LeadStore>,
-    vendedores: Option<&VendedorLookup>,
+    sellers: Option<&SellerLookup>,
     broker: Option<&BrokerSender>,
     args: Value,
 ) -> Result<ToolReply, ToolError> {
@@ -70,14 +70,14 @@ pub async fn handle(
     // Publish notification when ALL of:
     //   - outcome confidence ≥ floor
     //   - lead_id arg supplied + the lead exists for this tenant
-    //   - tool ctx provides BrokerSender + vendedor lookup
-    //   - vendedor opted in (gated inside the classifier)
+    //   - tool ctx provides BrokerSender + seller lookup
+    //   - seller opted in (gated inside the classifier)
     if outcome.confidence >= NOTIFY_CONFIDENCE_FLOOR {
         if let (Some(lead_id), Some(lookup), Some(sender)) =
-            (&parsed.lead_id, vendedores, broker)
+            (&parsed.lead_id, sellers, broker)
         {
             // Look up the lead — needed for the payload's
-            // vendedor_id resolution. Errors degrade silently
+            // seller_id resolution. Errors degrade silently
             // so a transient store hiccup never sinks the tool
             // reply.
             if let Ok(Some(lead)) = store.get(lead_id).await {

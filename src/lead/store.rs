@@ -20,7 +20,7 @@ use crate::error::MarketingError;
 use crate::lead::state::validate_transition;
 use crate::tenant::TenantId;
 use nexo_tool_meta::marketing::{
-    IntentClass, Lead, LeadId, LeadState, PersonId, SentimentBand, TenantIdRef, VendedorId,
+    IntentClass, Lead, LeadId, LeadState, PersonId, SentimentBand, TenantIdRef, SellerId,
 };
 
 /// Input for `LeadStore::create_lead`. Caller fills the fields
@@ -33,7 +33,7 @@ pub struct NewLead {
     pub thread_id: String,
     pub subject: String,
     pub person_id: PersonId,
-    pub vendedor_id: VendedorId,
+    pub seller_id: SellerId,
     pub last_activity_ms: i64,
     pub why_routed: Vec<String>,
 }
@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS leads (
     thread_id           TEXT NOT NULL,
     subject             TEXT NOT NULL,
     person_id           TEXT NOT NULL,
-    vendedor_id         TEXT NOT NULL,
+    seller_id         TEXT NOT NULL,
     state               TEXT NOT NULL,
     score               INTEGER NOT NULL DEFAULT 0,
     sentiment           TEXT NOT NULL DEFAULT 'neutral',
@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS leads (
 );
 CREATE INDEX IF NOT EXISTS idx_leads_thread          ON leads(tenant_id, thread_id);
 CREATE INDEX IF NOT EXISTS idx_leads_person          ON leads(tenant_id, person_id);
-CREATE INDEX IF NOT EXISTS idx_leads_vendedor_state  ON leads(tenant_id, vendedor_id, state);
+CREATE INDEX IF NOT EXISTS idx_leads_seller_state  ON leads(tenant_id, seller_id, state);
 CREATE INDEX IF NOT EXISTS idx_leads_next_check      ON leads(tenant_id, next_check_at_ms)
     WHERE next_check_at_ms IS NOT NULL;
 
@@ -119,7 +119,7 @@ impl LeadStore {
             .unwrap_or_else(|_| "[]".to_string());
         sqlx::query(
             "INSERT INTO leads \
-             (id, tenant_id, thread_id, subject, person_id, vendedor_id, \
+             (id, tenant_id, thread_id, subject, person_id, seller_id, \
               state, score, sentiment, intent, topic_tags_json, \
               last_activity_ms, next_check_at_ms, followup_attempts, why_routed_json) \
              VALUES (?,?,?,?,?,?,'cold',0,'neutral','browsing','[]',?,?,0,?) \
@@ -130,7 +130,7 @@ impl LeadStore {
         .bind(&input.thread_id)
         .bind(&input.subject)
         .bind(&input.person_id.0)
-        .bind(&input.vendedor_id.0)
+        .bind(&input.seller_id.0)
         .bind(input.last_activity_ms)
         .bind(Option::<i64>::None)
         .bind(&why_json)
@@ -160,7 +160,7 @@ impl LeadStore {
         thread_id: &str,
     ) -> Result<Option<Lead>, MarketingError> {
         let row = sqlx::query_as::<_, LeadRow>(
-            "SELECT id, tenant_id, thread_id, subject, person_id, vendedor_id, \
+            "SELECT id, tenant_id, thread_id, subject, person_id, seller_id, \
                     state, score, sentiment, intent, topic_tags_json, \
                     last_activity_ms, next_check_at_ms, followup_attempts, why_routed_json \
              FROM leads WHERE tenant_id = ? AND thread_id = ?",
@@ -249,7 +249,7 @@ impl LeadStore {
         limit: u32,
     ) -> Result<Vec<Lead>, MarketingError> {
         let rows = sqlx::query_as::<_, LeadRow>(
-            "SELECT id, tenant_id, thread_id, subject, person_id, vendedor_id, \
+            "SELECT id, tenant_id, thread_id, subject, person_id, seller_id, \
                     state, score, sentiment, intent, topic_tags_json, \
                     last_activity_ms, next_check_at_ms, followup_attempts, why_routed_json \
              FROM leads \
@@ -431,7 +431,7 @@ impl From<ThreadMessageRow> for ThreadMessage {
 // ── Row mapping ────────────────────────────────────────────────
 
 const SELECT_LEAD: &str =
-    "SELECT id, tenant_id, thread_id, subject, person_id, vendedor_id, \
+    "SELECT id, tenant_id, thread_id, subject, person_id, seller_id, \
             state, score, sentiment, intent, topic_tags_json, \
             last_activity_ms, next_check_at_ms, followup_attempts, why_routed_json \
      FROM leads WHERE tenant_id = ? AND id = ?";
@@ -443,7 +443,7 @@ struct LeadRow {
     thread_id: String,
     subject: String,
     person_id: String,
-    vendedor_id: String,
+    seller_id: String,
     state: String,
     score: i64,
     sentiment: String,
@@ -467,7 +467,7 @@ impl LeadRow {
             thread_id: self.thread_id,
             subject: self.subject,
             person_id: PersonId(self.person_id),
-            vendedor_id: VendedorId(self.vendedor_id),
+            seller_id: SellerId(self.seller_id),
             state: parse_state(&self.state),
             score: self.score.clamp(0, 100) as u8,
             sentiment: parse_sentiment(&self.sentiment),
@@ -569,13 +569,13 @@ mod tests {
         LeadStore::open(PathBuf::from(":memory:"), tenant).await.unwrap()
     }
 
-    fn input(id: &str, person: &str, vendedor: &str) -> NewLead {
+    fn input(id: &str, person: &str, seller: &str) -> NewLead {
         NewLead {
             id: LeadId(id.into()),
             thread_id: format!("th-{id}"),
             subject: "Re: cotización".into(),
             person_id: PersonId(person.into()),
-            vendedor_id: VendedorId(vendedor.into()),
+            seller_id: SellerId(seller.into()),
             last_activity_ms: 1_700_000_000_000,
             why_routed: vec!["fixture".into()],
         }

@@ -4,7 +4,7 @@
 //! step forward). Call-to-`Lost` lives in a separate tool to
 //! keep the audit trail clean.
 //!
-//! M15.41 — when a `BrokerSender` + `VendedorLookup` are
+//! M15.41 — when a `BrokerSender` + `SellerLookup` are
 //! available (Phase 81.17.c.ctx tool dispatch), publishes a
 //! `LeadTransitioned` notification post-success. Fire-and-
 //! forget — failure logs warn, never sinks the tool reply.
@@ -21,7 +21,7 @@ use nexo_tool_meta::marketing::{LeadId, LeadState, TenantIdRef};
 use crate::error::MarketingError;
 use crate::lead::LeadStore;
 use crate::notification::{
-    maybe_notify_lead_transitioned, NotificationOutcome, VendedorLookup,
+    maybe_notify_lead_transitioned, NotificationOutcome, SellerLookup,
 };
 use crate::tenant::TenantId;
 
@@ -38,7 +38,7 @@ struct Args {
 pub async fn handle(
     expected_tenant: &TenantId,
     store: Arc<LeadStore>,
-    vendedores: Option<&VendedorLookup>,
+    sellers: Option<&SellerLookup>,
     broker: Option<&BrokerSender>,
     args: Value,
 ) -> Result<ToolReply, ToolError> {
@@ -62,12 +62,12 @@ pub async fn handle(
         Ok(updated) => {
             // Fire-and-forget notification publish post-transition.
             // Only fires when ALL of: tool ctx provides broker,
-            // vendedor lookup is wired, vendedor opted in via
+            // seller lookup is wired, seller opted in via
             // `on_lead_transitioned`, agent_id is bound, channel
             // is non-Disabled. Misses (NotConfigured / EventDisabled
             // / NoAgentBound / ChannelDisabled) log at trace.
             if let (Some(lookup), Some(sender), Some(from)) =
-                (vendedores, broker, from_state)
+                (sellers, broker, from_state)
             {
                 match maybe_notify_lead_transitioned(
                     expected_tenant,
@@ -127,7 +127,7 @@ pub async fn handle(
 mod tests {
     use super::*;
     use crate::lead::{LeadStore, NewLead};
-    use nexo_tool_meta::marketing::{PersonId, VendedorId};
+    use nexo_tool_meta::marketing::{PersonId, SellerId};
 
     async fn store_with_lead_in(state: LeadState) -> Arc<LeadStore> {
         let s = LeadStore::open(
@@ -141,7 +141,7 @@ mod tests {
             thread_id: "th".into(),
             subject: "x".into(),
             person_id: PersonId("p".into()),
-            vendedor_id: VendedorId("v".into()),
+            seller_id: SellerId("v".into()),
             last_activity_ms: 1,
             why_routed: vec![],
         })

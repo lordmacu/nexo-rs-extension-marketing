@@ -17,7 +17,7 @@ pub struct ScoreInputs<'a> {
     pub intent: Option<IntentClass>,
     pub sentiment: Option<SentimentBand>,
     pub seniority: Option<&'a str>,
-    /// Time between the latest inbound and the agent / vendedor
+    /// Time between the latest inbound and the agent / seller
     /// reply. `None` when the thread doesn't have a reply yet.
     pub reply_latency_ms: Option<u64>,
     /// `true` when the resolver has merged this person across

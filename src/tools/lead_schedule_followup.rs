@@ -58,7 +58,7 @@ pub async fn handle(
 mod tests {
     use super::*;
     use crate::lead::{LeadStore, NewLead};
-    use nexo_tool_meta::marketing::{PersonId, VendedorId};
+    use nexo_tool_meta::marketing::{PersonId, SellerId};
 
     async fn fresh_store(t: &str) -> Arc<LeadStore> {
         let s = LeadStore::open(
@@ -72,7 +72,7 @@ mod tests {
             thread_id: "th-l1".into(),
             subject: "Re".into(),
             person_id: PersonId("p".into()),
-            vendedor_id: VendedorId("v".into()),
+            seller_id: SellerId("v".into()),
             last_activity_ms: 1,
             why_routed: vec![],
         })

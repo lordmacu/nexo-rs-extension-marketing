@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.12.0 — 2026-05-08 (M15.43 — domain rename `Vendedor` → `Seller`)
+
+Mass rename across every code identifier, file name, route,
+HTTP path, YAML config name, and test fixture. Pure refactor —
+no behaviour change. The repo's domain language is now fully
+English; the underlying data model + state machine + routing
+pipeline are unchanged.
+
+### Breaking changes
+
+- **YAML files**: operators must rename
+  `vendedores.yaml` → `sellers.yaml` in every per-tenant
+  state directory (`${state_root}/marketing/<tenant_id>/`).
+  Field renames inside: `vendedor_id` → `seller_id`,
+  `agent_id` unchanged.
+- **HTTP routes**:
+  - `GET /config/vendedores` → `GET /config/sellers`
+  - `PUT /config/vendedores` → `PUT /config/sellers`
+- **Wire shapes**: `Vendedor` → `Seller`, `VendedorId` →
+  `SellerId`. Notification payloads carry `seller_id` /
+  `seller_email`.
+- **Module paths**: `crate::config::load_vendedores` →
+  `crate::config::load_sellers` (et al),
+  `crate::notification::VendedorLookup` →
+  `crate::notification::SellerLookup`, etc.
+
+### Test count
+
+233/233 green (no test count change — pure rename).
+
+### Migration script (operator-facing)
+
+```bash
+# Per-tenant rename (run once per tenant directory):
+cd "${state_root}/marketing/<tenant_id>"
+mv vendedores.yaml sellers.yaml
+sed -i 's/vendedor_id/seller_id/g' *.yaml
+```
+
 ## 0.11.0 — 2026-05-08 (M15.41 — LeadTransitioned + MeetingIntent notifications)
 
 Closes F2.b in `FOLLOWUPS.md`. Tools that mutate state
@@ -21,19 +60,19 @@ need broker access from tools.
 - `notification.rs`:
   - `maybe_notify_lead_transitioned(tenant, lookup, lead, from, to, reason)`
     — fires from `lead_mark_qualified` after a successful
-    state transition. Summary: `🔄 Lead transicionó · {from}→{to}\nMotivo: {reason}\nVendedor: {ve}`.
+    state transition. Summary: `🔄 Lead transicionó · {from}→{to}\nMotivo: {reason}\nSeller: {ve}`.
   - `maybe_notify_meeting_intent(tenant, lookup, lead, confidence, evidence)`
     — fires from `lead_detect_meeting_intent` when
-    `confidence ≥ 0.7`. Summary: `📅 Intent de reunión detectado ({pct}%)\nEvidencia: {evidence}\nVendedor: {ve}`.
+    `confidence ≥ 0.7`. Summary: `📅 Intent de reunión detectado ({pct}%)\nEvidencia: {evidence}\nSeller: {ve}`.
   - Both ES + EN locales rendered.
 - `tools/lead_mark_qualified.rs`:
-  - Signature gains `vendedores: Option<&VendedorLookup>` +
+  - Signature gains `sellers: Option<&SellerLookup>` +
     `broker: Option<&BrokerSender>`. Snapshot the lead's
     state BEFORE transitioning so the notification carries
     the correct `from`. Fire-and-forget publish post-success.
 - `tools/lead_detect_meeting_intent.rs`:
   - Signature gains `store: Arc<LeadStore>` +
-    `vendedores: Option<&VendedorLookup>` +
+    `sellers: Option<&SellerLookup>` +
     `broker: Option<&BrokerSender>`.
   - New optional `lead_id` arg in the JSON schema. When
     present + classifier confidence ≥ 0.7, the tool fetches
@@ -68,12 +107,12 @@ SDK lift).
 - `notification.rs`:
   - Refactored shared `classify` helper used by both
     `maybe_notify_lead_created` + new `maybe_notify_lead_replied`.
-    DRY — same gates (vendedor-missing / not-configured /
+    DRY — same gates (seller-missing / not-configured /
     event-disabled / no-agent / channel-disabled) factored
     out, only the per-event `is_enabled` closure differs.
   - `render_summary` adds ES + EN templates for `LeadReplied`:
-    - ES: `💬 {from} respondió\nHilo: {subj}\nVendedor: {ve}`
-    - EN: `💬 {from} replied\nThread: {subj}\nVendedor: {ve}`
+    - ES: `💬 {from} respondió\nHilo: {subj}\nSeller: {ve}`
+    - EN: `💬 {from} replied\nThread: {subj}\nSeller: {ve}`
   - 3 new tests: dedicated toggle short-circuits, happy path
     publishes with distinct kind, EN summary uses `replied`.
 - `plugin/broker.rs`:
@@ -106,13 +145,13 @@ dispatch in the existing broker hop.
 
 The plugin subprocess CANNOT call admin RPC, so it cannot
 resolve `agent.inbound_bindings` at notification time. The
-frontend resolves the WA / email plugin instance at vendedor
+frontend resolves the WA / email plugin instance at seller
 save-time and bakes the resolved string into
-`vendedor.notification_settings.channel`. The marketing
+`seller.notification_settings.channel`. The marketing
 extension's publisher (M15.38) propagates the channel
 verbatim into the `EmailNotification` payload; the forwarder
 reads from there. Stale bindings (operator re-pairs WA
-post-save) require a vendedor re-save — form surfaces the
+post-save) require a seller re-save — form surfaces the
 warning.
 
 ### Implemented
@@ -170,7 +209,7 @@ firehose / admin + 7 thread + 23 config + 1 live-reload +
 ### Operator setup
 
 The forwarder runs automatically — no extra config beyond
-the existing M15.38 vendedor save flow. Frontend (M15.39)
+the existing M15.38 seller save flow. Frontend (M15.39)
 auto-resolves the WA instance from `agent.inbound_bindings`
 when the operator picks the `Whatsapp` channel. For email,
 operator types the `from_instance` (mailbox id from
@@ -180,14 +219,14 @@ operator types the `from_instance` (mailbox id from
 
 Marketing publishes typed `EmailNotification` frames to
 `agent.email.notification.<agent_id>` whenever a lead-
-lifecycle event matches the bound vendedor's per-event
+lifecycle event matches the bound seller's per-event
 toggles. The agent's runtime / sidecar subscribes and
 forwards via the configured channel — WhatsApp (default,
 reuses agent's existing inbound binding), email (to an
 arbitrary address), or disabled (publish without forward).
 
 This commit ships the publisher side: wire shape consumed,
-vendedor lookup with `arc_swap` live-reload, broker hop
+seller lookup with `arc_swap` live-reload, broker hop
 gates the publish on settings + agent_id presence, classifier
 tested across the 6 short-circuit branches.
 
@@ -196,9 +235,9 @@ tested across the 6 short-circuit branches.
 - `Cargo.toml`: no new deps — `arc-swap` already present
   from M15.33.
 - New `src/notification.rs`:
-  - `VendedorLookup = Arc<ArcSwap<HashMap<VendedorId, Vendedor>>>`
-    + `vendedor_lookup_from_list(rows)` builder.
-  - `NotificationOutcome` enum: `VendedorMissing`,
+  - `SellerLookup = Arc<ArcSwap<HashMap<SellerId, Seller>>>`
+    + `seller_lookup_from_list(rows)` builder.
+  - `NotificationOutcome` enum: `SellerMissing`,
     `NotConfigured`, `EventDisabled`, `NoAgentBound`,
     `ChannelDisabled`, `Publish { topic, payload }`.
   - `maybe_notify_lead_created(tenant, lookup, lead, parsed)`
@@ -206,32 +245,32 @@ tested across the 6 short-circuit branches.
     broker.publish IO so unit tests don't need a broker
     mock.
   - `render_summary` composes the operator-facing line
-    localised to the vendedor's `preferred_language`
+    localised to the seller's `preferred_language`
     (Spanish default, English when set).
   - 9 unit tests cover every short-circuit branch + the
     happy path + the en-locale path + email channel
     pass-through + arc_swap live-reload.
 - `plugin/mod.rs::PluginDeps`:
-  - New `vendedores: Option<VendedorLookup>` field.
-  - `with_vendedores(lookup)` builder.
+  - New `sellers: Option<SellerLookup>` field.
+  - `with_sellers(lookup)` builder.
 - `plugin/broker.rs::handle_inbound_event`:
-  - Signature gains `vendedores: Option<&VendedorLookup>`
+  - Signature gains `sellers: Option<&SellerLookup>`
     + uses the broker sender (was `_broker`) to publish.
-  - On `LeadCreated`, resolves the vendedor via lookup,
+  - On `LeadCreated`, resolves the seller via lookup,
     runs `maybe_notify_lead_created`, fire-and-forget
     publish via `BrokerSender::publish` with a typed
     `nexo_microapp_sdk::BrokerEvent`. Failures log
     warn but don't sink the broker hop.
 - `admin/mod.rs::AdminState`:
-  - New `vendedor_lookup: Option<VendedorLookup>` +
-    `with_vendedor_lookup` builder.
-- `admin/config.rs::put_vendedores`:
+  - New `seller_lookup: Option<SellerLookup>` +
+    `with_seller_lookup` builder.
+- `admin/config.rs::put_sellers`:
   - After atomic YAML write, rebuilds the `HashMap` from
     the freshly persisted rows + `handle.store(Arc::new)`
     — same pattern as `put_rules` (M15.33).
 - `main.rs`:
-  - Loads `vendedores.yaml` at boot via
-    `config::load_vendedores`, builds the lookup, threads
+  - Loads `sellers.yaml` at boot via
+    `config::load_sellers`, builds the lookup, threads
     it through both `PluginDeps` (broker hop) +
     `AdminState` (PUT live-reload).
 
@@ -251,18 +290,18 @@ framework forwarder (M22+ scope). Empty subscriber list
 is fine: marketing's `BrokerSender::publish` succeeds even
 with zero consumers (logged at debug, not warn).
 
-## 0.8.1 — 2026-05-07 (M15.35 — Vendedor agent binding wire shape)
+## 0.8.1 — 2026-05-07 (M15.35 — Seller agent binding wire shape)
 
-Picks up the framework's `nexo-tool-meta::marketing::Vendedor`
+Picks up the framework's `nexo-tool-meta::marketing::Seller`
 lift: `agent_id: Option<String>` + `model_override:
 Option<ModelRef>`. Backward compatible — existing
-`vendedores.yaml` files without the new fields parse cleanly.
+`sellers.yaml` files without the new fields parse cleanly.
 
 ### Implemented
 
-- `src/config/mod.rs::tests::fresh_vendedor` adds
+- `src/config/mod.rs::tests::fresh_seller` adds
   `agent_id: None, model_override: None` to the test fixture
-  so the `Vendedor` constructor stays exhaustive after the
+  so the `Seller` constructor stays exhaustive after the
   framework change.
 
 No behaviour change yet — the LLM-call pipeline that consumes
@@ -320,7 +359,7 @@ broker hop, no contention on the read path.
   - Renamed previous `put_rules_round_trips_with_restart_required_flag`
     → `put_rules_without_router_handle_signals_restart_required`.
   - New `put_rules_with_router_handle_swaps_live`: PUTs a
-    rule set whose `default_target = Vendedor("pedro")`,
+    rule set whose `default_target = Seller("pedro")`,
     asserts the handle's `load_full()` returns the new
     target after the request returns. End-to-end live-swap
     proof.
@@ -344,7 +383,7 @@ manual restart.
 
 ## 0.7.0 — 2026-05-07 (M15.32 — config WRITE endpoints)
 
-CRUD loop closes: `PUT /config/{mailboxes|vendedores|rules|
+CRUD loop closes: `PUT /config/{mailboxes|sellers|rules|
 followup_profiles}` accept the typed list / single document,
 validate via serde, and atomically replace the per-tenant
 YAML file on disk.
@@ -367,7 +406,7 @@ operator UI can surface a banner. Live reload (file watcher
     fsync + rename helper. Creates the per-tenant subdir
     (and `state_root`) if missing so first-save doesn't
     fail.
-  - `save_mailboxes` / `save_vendedores` / `save_followup_profiles`
+  - `save_mailboxes` / `save_sellers` / `save_followup_profiles`
     over the generic `save_yaml_list` helper.
   - `save_rules` for the single-document RuleSet shape.
   - 6 new write tests: round-trips for the 3 list configs,
@@ -378,7 +417,7 @@ operator UI can surface a banner. Live reload (file watcher
   - `extract_list<T>` helper — pull `key` out of the JSON
     envelope + deserialise as `Vec<T>` (or 400 with
     `invalid_payload` / `missing_field`).
-  - 4 PUT handlers: `put_mailboxes`, `put_vendedores`,
+  - 4 PUT handlers: `put_mailboxes`, `put_sellers`,
     `put_followup_profiles`, `put_rules`. Each validates,
     writes, and returns the parsed payload back so the
     operator UI can re-seed without an extra GET.
@@ -386,7 +425,7 @@ operator UI can surface a banner. Live reload (file watcher
     tenant — defense-in-depth against a misconfigured client
     sending a body with a different tenant id (403
     `tenant_mismatch`).
-  - 6 new admin tests: vendedor PUT round-trips through
+  - 6 new admin tests: seller PUT round-trips through
     GET, missing field 400, invalid payload 400, rules PUT
     flag, cross-tenant 403, followups round-trip.
 - `src/admin/mod.rs` mounts each `/config/*` path with both
@@ -408,24 +447,24 @@ helpers land in M15.32.
 ### Implemented
 
 - New `src/config/mod.rs`:
-  - `load_mailboxes` / `load_vendedores` /
+  - `load_mailboxes` / `load_sellers` /
     `load_followup_profiles` — generic `load_yaml_list<T>`
     over `<state_root>/marketing/<tenant_id>/<file>.yaml`.
   - Missing file → empty `Vec<T>` (operator hasn't
     configured yet).
   - Parse failures surface as `MarketingError::Config` so
     the admin layer 500s with a typed body.
-  - 6 unit tests: missing file, vendedor / mailbox /
+  - 6 unit tests: missing file, seller / mailbox /
     followup round-trips, parse error typed, cross-tenant
     isolation via path.
 - New `src/admin/config.rs`:
-  - 4 `GET /config/{mailboxes|vendedores|rules|followup_profiles}`
+  - 4 `GET /config/{mailboxes|sellers|rules|followup_profiles}`
     handlers under the existing bearer + `X-Tenant-Id`
     middleware.
   - `state_root_missing` typed 500 surface so misconfigured
     deployments don't return undefined behaviour.
   - 5 admin tests: missing files → empty lists, rules
-    default-drop, vendedores YAML renders, parse error
+    default-drop, sellers YAML renders, parse error
     surfaces typed code, missing state root → typed 500.
 - `AdminState::with_state_root` builder + `state_root: Option<PathBuf>`
   field; `main.rs` calls it with the same root used for the
@@ -545,7 +584,7 @@ auto-mounts under the existing admin port. Microapp wiring
 The broker hop is no longer placeholder-only. Each
 `plugin.inbound.email.*` event now drives the full
 resolver → router pipeline: the SDK identity stores get a
-deterministic Person row, the YAML rule set picks a vendedor,
+deterministic Person row, the YAML rule set picks a seller,
 and the lead lands with a real `why_routed` audit trail.
 
 ### Implemented
@@ -562,7 +601,7 @@ and the lead lands with a real `why_routed` audit trail.
     (`signature` / `display_name` / `reply_to` →
     `SignatureParsed`, `llm_extractor` → `LlmExtracted`,
     `cross_thread` → `CrossLinked`).
-  - `route_inbound` calls the YAML dispatcher; `Vendedor`
+  - `route_inbound` calls the YAML dispatcher; `Seller`
     outcomes use the picked id, `Drop` aborts with
     `HandledOutcome::DroppedByRule`, `NoTarget` (empty
     round-robin pool) falls back to `unassigned`.
@@ -708,7 +747,7 @@ proxy.
 - **HTTP admin** axum router on loopback with bearer +
   `X-Tenant-Id` middleware. Routes today: `/healthz`,
   `/leads`, `/leads/:id`. CRUD endpoints for rules /
-  mailboxes / vendedores follow.
+  mailboxes / sellers follow.
 - **Cross-tenant isolation suite** (`tests/tenant_isolation.rs`)
   — 8 release-blocker assertions all green: lead get / sweep
   / count / identity persons / person_emails / scraper cache /
@@ -720,7 +759,7 @@ proxy.
 
 ### Pending
 
-- CRUD admin endpoints for rules / mailboxes / vendedores /
+- CRUD admin endpoints for rules / mailboxes / sellers /
   followup_profiles (need YAML write helpers — M22).
 - SSE firehose (`/firehose` → tenant-scoped
   `agent.lead.transition.*`).

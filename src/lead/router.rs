@@ -13,7 +13,7 @@ use std::path::Path;
 
 use nexo_microapp_sdk::routing::{
     load_rule_set_from_str, AssignTarget, Dispatcher, DomainKind, MatchContext, RuleSet,
-    RoutingDecision, RoutingError, TenantIdRef, VendedorId,
+    RoutingDecision, RoutingError, TenantIdRef, SellerId,
 };
 
 use crate::error::MarketingError;
@@ -45,7 +45,7 @@ fn empty_rule_set(tenant_id: &TenantId) -> RuleSet {
         rules: Vec::new(),
         // Default Drop until operator authors at least one
         // rule. Conservative — we'd rather drop than auto-
-        // assign to a wrong vendedor.
+        // assign to a wrong seller.
         default_target: AssignTarget::Drop,
     }
 }
@@ -132,8 +132,8 @@ impl LeadRouter {
 
     fn flatten(&self, d: RoutingDecision) -> RouteOutcome {
         match d.target {
-            AssignTarget::Vendedor { id } => RouteOutcome::Vendedor {
-                vendedor_id: id,
+            AssignTarget::Seller { id } => RouteOutcome::Seller {
+                seller_id: id,
                 matched_rule_id: d.matched_rule_id,
                 why: d.why,
             },
@@ -152,8 +152,8 @@ impl LeadRouter {
                     .rr_cursor
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let pick = &pool[cursor % pool.len()];
-                RouteOutcome::Vendedor {
-                    vendedor_id: pick.clone(),
+                RouteOutcome::Seller {
+                    seller_id: pick.clone(),
                     matched_rule_id: d.matched_rule_id,
                     why: d.why,
                 }
@@ -165,10 +165,10 @@ impl LeadRouter {
 /// What the extension does with the inbound after routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteOutcome {
-    /// Hand off to a specific vendedor — single match or
+    /// Hand off to a specific seller — single match or
     /// round-robin pick.
-    Vendedor {
-        vendedor_id: VendedorId,
+    Seller {
+        seller_id: SellerId,
         matched_rule_id: Option<String>,
         why: Vec<String>,
     },
@@ -190,7 +190,7 @@ pub enum RouteOutcome {
 mod tests {
     use super::*;
     use nexo_microapp_sdk::routing::{
-        RoutingRule, RulePredicate, TenantIdRef, VendedorId,
+        RoutingRule, RulePredicate, TenantIdRef, SellerId,
     };
 
     fn rs(t: &str, rules: Vec<RoutingRule>, default: AssignTarget) -> RuleSet {
@@ -201,8 +201,8 @@ mod tests {
             default_target: default,
         }
     }
-    fn vendedor(id: &str) -> VendedorId {
-        VendedorId(id.into())
+    fn seller(id: &str) -> SellerId {
+        SellerId(id.into())
     }
     fn rule(id: &str, conds: Vec<RulePredicate>, target: AssignTarget) -> RoutingRule {
         RoutingRule {
@@ -225,7 +225,7 @@ mod tests {
                     RulePredicate::SenderDomainKind { value: DomainKind::Corporate },
                     RulePredicate::ScoreGte { score: 70 },
                 ],
-                AssignTarget::Vendedor { id: vendedor("pedro") },
+                AssignTarget::Seller { id: seller("pedro") },
             )],
             AssignTarget::Drop,
         );
@@ -239,15 +239,15 @@ mod tests {
             })
             .unwrap();
         match out {
-            RouteOutcome::Vendedor {
-                vendedor_id,
+            RouteOutcome::Seller {
+                seller_id,
                 matched_rule_id,
                 ..
             } => {
-                assert_eq!(vendedor_id, vendedor("pedro"));
+                assert_eq!(seller_id, seller("pedro"));
                 assert_eq!(matched_rule_id.as_deref(), Some("warm-corp"));
             }
-            other => panic!("expected Vendedor, got {other:?}"),
+            other => panic!("expected Seller, got {other:?}"),
         }
     }
 
@@ -262,7 +262,7 @@ mod tests {
                 }],
                 AssignTarget::Drop,
             )],
-            AssignTarget::Vendedor { id: vendedor("luis") },
+            AssignTarget::Seller { id: seller("luis") },
         );
         let r = LeadRouter::new(TenantId::new("acme").unwrap(), rs);
         let out = r
@@ -281,18 +281,18 @@ mod tests {
             "acme",
             vec![],
             AssignTarget::RoundRobin {
-                pool: vec![vendedor("a"), vendedor("b"), vendedor("c")],
+                pool: vec![seller("a"), seller("b"), seller("c")],
             },
         );
         let r = LeadRouter::new(TenantId::new("acme").unwrap(), rs);
         let mut picks = Vec::new();
         for _ in 0..6 {
             let out = r.route(&RouteInputs::default()).unwrap();
-            if let RouteOutcome::Vendedor { vendedor_id, .. } = out {
-                picks.push(vendedor_id.0);
+            if let RouteOutcome::Seller { seller_id, .. } = out {
+                picks.push(seller_id.0);
             }
         }
-        // Round-robin wraps; over 6 calls each vendedor gets 2.
+        // Round-robin wraps; over 6 calls each seller gets 2.
         let count_a = picks.iter().filter(|p| *p == "a").count();
         let count_b = picks.iter().filter(|p| *p == "b").count();
         let count_c = picks.iter().filter(|p| *p == "c").count();
@@ -320,9 +320,9 @@ mod tests {
             vec![rule(
                 "vip",
                 vec![RulePredicate::PersonHasTag { tag: "vip".into() }],
-                AssignTarget::Vendedor { id: vendedor("ana") },
+                AssignTarget::Seller { id: seller("ana") },
             )],
-            AssignTarget::Vendedor { id: vendedor("luis") },
+            AssignTarget::Seller { id: seller("luis") },
         );
         let r = LeadRouter::new(TenantId::new("acme").unwrap(), rs);
         let out = r
@@ -334,15 +334,15 @@ mod tests {
             })
             .unwrap();
         match out {
-            RouteOutcome::Vendedor {
-                vendedor_id,
+            RouteOutcome::Seller {
+                seller_id,
                 matched_rule_id,
                 ..
             } => {
-                assert_eq!(vendedor_id, vendedor("luis"));
+                assert_eq!(seller_id, seller("luis"));
                 assert!(matched_rule_id.is_none(), "default target carries no rule id");
             }
-            other => panic!("expected default Vendedor, got {other:?}"),
+            other => panic!("expected default Seller, got {other:?}"),
         }
     }
 
@@ -376,7 +376,7 @@ rules:
       - kind: person_has_tag
         tag: vip
     assigns_to:
-      kind: vendedor
+      kind: seller
       id: "ana"
 "#,
         )

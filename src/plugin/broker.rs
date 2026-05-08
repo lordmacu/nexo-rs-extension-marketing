@@ -18,7 +18,7 @@
 //!    here. Pending outcomes still create a lead with a
 //!    deterministic `placeholder-<uuid5>` person id so the
 //!    operator can confirm in the UI.
-//! 5. Run the YAML routing dispatcher → pick a vendedor.
+//! 5. Run the YAML routing dispatcher → pick a seller.
 //!    `Drop` rule outcome aborts; `NoTarget` (empty
 //!    round-robin pool) falls back to `unassigned`.
 //! 6. Look up or create a lead in the per-tenant store.
@@ -33,7 +33,7 @@ use nexo_microapp_sdk::identity::{Person, PersonEmailStore, PersonStore};
 use nexo_microapp_sdk::plugin::BrokerSender;
 use nexo_tool_meta::marketing::{
     EnrichmentResult, EnrichmentStatus, LeadId, PersonId, PersonInferred, TenantIdRef,
-    VendedorId,
+    SellerId,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -46,7 +46,7 @@ use crate::lead::{
 };
 use crate::notification::{
     maybe_notify_lead_created, maybe_notify_lead_replied, NotificationOutcome,
-    VendedorLookup,
+    SellerLookup,
 };
 use crate::plugin::IdentityDeps;
 use crate::tenant::TenantId;
@@ -223,11 +223,11 @@ async fn resolve_person(
 
 /// Run the routing dispatcher against the parsed email + the
 /// resolved person's hint metadata. Returns the chosen
-/// `VendedorId` + the audit `why_routed` chain.
+/// `SellerId` + the audit `why_routed` chain.
 fn route_inbound(
     parsed: &ParsedInbound,
     router: &LeadRouter,
-) -> Result<(Option<VendedorId>, Vec<String>), crate::error::MarketingError> {
+) -> Result<(Option<SellerId>, Vec<String>), crate::error::MarketingError> {
     let inputs = RouteInputs {
         sender_email: Some(parsed.from_email.clone()),
         sender_domain_kind: Some(parsed.from_domain_kind),
@@ -239,8 +239,8 @@ fn route_inbound(
     };
     let outcome = router.route(&inputs)?;
     Ok(match outcome {
-        RouteOutcome::Vendedor {
-            vendedor_id,
+        RouteOutcome::Seller {
+            seller_id,
             matched_rule_id,
             why,
         } => {
@@ -248,7 +248,7 @@ fn route_inbound(
             if let Some(r) = matched_rule_id {
                 audit.push(format!("rule:{r}"));
             }
-            (Some(vendedor_id), audit)
+            (Some(seller_id), audit)
         }
         RouteOutcome::Drop {
             matched_rule_id,
@@ -264,7 +264,7 @@ fn route_inbound(
         RouteOutcome::NoTarget { why, .. } => {
             let mut audit = why;
             audit.push("no_target_fallback_unassigned".into());
-            (Some(VendedorId("unassigned".into())), audit)
+            (Some(SellerId("unassigned".into())), audit)
         }
     })
 }
@@ -342,7 +342,7 @@ pub async fn handle_inbound_event(
     router: Option<&LeadRouter>,
     identity: Option<&IdentityDeps>,
     firehose: Option<&LeadEventBus>,
-    vendedores: Option<&VendedorLookup>,
+    sellers: Option<&SellerLookup>,
     broker: Option<BrokerSender>,
 ) -> HandledOutcome {
     if !topic.starts_with("plugin.inbound.email.") && topic != "plugin.inbound.email" {
@@ -417,11 +417,11 @@ pub async fn handle_inbound_event(
         }
         // M15.40 — operator notification on existing-thread
         // reply. Same publish path as LeadCreated: classifier
-        // gates on vendedor.notification_settings.on_lead_replied
+        // gates on seller.notification_settings.on_lead_replied
         // + agent_id presence; the forwarder (M15.39) routes to
         // WA / email outbound. Fire-and-forget — never blocks
         // the broker hop on a transient daemon hiccup.
-        if let (Some(lookup), Some(broker_sender)) = (vendedores, broker.as_ref()) {
+        if let (Some(lookup), Some(broker_sender)) = (sellers, broker.as_ref()) {
             match maybe_notify_lead_replied(tenant_id, lookup, &lead, &parsed) {
                 NotificationOutcome::Publish { topic, payload } => {
                     let json_payload = serde_json::to_value(&payload)
@@ -475,7 +475,7 @@ pub async fn handle_inbound_event(
     };
 
     // ─── Router pass ──────────────────────────────────────────
-    let (vendedor_id, mut why_routed) = match router {
+    let (seller_id, mut why_routed) = match router {
         Some(r) => match route_inbound(&parsed, r) {
             Ok((Some(v), why)) => (v, why),
             Ok((None, why)) => {
@@ -497,13 +497,13 @@ pub async fn handle_inbound_event(
                     "router error; falling back to unassigned"
                 );
                 (
-                    VendedorId("unassigned".into()),
+                    SellerId("unassigned".into()),
                     vec!["router_error_fallback".into()],
                 )
             }
         },
         None => (
-            VendedorId("unassigned".into()),
+            SellerId("unassigned".into()),
             vec!["no_router_deps".into()],
         ),
     };
@@ -517,7 +517,7 @@ pub async fn handle_inbound_event(
         thread_id: parsed.thread_id.clone(),
         subject: parsed.subject.clone(),
         person_id,
-        vendedor_id,
+        seller_id,
         last_activity_ms: now_ms,
         why_routed,
     };
@@ -549,7 +549,7 @@ pub async fn handle_inbound_event(
                     thread_id: parsed.thread_id.clone(),
                     subject: parsed.subject.clone(),
                     from_email: parsed.from_email.clone(),
-                    vendedor_id: lead.vendedor_id.0.clone(),
+                    seller_id: lead.seller_id.0.clone(),
                     state: lead.state,
                     at_ms: now_ms,
                     why_routed: lead.why_routed.clone(),
@@ -560,7 +560,7 @@ pub async fn handle_inbound_event(
             // happens inline; the broker.publish is fire-and-
             // forget so a transient daemon hiccup doesn't
             // sink the lead-create itself.
-            if let (Some(lookup), Some(broker_sender)) = (vendedores, broker.as_ref()) {
+            if let (Some(lookup), Some(broker_sender)) = (sellers, broker.as_ref()) {
                 match maybe_notify_lead_created(tenant_id, lookup, &lead, &parsed) {
                     NotificationOutcome::Publish { topic, payload } => {
                         let json_payload = serde_json::to_value(&payload)
@@ -669,7 +669,7 @@ mod tests {
     }
 
     fn unassigned_router(t: &TenantId) -> LeadRouter {
-        // A router whose default fires `Vendedor { id: "unassigned" }`
+        // A router whose default fires `Seller { id: "unassigned" }`
         // so a no-rule tenant still creates leads (operator picks up
         // from the inbox manually).
         LeadRouter::new(
@@ -678,8 +678,8 @@ mod tests {
                 tenant_id: TenantIdRef(t.as_str().into()),
                 version: 0,
                 rules: Vec::new(),
-                default_target: AssignTarget::Vendedor {
-                    id: VendedorId("unassigned".into()),
+                default_target: AssignTarget::Seller {
+                    id: SellerId("unassigned".into()),
                 },
             },
         )
@@ -783,7 +783,7 @@ mod tests {
         // why_routed carries the resolver source.
         let lead = store.get(&lead_id).await.unwrap().expect("lead row");
         assert_eq!(
-            lead.vendedor_id.0, "unassigned",
+            lead.seller_id.0, "unassigned",
             "default_target should pin to unassigned"
         );
         assert!(

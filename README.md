@@ -3,7 +3,7 @@
 Email marketing extension for the [nexo-rs] agent framework —
 multi-tenant CRM-lite that watches IMAP mailboxes, resolves
 sender identity (multi-email per person, web-scraper enrichment
-for corporate domains), routes inbound to vendedores via YAML
+for corporate domains), routes inbound to sellers via YAML
 rules, generates AI draft replies the operator approves in the
 [`agent-creator` microapp][agent-creator] UI, schedules
 followups, and tracks lead state through `cold → engaged →
@@ -56,7 +56,7 @@ Pending follow-ups:
 - LLM extractor + scraper adapters wired into the chain
   (M22) — pure additive, no changes to the broker hop's
   contract.
-- CRUD admin endpoints for rules / mailboxes / vendedores /
+- CRUD admin endpoints for rules / mailboxes / sellers /
   followup_profiles (need YAML write helpers).
 - SSE firehose `/firehose` → tenant-scoped
   `agent.lead.transition.*`.
@@ -82,7 +82,7 @@ the subprocess on next boot.
 
 Per-tenant YAML lives under `${NEXO_EXTENSION_STATE_ROOT}/marketing/<tenant_id>/`:
 - `mailboxes.yaml` — IMAP accounts to watch
-- `vendedores.yaml` — sales reps + outbound SMTP creds + working hours
+- `sellers.yaml` — sales reps + outbound SMTP creds + working hours
 - `rules.yaml` — routing rules
 - `followup_profiles.yaml` — cadence templates
 - `leads.db` — sqlite store with lead state + thread history

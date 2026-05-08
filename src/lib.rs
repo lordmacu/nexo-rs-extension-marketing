@@ -3,7 +3,7 @@
 //
 // Subprocess plugin (Phase 81.5 contract). Subscribes to the
 // email plugin's broker topics, resolves sender identity per
-// tenant, routes inbound to vendedores via YAML rules, generates
+// tenant, routes inbound to sellers via YAML rules, generates
 // AI draft replies the operator approves in the agent-creator
 // microapp UI, schedules followups, tracks lead state.
 //

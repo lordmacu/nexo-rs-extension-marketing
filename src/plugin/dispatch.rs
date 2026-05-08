@@ -70,13 +70,13 @@ pub async fn dispatch(
         "marketing_lead_mark_qualified" => {
             // Phase 81.17.c.ctx — tool gets BrokerSender via
             // ToolContext, publishes LeadTransitioned
-            // notification post-transition. Vendedor lookup
+            // notification post-transition. Seller lookup
             // resolved from PluginDeps (live-reloaded by PUT
-            // /config/vendedores).
+            // /config/sellers).
             tools::lead_mark_qualified::handle(
                 tenant,
                 deps.lead_store.clone(),
-                deps.vendedores.as_ref(),
+                deps.sellers.as_ref(),
                 ctx.map(|c| &c.broker),
                 inv.args,
             )
@@ -88,7 +88,7 @@ pub async fn dispatch(
             tools::lead_detect_meeting_intent::handle(
                 tenant,
                 deps.lead_store.clone(),
-                deps.vendedores.as_ref(),
+                deps.sellers.as_ref(),
                 ctx.map(|c| &c.broker),
                 inv.args,
             )

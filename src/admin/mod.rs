@@ -21,7 +21,7 @@ use axum::Router;
 
 use crate::firehose::LeadEventBus;
 use crate::lead::{LeadStore, RouterHandle};
-use crate::notification::VendedorLookup;
+use crate::notification::SellerLookup;
 use crate::tenant::TenantId;
 
 pub mod auth;
@@ -55,12 +55,12 @@ pub struct AdminState {
     /// events route through the new rules without a process
     /// restart.
     pub router: Option<RouterHandle>,
-    /// M15.38 — vendedor lookup for notification routing.
-    /// `PUT /config/vendedores` rebuilds the `HashMap` from
+    /// M15.38 — seller lookup for notification routing.
+    /// `PUT /config/sellers` rebuilds the `HashMap` from
     /// disk + swaps it into this handle so the broker hop's
     /// next notification publish routes via the fresh
     /// `agent_id` / `notification_settings`.
-    pub vendedor_lookup: Option<VendedorLookup>,
+    pub seller_lookup: Option<SellerLookup>,
 }
 
 impl AdminState {
@@ -71,7 +71,7 @@ impl AdminState {
             firehose: Arc::new(LeadEventBus::new()),
             state_root: None,
             router: None,
-            vendedor_lookup: None,
+            seller_lookup: None,
         }
     }
 
@@ -108,13 +108,13 @@ impl AdminState {
         self
     }
 
-    /// Inject the vendedor lookup the broker hop captured at
-    /// boot. `PUT /config/vendedores` swaps a freshly loaded
-    /// `HashMap<VendedorId, Vendedor>` into this Arc so the
+    /// Inject the seller lookup the broker hop captured at
+    /// boot. `PUT /config/sellers` swaps a freshly loaded
+    /// `HashMap<SellerId, Seller>` into this Arc so the
     /// next notification publish reads the updated
     /// `notification_settings`.
-    pub fn with_vendedor_lookup(mut self, lookup: VendedorLookup) -> Self {
-        self.vendedor_lookup = Some(lookup);
+    pub fn with_seller_lookup(mut self, lookup: SellerLookup) -> Self {
+        self.seller_lookup = Some(lookup);
         self
     }
 
@@ -141,8 +141,8 @@ pub fn router(state: Arc<AdminState>) -> Router {
             get(config::list_mailboxes).put(config::put_mailboxes),
         )
         .route(
-            "/config/vendedores",
-            get(config::list_vendedores).put(config::put_vendedores),
+            "/config/sellers",
+            get(config::list_sellers).put(config::put_sellers),
         )
         .route(
             "/config/rules",

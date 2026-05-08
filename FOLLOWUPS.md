@@ -21,7 +21,7 @@ Both publish via `BrokerSender::publish` post-success.
 ### F4 · Reconciliation race condition (M15.37)
 
 - **Origin:** M15.37 (microapp)
-- **Status:** `saveVendedores` + `agents/upsert` are separate
+- **Status:** `saveSellers` + `agents/upsert` are separate
   client-side calls. 2 operators saving simultaneously can produce
   inconsistent agent bindings.
 - **Impact:** rare in 1-operator deployments; real at scale.
@@ -30,10 +30,10 @@ Both publish via `BrokerSender::publish` post-success.
   recommended" in the README.
 - **Recommendation:** doc-only for now.
 
-### F7 · Stale `vendedor.agent_id` when agent deleted ✅ — done in M15.42
+### F7 · Stale `seller.agent_id` when agent deleted ✅ — done in M15.42
 
-Frontend `unbindVendedoresFromAgent` runs before
-`agents/delete`; cascade banner surfaces affected vendedores
+Frontend `unbindSellersFromAgent` runs before
+`agents/delete`; cascade banner surfaces affected sellers
 in the confirm modal. Dropdown filters inactive agents.
 
 ### F8 · `LeadReplied` notification ✅ — done in M15.40
@@ -43,10 +43,10 @@ in the confirm modal. Dropdown filters inactive agents.
 ### F6 · Reconciler walk O(N agents) per save
 
 - **Origin:** M15.37
-- **Status:** every vendedor save → `agents/list` + per-agent
+- **Status:** every seller save → `agents/list` + per-agent
   `agents/get` + diff. ~200ms with 5 agents; 2-3s with 50.
 - **Plan:** compute the diff client-side comparing previous vs
-  new vendedores list — only touch agents that appear in old
+  new sellers list — only touch agents that appear in old
   OR new `agent_id` set.
 - **Effort:** ~60 LOC + reconciler signature change.
 
@@ -66,15 +66,15 @@ in the confirm modal. Dropdown filters inactive agents.
 - **Status:** `render_summary` has hardcoded strings; no
   operator-supplied template per kind / locale.
 - **Plan:** template in `marketing.yaml` with placeholders
-  `{from}`, `{subject}`, `{vendedor}`. Render via
+  `{from}`, `{subject}`, `{seller}`. Render via
   `nexo-tool-meta::template`.
 - **Effort:** ~100 LOC.
 
-### F15 · No integration test for vendedor lookup live-reload
+### F15 · No integration test for seller lookup live-reload
 
 - **Origin:** M15.38
 - **Status:** unit tests separate classifier (pure) from publish
-  (IO). No end-to-end test that PUT vendedores via admin router
+  (IO). No end-to-end test that PUT sellers via admin router
   → next broker hop sees fresh settings.
 - **Plan:** integration test `tests/notification_live_reload.rs`
   that boots admin router + broker hop test fixtures.
@@ -104,8 +104,8 @@ in the confirm modal. Dropdown filters inactive agents.
 ### F12 · Agent UI badge doesn't filter on click
 
 - **Origin:** M15.36
-- **Status:** `📧 N email vendedores` navigates to the full
-  vendedores list — no filter applied.
+- **Status:** `📧 N email sellers` navigates to the full
+  sellers list — no filter applied.
 - **Plan:** querystring `?agent_id=pedro-agent` + sidebar
   applies via `useUrlState`.
 - **Effort:** ~30 LOC.
@@ -113,18 +113,18 @@ in the confirm modal. Dropdown filters inactive agents.
 ### F13 · No edit-from-agent path
 
 - **Origin:** M15.36
-- **Status:** to associate / disassociate vendedor from agent,
+- **Status:** to associate / disassociate seller from agent,
   operator must navigate to the marketing tab.
-- **Plan:** "Email vendedores" section in agent edit modal with
+- **Plan:** "Email sellers" section in agent edit modal with
   add/remove inline.
 - **Effort:** ~150 LOC.
 
 ### F14 · Stale data in `/agents` count badge
 
 - **Origin:** M15.36
-- **Status:** badge fetches vendedores once on mount; no refresh
+- **Status:** badge fetches sellers once on mount; no refresh
   on cross-tab edit.
-- **Plan:** subscribe to firehose (extend with `vendedor.changed`
+- **Plan:** subscribe to firehose (extend with `seller.changed`
   topic) or 30s polling.
 - **Effort:** depends on approach.
 
@@ -133,9 +133,9 @@ in the confirm modal. Dropdown filters inactive agents.
 - **Origin:** M15.37
 - **Status:** the auto-bound `{plugin: "marketing", instance: pedro}`
   renders as a generic binding row in the agent UI — no link
-  back to the vendedor.
+  back to the seller.
 - **Plan:** detect `plugin === "marketing"` + render "Email
-  channel via vendedor X" with deeplink.
+  channel via seller X" with deeplink.
 - **Effort:** ~50 LOC.
 
 ## ⚪ Resolved during M15.39
@@ -158,7 +158,7 @@ in the confirm modal. Dropdown filters inactive agents.
   on `ok_with_partial_warning`. Acceptable UX — operator dismisses
   manually.
 
-### F18 · Reconciler doesn't handle vendedor delete / rename ✅
+### F18 · Reconciler doesn't handle seller delete / rename ✅
 
 - **Resolved:** delete works (reconciler runs with the new list
   sans removed). Rename is documented as not-supported (id

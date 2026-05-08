@@ -22,14 +22,14 @@
 //! Plugins (Phase 81.5 subprocesses) cannot call admin RPC,
 //! so they cannot fetch `agent.inbound_bindings` to resolve
 //! "which WA instance does this agent use?" at notification
-//! time. The frontend resolves it at vendedor-save time and
+//! time. The frontend resolves it at seller-save time and
 //! bakes the resolved instance string into
-//! `vendedor.notification_settings.channel`. The publisher
+//! `seller.notification_settings.channel`. The publisher
 //! ([`crate::notification::maybe_notify_lead_created`])
 //! propagates the channel verbatim into the
 //! `EmailNotification` payload; the forwarder reads from
 //! there. Stale bindings (operator re-pairs WA after save)
-//! require a vendedor re-save — the form surfaces the warning.
+//! require a seller re-save — the form surfaces the warning.
 
 use nexo_microapp_sdk::plugin::BrokerSender;
 use nexo_microapp_sdk::BrokerEvent;
@@ -76,7 +76,7 @@ fn whatsapp_outbound_body(notif: &EmailNotification) -> serde_json::Value {
         "metadata": {
             "source": "marketing.notification",
             "lead_id": notif.lead_id.0,
-            "vendedor_id": notif.vendedor_id.0,
+            "seller_id": notif.seller_id.0,
         }
     })
 }
@@ -94,7 +94,7 @@ fn email_outbound_body(notif: &EmailNotification, to: &str) -> serde_json::Value
         "metadata": {
             "source": "marketing.notification",
             "lead_id": notif.lead_id.0,
-            "vendedor_id": notif.vendedor_id.0,
+            "seller_id": notif.seller_id.0,
         }
     })
 }
@@ -125,7 +125,7 @@ pub fn classify_forward(topic: &str, payload: &serde_json::Value) -> ForwardOutc
                 tracing::warn!(
                     target: "extension.marketing.forwarder",
                     agent_id = %notif.agent_id,
-                    vendedor_id = %notif.vendedor_id.0,
+                    seller_id = %notif.seller_id.0,
                     "Whatsapp channel has empty instance — frontend did not resolve binding before save"
                 );
                 return ForwardOutcome::UnresolvedInstance { kind: "whatsapp" };
@@ -194,7 +194,7 @@ mod tests {
     use super::*;
 
     use nexo_tool_meta::marketing::{
-        EmailNotificationKind, LeadId, TenantIdRef, VendedorId,
+        EmailNotificationKind, LeadId, TenantIdRef, SellerId,
     };
 
     fn notif(channel: NotificationChannel) -> EmailNotification {
@@ -203,8 +203,8 @@ mod tests {
             tenant_id: TenantIdRef("acme".into()),
             agent_id: "pedro-agent".into(),
             lead_id: LeadId("l-1".into()),
-            vendedor_id: VendedorId("pedro".into()),
-            vendedor_email: "pedro@acme.com".into(),
+            seller_id: SellerId("pedro".into()),
+            seller_email: "pedro@acme.com".into(),
             from_email: "cliente@empresa.com".into(),
             subject: "Cotización CRM".into(),
             at_ms: 1_700_000_000_000,

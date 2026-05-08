@@ -187,7 +187,7 @@ mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::header;
     use axum::http::Request;
-    use nexo_tool_meta::marketing::{PersonId, VendedorId};
+    use nexo_tool_meta::marketing::{PersonId, SellerId};
     use std::path::PathBuf;
     use tower::util::ServiceExt;
 
@@ -204,7 +204,7 @@ mod tests {
                 thread_id: "th-1".into(),
                 subject: "Re: cot".into(),
                 person_id: PersonId("p".into()),
-                vendedor_id: VendedorId("v".into()),
+                seller_id: SellerId("v".into()),
                 last_activity_ms: 1,
                 why_routed: vec!["fixture".into()],
             })

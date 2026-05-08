@@ -9,7 +9,7 @@
 //! Write endpoints (`PUT`) are intentionally not exposed at
 //! this milestone — operators still hand-edit YAML; the GET
 //! surface unblocks the agent-creator microapp's Settings
-//! tabs (mailboxes / vendedores / rules / followup_profiles)
+//! tabs (mailboxes / sellers / rules / followup_profiles)
 //! to render real data instead of mock fixtures.
 
 use std::sync::Arc;
@@ -18,13 +18,13 @@ use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use nexo_tool_meta::marketing::{FollowupProfile, MailboxConfig, RuleSet, Vendedor};
+use nexo_tool_meta::marketing::{FollowupProfile, MailboxConfig, RuleSet, Seller};
 use serde_json::{json, Value};
 
 use super::AdminState;
 use crate::config::{
-    load_followup_profiles, load_mailboxes, load_vendedores, save_followup_profiles,
-    save_mailboxes, save_rules, save_vendedores,
+    load_followup_profiles, load_mailboxes, load_sellers, save_followup_profiles,
+    save_mailboxes, save_rules, save_sellers,
 };
 use crate::error::MarketingError;
 use crate::lead::router::load_rule_set;
@@ -47,9 +47,9 @@ pub async fn list_mailboxes(
     }
 }
 
-/// `GET /config/vendedores` — list of `Vendedor` rows from
-/// `vendedores.yaml`. Empty list when missing.
-pub async fn list_vendedores(
+/// `GET /config/sellers` — list of `Seller` rows from
+/// `sellers.yaml`. Empty list when missing.
+pub async fn list_sellers(
     State(state): State<Arc<AdminState>>,
     Extension(tenant_id): Extension<TenantId>,
 ) -> Response {
@@ -57,8 +57,8 @@ pub async fn list_vendedores(
         Some(r) => r,
         None => return state_root_missing(),
     };
-    match load_vendedores(root, &tenant_id) {
-        Ok(rows) => ok(json!({ "vendedores": rows, "count": rows.len() })),
+    match load_sellers(root, &tenant_id) {
+        Ok(rows) => ok(json!({ "sellers": rows, "count": rows.len() })),
         Err(e) => marketing_error(e),
     }
 }
@@ -151,8 +151,8 @@ pub async fn put_mailboxes(
     ok(json!({ "mailboxes": rows, "count": rows.len() }))
 }
 
-/// `PUT /config/vendedores`. Body: `{ "vendedores": [...] }`.
-pub async fn put_vendedores(
+/// `PUT /config/sellers`. Body: `{ "sellers": [...] }`.
+pub async fn put_sellers(
     State(state): State<Arc<AdminState>>,
     Extension(tenant_id): Extension<TenantId>,
     Json(body): Json<Value>,
@@ -161,20 +161,20 @@ pub async fn put_vendedores(
         Some(r) => r,
         None => return state_root_missing(),
     };
-    let rows: Vec<Vendedor> = match extract_list(&body, "vendedores") {
+    let rows: Vec<Seller> = match extract_list(&body, "sellers") {
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    if let Err(e) = save_vendedores(root, &tenant_id, &rows) {
+    if let Err(e) = save_sellers(root, &tenant_id, &rows) {
         return marketing_error(e);
     }
-    // M15.38 — live-reload the vendedor lookup so the broker
+    // M15.38 — live-reload the seller lookup so the broker
     // hop's next notification publish reads the fresh
     // `notification_settings`. Same `arc_swap` pattern as
     // `put_rules` (M15.33). When the handle isn't wired
     // (legacy embedders) the save still lands but
     // notifications use stale settings until restart.
-    if let Some(handle) = &state.vendedor_lookup {
+    if let Some(handle) = &state.seller_lookup {
         let map: std::collections::HashMap<_, _> =
             rows.iter().map(|v| (v.id.clone(), v.clone())).collect();
         handle.store(std::sync::Arc::new(map));
@@ -182,10 +182,10 @@ pub async fn put_vendedores(
             target: "extension.marketing.config",
             tenant = %tenant_id.as_str(),
             count = rows.len(),
-            "vendedor lookup live-reloaded after PUT /config/vendedores"
+            "seller lookup live-reloaded after PUT /config/sellers"
         );
     }
-    ok(json!({ "vendedores": rows, "count": rows.len() }))
+    ok(json!({ "sellers": rows, "count": rows.len() }))
 }
 
 /// `PUT /config/followup_profiles`. Body: `{ "profiles": [...] }`.
@@ -392,7 +392,7 @@ mod tests {
         let app = router(state);
         for path in [
             "/config/mailboxes",
-            "/config/vendedores",
+            "/config/sellers",
             "/config/followup_profiles",
         ] {
             let resp = app.clone().oneshot(req(path)).await.unwrap();
@@ -416,7 +416,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vendedores_yaml_renders_via_endpoint() {
+    async fn sellers_yaml_renders_via_endpoint() {
         let (state, tmp) = build_state_with_tenant_dir().await;
         let yaml = "\
 - id: pedro
@@ -430,17 +430,17 @@ mod tests {
   on_vacation: false
 ";
         fs::write(
-            tmp.path().join("marketing").join("acme").join("vendedores.yaml"),
+            tmp.path().join("marketing").join("acme").join("sellers.yaml"),
             yaml,
         )
         .unwrap();
         let app = router(state);
-        let resp = app.oneshot(req("/config/vendedores")).await.unwrap();
+        let resp = app.oneshot(req("/config/sellers")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_to_json(resp).await;
         assert_eq!(v["result"]["count"], 1);
-        assert_eq!(v["result"]["vendedores"][0]["id"], "pedro");
-        assert_eq!(v["result"]["vendedores"][0]["primary_email"], "pedro@acme.com");
+        assert_eq!(v["result"]["sellers"][0]["id"], "pedro");
+        assert_eq!(v["result"]["sellers"][0]["primary_email"], "pedro@acme.com");
     }
 
     #[tokio::test]
@@ -491,10 +491,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_vendedores_writes_yaml_and_get_round_trips() {
+    async fn put_sellers_writes_yaml_and_get_round_trips() {
         let (state, tmp) = build_state_with_tenant_dir().await;
         let payload = json!({
-            "vendedores": [{
+            "sellers": [{
                 "id": "pedro",
                 "tenant_id": "acme",
                 "name": "Pedro García",
@@ -507,7 +507,7 @@ mod tests {
         let app = router(state.clone());
         let resp = app
             .clone()
-            .oneshot(put_req("/config/vendedores", payload))
+            .oneshot(put_req("/config/sellers", payload))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -518,12 +518,12 @@ mod tests {
             .path()
             .join("marketing")
             .join("acme")
-            .join("vendedores.yaml");
+            .join("sellers.yaml");
         assert!(yaml_path.exists());
-        let resp = app.oneshot(req("/config/vendedores")).await.unwrap();
+        let resp = app.oneshot(req("/config/sellers")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_to_json(resp).await;
-        assert_eq!(v["result"]["vendedores"][0]["id"], "pedro");
+        assert_eq!(v["result"]["sellers"][0]["id"], "pedro");
     }
 
     #[tokio::test]
@@ -545,8 +545,8 @@ mod tests {
         let app = router(state);
         let resp = app
             .oneshot(put_req(
-                "/config/vendedores",
-                json!({ "vendedores": [{ "id": "x" }] }),
+                "/config/sellers",
+                json!({ "sellers": [{ "id": "x" }] }),
             ))
             .await
             .unwrap();
@@ -617,7 +617,7 @@ mod tests {
                 "tenant_id": "acme",
                 "version": 2,
                 "rules": [],
-                "default_target": { "kind": "vendedor", "id": "pedro" },
+                "default_target": { "kind": "seller", "id": "pedro" },
             }
         });
         let resp = app
@@ -630,11 +630,11 @@ mod tests {
         assert_eq!(v["result"]["restart_required"], false);
 
         // Inspect the swapped router via the handle. Default
-        // target should now be Vendedor("pedro"), not Drop.
+        // target should now be Seller("pedro"), not Drop.
         let snap = handle.load_full();
         match &snap.rule_set().default_target {
-            AssignTarget::Vendedor { id } => assert_eq!(id.0, "pedro"),
-            other => panic!("expected Vendedor, got {other:?}"),
+            AssignTarget::Seller { id } => assert_eq!(id.0, "pedro"),
+            other => panic!("expected Seller, got {other:?}"),
         }
     }
 

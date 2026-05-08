@@ -36,8 +36,8 @@ pub fn marketing_tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "marketing_lead_route".into(),
-            description: "Pick the vendedor to assign a lead to using the per-tenant \
-                YAML rule set. Returns `vendedor_id` + the matched rule id. Falls back to \
+            description: "Pick the seller to assign a lead to using the per-tenant \
+                YAML rule set. Returns `seller_id` + the matched rule id. Falls back to \
                 the tenant's `default_target` (round-robin or drop) when no rule matches."
                 .into(),
             input_schema: json!({

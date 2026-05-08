@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use nexo_microapp_sdk::{ToolError, ToolReply};
-use nexo_tool_meta::marketing::{LeadRouteArgs, LeadRouteResponse, VendedorId};
+use nexo_tool_meta::marketing::{LeadRouteArgs, LeadRouteResponse, SellerId};
 
 use crate::lead::{LeadRouter, RouteInputs, RouteOutcome};
 use crate::tenant::TenantId;
@@ -42,12 +42,12 @@ pub async fn handle(
         .map_err(|e| ToolError::Internal(e.to_string()))?;
 
     let resp = match outcome {
-        RouteOutcome::Vendedor {
-            vendedor_id,
+        RouteOutcome::Seller {
+            seller_id,
             matched_rule_id,
             why,
         } => LeadRouteResponse {
-            vendedor_id: Some(vendedor_id),
+            seller_id: Some(seller_id),
             matched_rule_id,
             why_routed: why,
         },
@@ -55,7 +55,7 @@ pub async fn handle(
             matched_rule_id,
             why,
         } => LeadRouteResponse {
-            vendedor_id: None,
+            seller_id: None,
             matched_rule_id,
             why_routed: why,
         },
@@ -63,7 +63,7 @@ pub async fn handle(
             matched_rule_id,
             why,
         } => LeadRouteResponse {
-            vendedor_id: None,
+            seller_id: None,
             matched_rule_id,
             why_routed: why,
         },
@@ -77,7 +77,7 @@ pub async fn handle(
 
 // satisfy unused-import lint for type-only re-exports
 #[allow(dead_code)]
-fn _typecheck() -> Option<VendedorId> {
+fn _typecheck() -> Option<SellerId> {
     None
 }
 
@@ -114,7 +114,7 @@ mod tests {
         .unwrap();
         let json = r.as_value();
         assert_eq!(json["ok"], true);
-        assert!(json["result"]["vendedor_id"].is_null());
+        assert!(json["result"]["seller_id"].is_null());
     }
 
     #[tokio::test]

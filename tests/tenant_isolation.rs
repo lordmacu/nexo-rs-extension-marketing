@@ -23,7 +23,7 @@ use nexo_microapp_sdk::identity::{
     open_pool, PersonStore, SqlitePersonEmailStore, SqlitePersonStore,
 };
 use nexo_tool_meta::marketing::{
-    EnrichmentStatus, LeadId, LeadState, Person, PersonId, TenantIdRef, VendedorId,
+    EnrichmentStatus, LeadId, LeadState, Person, PersonId, TenantIdRef, SellerId,
 };
 use sqlx::sqlite::SqlitePoolOptions;
 
@@ -42,7 +42,7 @@ fn lead_input(id: &str) -> NewLead {
         thread_id: format!("thread-{id}"),
         subject: format!("subject-{id}"),
         person_id: PersonId("p".into()),
-        vendedor_id: VendedorId("v".into()),
+        seller_id: SellerId("v".into()),
         last_activity_ms: 1_700_000_000_000,
         why_routed: vec!["fixture".into()],
     }
@@ -240,7 +240,7 @@ async fn assert_7_outbound_publisher_idempotency_is_per_publisher() {
     let make_input = || DispatchInput {
         thread_id: "t-1".into(),
         draft_id: "d-1".into(),
-        vendedor_smtp_instance: "v-smtp".into(),
+        seller_smtp_instance: "v-smtp".into(),
         email: OutboundEmail {
             to: vec!["someone@acme.com".into()],
             cc: vec![],

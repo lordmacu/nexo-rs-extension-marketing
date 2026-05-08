@@ -4,7 +4,7 @@
 //! one file per entity type:
 //!
 //! - `mailboxes.yaml`     → `Vec<MailboxConfig>`
-//! - `vendedores.yaml`    → `Vec<Vendedor>`
+//! - `sellers.yaml`    → `Vec<Seller>`
 //! - `rules.yaml`         → `RuleSet` (loaded by `lead::router`)
 //! - `followup_profiles.yaml` → `Vec<FollowupProfile>`
 //!
@@ -23,7 +23,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use nexo_tool_meta::marketing::{FollowupProfile, MailboxConfig, Vendedor};
+use nexo_tool_meta::marketing::{FollowupProfile, MailboxConfig, Seller};
 
 use crate::error::MarketingError;
 use crate::tenant::TenantId;
@@ -66,12 +66,12 @@ pub fn load_mailboxes(
     load_yaml_list(state_root, tenant, "mailboxes.yaml")
 }
 
-/// Read `vendedores.yaml`. Missing file → empty list.
-pub fn load_vendedores(
+/// Read `sellers.yaml`. Missing file → empty list.
+pub fn load_sellers(
     state_root: impl AsRef<Path>,
     tenant: &TenantId,
-) -> Result<Vec<Vendedor>, MarketingError> {
-    load_yaml_list(state_root, tenant, "vendedores.yaml")
+) -> Result<Vec<Seller>, MarketingError> {
+    load_yaml_list(state_root, tenant, "sellers.yaml")
 }
 
 /// Read `followup_profiles.yaml`. Missing file → empty list.
@@ -127,7 +127,7 @@ fn write_yaml_atomic<T: serde::Serialize>(
 }
 
 /// Generic write helper symmetric to `load_yaml_list`. Used by
-/// every list-shaped config (mailboxes / vendedores /
+/// every list-shaped config (mailboxes / sellers /
 /// followup_profiles). Caller's responsibility to validate the
 /// payload before calling — we serialise as-is.
 fn save_yaml_list<T: serde::Serialize>(
@@ -152,13 +152,13 @@ pub fn save_mailboxes(
     save_yaml_list(state_root, tenant, "mailboxes.yaml", rows)
 }
 
-/// Write `vendedores.yaml`. Same full-replace contract.
-pub fn save_vendedores(
+/// Write `sellers.yaml`. Same full-replace contract.
+pub fn save_sellers(
     state_root: impl AsRef<Path>,
     tenant: &TenantId,
-    rows: &Vec<Vendedor>,
+    rows: &Vec<Seller>,
 ) -> Result<(), MarketingError> {
-    save_yaml_list(state_root, tenant, "vendedores.yaml", rows)
+    save_yaml_list(state_root, tenant, "sellers.yaml", rows)
 }
 
 /// Write `followup_profiles.yaml`. Same full-replace contract.
@@ -191,13 +191,13 @@ mod tests {
     use std::fs;
 
     use nexo_tool_meta::marketing::{
-        MailboxMode, TenantIdRef, VendedorId, WorkingHoursWindow,
+        MailboxMode, TenantIdRef, SellerId, WorkingHoursWindow,
     };
     use tempfile::tempdir;
 
-    fn fresh_vendedor() -> Vendedor {
-        Vendedor {
-            id: VendedorId("pedro".into()),
+    fn fresh_seller() -> Seller {
+        Seller {
+            id: SellerId("pedro".into()),
             tenant_id: TenantIdRef("acme".into()),
             name: "Pedro García".into(),
             primary_email: "pedro@acme.com".into(),
@@ -247,22 +247,22 @@ mod tests {
     fn missing_file_returns_empty_vec() {
         let tmp = tempdir().unwrap();
         assert!(load_mailboxes(tmp.path(), &tenant()).unwrap().is_empty());
-        assert!(load_vendedores(tmp.path(), &tenant()).unwrap().is_empty());
+        assert!(load_sellers(tmp.path(), &tenant()).unwrap().is_empty());
         assert!(load_followup_profiles(tmp.path(), &tenant())
             .unwrap()
             .is_empty());
     }
 
     #[test]
-    fn vendedores_yaml_round_trips() {
+    fn sellers_yaml_round_trips() {
         let tmp = tempdir().unwrap();
-        let v = fresh_vendedor();
+        let v = fresh_seller();
         write_yaml(
             tmp.path(),
-            "vendedores.yaml",
+            "sellers.yaml",
             &serde_yaml::to_string(&vec![v.clone()]).unwrap(),
         );
-        let got = load_vendedores(tmp.path(), &tenant()).unwrap();
+        let got = load_sellers(tmp.path(), &tenant()).unwrap();
         assert_eq!(got, vec![v]);
     }
 
@@ -300,8 +300,8 @@ mod tests {
     #[test]
     fn parse_error_surfaces_typed_config_error() {
         let tmp = tempdir().unwrap();
-        write_yaml(tmp.path(), "vendedores.yaml", "this is: { not: valid: yaml");
-        let err = load_vendedores(tmp.path(), &tenant()).unwrap_err();
+        write_yaml(tmp.path(), "sellers.yaml", "this is: { not: valid: yaml");
+        let err = load_sellers(tmp.path(), &tenant()).unwrap_err();
         assert!(
             matches!(err, MarketingError::Config(_)),
             "expected Config error, got {err:?}"
@@ -312,22 +312,22 @@ mod tests {
     fn cross_tenant_isolation_via_path() {
         let tmp = tempdir().unwrap();
         // Write under acme; lookup under globex must not see it.
-        let v = fresh_vendedor();
+        let v = fresh_seller();
         write_yaml(
             tmp.path(),
-            "vendedores.yaml",
+            "sellers.yaml",
             &serde_yaml::to_string(&vec![v]).unwrap(),
         );
         let other = TenantId::new("globex").unwrap();
-        assert!(load_vendedores(tmp.path(), &other).unwrap().is_empty());
+        assert!(load_sellers(tmp.path(), &other).unwrap().is_empty());
     }
 
     #[test]
-    fn save_then_load_round_trips_vendedores() {
+    fn save_then_load_round_trips_sellers() {
         let tmp = tempdir().unwrap();
-        let rows = vec![fresh_vendedor()];
-        save_vendedores(tmp.path(), &tenant(), &rows).unwrap();
-        let got = load_vendedores(tmp.path(), &tenant()).unwrap();
+        let rows = vec![fresh_seller()];
+        save_sellers(tmp.path(), &tenant(), &rows).unwrap();
+        let got = load_sellers(tmp.path(), &tenant()).unwrap();
         assert_eq!(got, rows);
     }
 
@@ -367,11 +367,11 @@ mod tests {
     #[test]
     fn save_overwrites_existing_file_atomically() {
         let tmp = tempdir().unwrap();
-        save_vendedores(tmp.path(), &tenant(), &vec![fresh_vendedor()]).unwrap();
+        save_sellers(tmp.path(), &tenant(), &vec![fresh_seller()]).unwrap();
         // Replace with empty list — the rewrite must leave a
         // valid yaml document (not a half-written file).
-        save_vendedores(tmp.path(), &tenant(), &Vec::<Vendedor>::new()).unwrap();
-        let got = load_vendedores(tmp.path(), &tenant()).unwrap();
+        save_sellers(tmp.path(), &tenant(), &Vec::<Seller>::new()).unwrap();
+        let got = load_sellers(tmp.path(), &tenant()).unwrap();
         assert!(got.is_empty());
         // No tmp file leftover.
         let path = tmp.path().join("marketing").join("acme");
@@ -385,14 +385,14 @@ mod tests {
 
     #[test]
     fn save_rules_round_trips() {
-        use nexo_tool_meta::marketing::{AssignTarget, RuleSet, VendedorId};
+        use nexo_tool_meta::marketing::{AssignTarget, RuleSet, SellerId};
         let tmp = tempdir().unwrap();
         let rs = RuleSet {
             tenant_id: TenantIdRef("acme".into()),
             version: 1,
             rules: Vec::new(),
-            default_target: AssignTarget::Vendedor {
-                id: VendedorId("pedro".into()),
+            default_target: AssignTarget::Seller {
+                id: SellerId("pedro".into()),
             },
         };
         save_rules(tmp.path(), &tenant(), &rs).unwrap();

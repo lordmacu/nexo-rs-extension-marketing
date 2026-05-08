@@ -43,7 +43,7 @@ pub struct OutboundEmail {
 pub struct DispatchInput {
     pub thread_id: String,
     pub draft_id: String,
-    pub vendedor_smtp_instance: String,
+    pub seller_smtp_instance: String,
     pub email: OutboundEmail,
 }
 
@@ -146,7 +146,7 @@ impl OutboundPublisher {
             }
         }
 
-        let topic = format!("plugin.outbound.email.{}", input.vendedor_smtp_instance);
+        let topic = format!("plugin.outbound.email.{}", input.seller_smtp_instance);
         OutboundDispatchResult::Publish {
             topic,
             command: email,
@@ -163,7 +163,7 @@ mod tests {
         DispatchInput {
             thread_id: thread.into(),
             draft_id: draft.into(),
-            vendedor_smtp_instance: "acme-pedro".into(),
+            seller_smtp_instance: "acme-pedro".into(),
             email: OutboundEmail {
                 to: vec!["juan@acme.com".into()],
                 cc: vec![],
