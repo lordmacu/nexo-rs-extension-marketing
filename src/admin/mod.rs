@@ -87,6 +87,30 @@ pub struct AdminState {
     /// swaps the inner `Arc` so subsequent broker-hop scans
     /// pick up the override without a process restart.
     pub guardrails: Option<crate::guardrails::GuardrailHandle>,
+    /// M15.21 slice 2 — outbound publisher (compliance gate
+    /// + idempotency tracking + topic composition). One
+    /// instance per process (matches the per-tenant
+    /// extension boundary today). When `None`, the approve
+    /// handler refuses with `outbound_disabled`.
+    pub outbound: Option<Arc<crate::broker::OutboundPublisher>>,
+    /// M15.21 slice 2 — `BrokerSender` cloned out of the
+    /// first `on_broker_event` invocation. The admin server
+    /// runs in parallel to the broker subscriber so the
+    /// sender isn't available at boot — we capture it
+    /// lazily on the first event. Loads via
+    /// `broker_sender.load_full()` returning
+    /// `Option<Arc<BrokerSender>>`. `None` ⇒ publish refuses
+    /// with a clear "broker not yet attached" error.
+    pub broker_sender: Arc<
+        arc_swap::ArcSwapOption<nexo_microapp_sdk::plugin::BrokerSender>,
+    >,
+    /// M15.21 slice 2 — tracking deps shared with the
+    /// existing engagement endpoints. Reused here to mint
+    /// the per-send `MsgId` + inject the open-pixel + rewrite
+    /// links before the outbound goes through the broker.
+    /// `None` ⇒ outbound publishes WITHOUT tracking signals
+    /// (operator hasn't wired the secret yet).
+    pub tracking_for_outbound: Option<Arc<crate::tracking::TrackingDeps>>,
 }
 
 impl AdminState {
@@ -102,6 +126,9 @@ impl AdminState {
             tracking: None,
             audit: None,
             guardrails: None,
+            outbound: None,
+            broker_sender: Arc::new(arc_swap::ArcSwapOption::empty()),
+            tracking_for_outbound: None,
         }
     }
 
@@ -192,6 +219,45 @@ impl AdminState {
         self
     }
 
+    /// M15.21 slice 2 — wire the outbound publisher. Same
+    /// `Arc` shared between this admin surface (approve
+    /// handler) and any future tools that publish drafts
+    /// post-LLM-generation.
+    pub fn with_outbound(
+        mut self,
+        publisher: Arc<crate::broker::OutboundPublisher>,
+    ) -> Self {
+        self.outbound = Some(publisher);
+        self
+    }
+
+    /// M15.21 slice 2 — wire the broker-sender cell. Same
+    /// `ArcSwapOption` the broker subscriber populates on
+    /// its first invocation. Caller passes the same `Arc`
+    /// instance both here and into the closure so the
+    /// approve handler reads what the closure stored.
+    pub fn with_broker_sender_cell(
+        mut self,
+        cell: Arc<
+            arc_swap::ArcSwapOption<nexo_microapp_sdk::plugin::BrokerSender>,
+        >,
+    ) -> Self {
+        self.broker_sender = cell;
+        self
+    }
+
+    /// M15.21 slice 2 — same tracking deps the engagement
+    /// endpoints already consume. Reusing the Arc keeps the
+    /// signer + store + base_url consistent across the
+    /// outbound prep + ingest verify paths.
+    pub fn with_tracking_for_outbound(
+        mut self,
+        deps: Arc<crate::tracking::TrackingDeps>,
+    ) -> Self {
+        self.tracking_for_outbound = Some(deps);
+        self
+    }
+
     pub fn lookup_store(&self, tenant_id: &TenantId) -> Option<Arc<LeadStore>> {
         self.stores.get(tenant_id).cloned()
     }
@@ -222,6 +288,10 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route(
             "/leads/:lead_id/drafts/:message_id/reject",
             axum::routing::post(leads::reject_draft_handler),
+        )
+        .route(
+            "/leads/:lead_id/drafts/:message_id/approve",
+            axum::routing::post(leads::approve_draft_handler),
         )
         .route(
             "/config/mailboxes",

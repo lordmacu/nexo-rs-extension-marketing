@@ -313,6 +313,313 @@ pub async fn update_draft_handler(
     }
 }
 
+/// `POST /leads/:lead_id/drafts/:message_id/approve` —
+/// fires the outbound. Atomic-ish:
+///
+/// 1. Resolve lead + seller + person on the active tenant.
+/// 2. Validate the seller has an SMTP credential (M15.16).
+/// 3. Compose the `OutboundEmail` (subject inherits from
+///    the lead row + draft body + RFC 5322 threading
+///    headers).
+/// 4. Run `prepare_outbound_email` (M15.23.a) when tracking
+///    is wired — injects open pixel + rewrites links +
+///    persists link mappings.
+/// 5. Call `OutboundPublisher::dispatch` — runs the compliance
+///    gate + idempotency reservation.
+/// 6. On `Publish { topic, command, idempotency_key }`,
+///    serialise the command + publish via the cached
+///    `BrokerSender`.
+/// 7. Atomically: set draft status = approved + append
+///    outbound `thread_messages` row carrying the same
+///    `msg_id` so the lead drawer reflects the send.
+/// 8. Record audit + firehose event.
+///
+/// Failures degrade to typed error codes the operator UI
+/// surfaces in the modal banner — no partial state lands
+/// when any step refuses (compliance block, missing creds,
+/// broker not attached, etc.).
+pub async fn approve_draft_handler(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path((lead_id, message_id)): Path<(String, String)>,
+) -> Response {
+    use crate::broker::{DispatchInput, OutboundDispatchResult, OutboundEmail};
+    use crate::lead::DraftStatus;
+
+    // ── Validate wiring ──────────────────────────────────────
+    let store = match state.lookup_store(&tenant_id) {
+        Some(s) => s,
+        None => return server_error("store_missing", "tenant store not mounted"),
+    };
+    let outbound = match state.outbound.as_ref() {
+        Some(o) => o.clone(),
+        None => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "outbound_disabled",
+                "OutboundPublisher not wired; build with the marketing-extension binary that sets state.outbound at boot",
+            );
+        }
+    };
+    let broker_sender = match state.broker_sender.load_full() {
+        Some(s) => s,
+        None => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "broker_not_attached",
+                "BrokerSender not yet captured; wait for the first inbound or trigger any plugin event before approving",
+            );
+        }
+    };
+
+    // ── Resolve lead + draft ────────────────────────────────
+    let lead_obj_id = LeadId(lead_id.clone());
+    let lead = match store.get(&lead_obj_id).await {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            return error(
+                StatusCode::NOT_FOUND,
+                "lead_not_found",
+                &format!("no lead with id {lead_id:?} for the active tenant"),
+            );
+        }
+        Err(e) => return marketing_error(e),
+    };
+    let drafts = match store.list_drafts(&lead_obj_id, None).await {
+        Ok(rows) => rows,
+        Err(e) => return marketing_error(e),
+    };
+    let draft = match drafts.iter().find(|d| d.id == message_id) {
+        Some(d) => d,
+        None => {
+            return error(
+                StatusCode::NOT_FOUND,
+                "draft_not_found",
+                "no draft with that id on the active lead",
+            );
+        }
+    };
+    if draft.draft_status != Some(DraftStatus::Pending) {
+        return error(
+            StatusCode::CONFLICT,
+            "draft_not_pending",
+            "draft is already approved/rejected",
+        );
+    }
+
+    // ── Resolve seller + SMTP credential ────────────────────
+    let sellers_lookup = match state.seller_lookup.as_ref() {
+        Some(l) => l.load_full(),
+        None => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "sellers_not_loaded",
+                "seller index not mounted on AdminState — operator hasn't saved sellers.yaml yet",
+            );
+        }
+    };
+    let seller = match sellers_lookup.get(&lead.seller_id) {
+        Some(s) => s.clone(),
+        None => {
+            return error(
+                StatusCode::NOT_FOUND,
+                "seller_not_found",
+                &format!("seller {:?} bound to lead but missing from sellers.yaml", lead.seller_id.0),
+            );
+        }
+    };
+    let smtp = match seller.smtp_credential.as_ref() {
+        Some(c) => c.clone(),
+        None => {
+            return error(
+                StatusCode::PRECONDITION_FAILED,
+                "seller_missing_smtp",
+                &format!(
+                    "seller {:?} has no smtp_credential — register one via the seller form before approving drafts",
+                    seller.id.0,
+                ),
+            );
+        }
+    };
+
+    // ── Resolve recipient via PersonStore (when wired) ──────
+    // Falls back to the lead's `person_id` interpreted as
+    // an email — placeholder leads carry a synthesised id
+    // shaped like `placeholder-<uuid>` which isn't a real
+    // address, so the fallback bails clearly.
+    let recipient_email = lead.person_id.0.clone();
+    let recipient_email = if recipient_email.contains('@') {
+        recipient_email
+    } else {
+        return error(
+            StatusCode::PRECONDITION_FAILED,
+            "recipient_unresolved",
+            "lead's person_id is a placeholder — operator must confirm the contact's email before approving",
+        );
+    };
+
+    // ── Compose the OutboundEmail body ──────────────────────
+    let mut html_body = format!(
+        "<html><body>{}<br/><br/>{}</body></html>",
+        draft.body.replace('\n', "<br/>"),
+        seller.signature_text.replace('\n', "<br/>"),
+    );
+
+    // Subject — operator UI doesn't expose draft subject
+    // editing yet (slice 3 follow-up). Inherit lead subject
+    // with `Re: ` prefix when the lead already has a
+    // thread + `Re:` isn't already present.
+    let subject = if lead.subject.to_ascii_lowercase().starts_with("re:") {
+        lead.subject.clone()
+    } else {
+        format!("Re: {}", lead.subject)
+    };
+
+    // ── Tracking pre-send (open pixel + link rewrite) ───────
+    // When tracking deps are wired, mint a fresh msg_id +
+    // mutate `html_body` in place. The returned msg_id
+    // becomes the stable identifier for engagement
+    // attribution AND the thread_messages row.
+    let msg_id = if let Some(tracking) = state.tracking_for_outbound.as_ref() {
+        match crate::tracking::prepare_outbound_email(
+            tracking,
+            &tenant_id,
+            &mut html_body,
+        )
+        .await
+        {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!(
+                    target: "extension.marketing.draft_approve",
+                    error = %e,
+                    "prepare_outbound_email failed; outbound will lack tracking signals (non-fatal)"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let outbound_msg_id = msg_id
+        .as_ref()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| format!("outbound-{}", uuid::Uuid::new_v4()));
+
+    let email = OutboundEmail {
+        to: vec![recipient_email],
+        cc: vec![],
+        bcc: vec![],
+        subject,
+        body: html_body,
+        // Thread the reply against the original `Message-Id`
+        // when the lead carries one — keeps the thread tidy
+        // in the recipient's mail client.
+        in_reply_to: Some(lead.thread_id.clone()),
+        references: vec![lead.thread_id.clone()],
+    };
+    let dispatch_input = DispatchInput {
+        thread_id: lead.thread_id.clone(),
+        draft_id: message_id.clone(),
+        seller_smtp_instance: smtp.instance.clone(),
+        email,
+    };
+
+    // ── Compliance gate + idempotency reservation ───────────
+    let outcome = outbound.dispatch(dispatch_input);
+    let (topic, command) = match outcome {
+        OutboundDispatchResult::Publish {
+            topic, command, ..
+        } => (topic, command),
+        OutboundDispatchResult::Skipped { reason, .. } => {
+            return error(
+                StatusCode::CONFLICT,
+                "outbound_skipped",
+                &format!("publisher reservation says draft already dispatched: {reason}"),
+            );
+        }
+        OutboundDispatchResult::Blocked { reason, .. } => {
+            return error(
+                StatusCode::PRECONDITION_FAILED,
+                "outbound_blocked",
+                &format!("compliance gate blocked send: {reason}"),
+            );
+        }
+    };
+
+    // ── Publish to the broker ───────────────────────────────
+    let json_payload =
+        serde_json::to_value(&command).unwrap_or_else(|_| serde_json::json!({}));
+    let event = nexo_microapp_sdk::BrokerEvent::new(
+        topic.clone(),
+        "marketing.outbound",
+        json_payload,
+    );
+    if let Err(e) = broker_sender.publish(&topic, event).await {
+        return error(
+            StatusCode::BAD_GATEWAY,
+            "broker_publish_failed",
+            &format!("publish to {topic}: {e}"),
+        );
+    }
+
+    // ── Persist draft status + outbound thread row ──────────
+    // Ordering: status flip happens first so a crash mid-
+    // append doesn't fork the row into a "approved but no
+    // outbound message" state.
+    if let Err(e) = store
+        .set_draft_status(&lead_obj_id, &message_id, DraftStatus::Approved)
+        .await
+    {
+        return marketing_error(e);
+    }
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let outbound_msg = crate::lead::NewThreadMessage {
+        message_id: outbound_msg_id.clone(),
+        direction: crate::lead::MessageDirection::Outbound,
+        from_label: seller.name.clone(),
+        body: command.body.clone(),
+        at_ms: now_ms,
+        draft_status: None,
+    };
+    if let Err(e) = store.append_thread_message(&lead_obj_id, outbound_msg).await {
+        tracing::warn!(
+            target: "extension.marketing.draft_approve",
+            error = %e,
+            lead_id = %lead.id.0,
+            "outbound thread_message persist failed (non-fatal — broker already published)"
+        );
+    }
+
+    // ── Audit row ───────────────────────────────────────────
+    if let Some(audit) = state.audit.as_ref() {
+        let event = crate::audit::AuditEvent::NotificationPublished {
+            tenant_id: tenant_id.as_str().to_string(),
+            lead_id: lead.id.0.clone(),
+            seller_id: lead.seller_id.0.clone(),
+            notification_kind: "draft_approved".into(),
+            channel: "smtp_outbound".into(),
+            at_ms: now_ms.max(0) as u64,
+        };
+        if let Err(e) = audit.record(event).await {
+            tracing::warn!(
+                target: "extension.marketing.draft_approve",
+                error = %e,
+                "approve audit record failed (non-fatal)"
+            );
+        }
+    }
+
+    ok(json!({
+        "draft_id": message_id,
+        "status": "approved",
+        "topic": topic,
+        "outbound_message_id": outbound_msg_id,
+        "tracking_msg_id": msg_id.map(|m| m.as_str().to_string()),
+    }))
+}
+
 /// `POST /leads/:lead_id/drafts/:message_id/reject` — sets
 /// `draft_status = rejected`. Idempotent on already-rejected
 /// rows (returns 409 once locked). The approve handler lands

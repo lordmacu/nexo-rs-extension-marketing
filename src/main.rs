@@ -283,6 +283,26 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // ─── Outbound publisher (M15.21 slice 2) ──────────────────
+    // Single instance per process — same tenant boundary the
+    // marketing extension already runs single-tenant under.
+    // Compliance gate uses framework defaults
+    // (anti-loop / opt-out / PII / rate-limit). Operator
+    // overrides via the existing `compliance` module surface.
+    let outbound_publisher = Arc::new(
+        nexo_marketing::broker::OutboundPublisher::new(
+            tenant.clone(),
+            nexo_marketing::compliance::OutboundGate::with_defaults(),
+        ),
+    );
+    // M15.21 slice 2 — `BrokerSender` cell. Populated lazily
+    // on the first `on_broker_event` invocation; the admin
+    // approve handler reads from it. Cloned `Arc` shared
+    // between the closure (writer) and AdminState (reader).
+    let broker_sender_cell: Arc<
+        arc_swap::ArcSwapOption<nexo_microapp_sdk::plugin::BrokerSender>,
+    > = Arc::new(arc_swap::ArcSwapOption::empty());
+
     // ─── Surface 1: HTTP admin ────────────────────────────────
     let mut admin_state_builder = AdminState::new(bearer)
         .with_store(lead_store.clone())
@@ -292,9 +312,13 @@ async fn main() -> anyhow::Result<()> {
         .with_seller_lookup(seller_lookup.clone())
         .with_template_lookup(template_lookup.clone())
         .with_audit(audit_log.clone())
-        .with_guardrails(guardrails.clone());
+        .with_guardrails(guardrails.clone())
+        .with_outbound(outbound_publisher.clone())
+        .with_broker_sender_cell(broker_sender_cell.clone());
     if let Some(deps) = tracking_deps.clone() {
-        admin_state_builder = admin_state_builder.with_tracking(deps);
+        admin_state_builder = admin_state_builder
+            .with_tracking(deps.clone())
+            .with_tracking_for_outbound(deps);
     }
     let admin_state = Arc::new(admin_state_builder);
     let app = admin::router(admin_state);
@@ -320,6 +344,7 @@ async fn main() -> anyhow::Result<()> {
     let broker_sellers = seller_lookup.clone();
     let broker_templates = template_lookup.clone();
     let broker_dedup = dedup.clone();
+    let broker_sender_cell_for_closure = broker_sender_cell.clone();
     let broker_audit = audit_log.clone();
     // M15.23.e WA half — tenant resolver dedicated to
     // WhatsApp inbounds. Falls back to the same default
@@ -348,6 +373,15 @@ async fn main() -> anyhow::Result<()> {
         })
         .on_broker_event(
             move |topic: String, event: BrokerEvent, broker: BrokerSender| {
+                // M15.21 slice 2 — capture the BrokerSender on
+                // every event so the admin approve handler
+                // (running in a separate axum task) can publish
+                // outbound. Cheap clone (Arc internals); idempotent
+                // — store-overwrite pattern means later events
+                // can refresh the cached handle if the SDK ever
+                // rotates it.
+                broker_sender_cell_for_closure
+                    .store(Some(Arc::new(broker.clone())));
                 let store = broker_store.clone();
                 let router_handle = broker_router.clone();
                 let identity = broker_identity.clone();
