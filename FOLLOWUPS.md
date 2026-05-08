@@ -149,20 +149,34 @@ already used.
   spans WA account migrations; promote when LID-only
   contacts become common.
 
-### F24 · Duplicate matcher: broaden name+company search
+### F24 · Duplicate matcher: broaden name+company search ✅ — done in marketing 0.16.1 / SDK 0.1.9
 
-- **Origin:** M15.23.e.3 — `find_duplicate_candidates`'s
-  fuzzy-name signal currently only compares the candidate
-  against persons already surfaced via email or phone
-  match (a programming convenience to avoid a full
-  `PersonStore` table scan).
-- **Plan:** lift `PersonStore::list_by_company(tenant,
-  company_id, limit)` so the matcher pulls every person
-  with the same explicit company, scores all of them.
-  Index on `(tenant_id, company_id)` already exists in the
-  schema.
-- **Effort:** ~80 LOC (1 trait method + 1 SQL query + 3
-  tests).
+`PersonStore::list_by_company(tenant, company_id, limit)`
+lifted to the SDK trait with a default impl returning empty
+(in-tree fakes only override when they want the signal).
+SQLite impl runs a tenant-scoped query ordered by
+`last_seen_at_ms` desc; `limit` clamped at 1-1000 so a
+misconfigured caller can't trigger an unbounded table scan.
+
+`crate::duplicate::find_duplicate_candidates` now seeds its
+fuzzy-name comparison pool from
+`person_store.list_by_company(tenant, candidate.company_id,
+200)` when the candidate has a `company_id`. Falls back to
+the previous email/phone-pool comparison when no company id
+is set. SQLite errors on `list_by_company` log warn +
+degrade to the fallback (matcher remains a hint, never
+blocks).
+
+6 SDK tests + 4 marketing tests: matching company rows
+returned / null company excluded / tenant scoped / recency
+ordering / limit clamping / unknown company empty. Marketing
+tests cover: F24 broadening surfaces a candidate even when
+no email or phone signal fires, self-match excluded, below-
+floor drops, no-company candidate falls back to email pool.
+
+360/360 marketing tests green (356 baseline + 4 F24). 324/324
+SDK tests green (318 baseline + 6 list_by_company).
+SDK 0.1.8 → 0.1.9 · marketing 0.16.0 → 0.16.1.
 
 ### F25 · Cross-restart notification dedup via sled
 

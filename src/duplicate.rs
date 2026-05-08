@@ -167,55 +167,90 @@ pub async fn find_duplicate_candidates(
 
     // ── Name + company fuzzy ────────────────────────────────
     //
-    // Pull every person on the same tenant whose primary email
-    // shares the candidate's email domain — narrows the search
-    // space without a full table scan. (When the candidate has
-    // a personal email, this still works because gmail.com
-    // matches the populous "personal" bucket; the fuzzy
-    // floor + per-pair Jaccard keep it from over-matching.)
+    // F24 — when the candidate has a `company_id`, scan EVERY
+    // person on the same tenant who shares that company via
+    // the new `PersonStore::list_by_company` (capped at 200
+    // rows; tenants with > 200 same-company persons are rare
+    // + the operator UI surfaces only top-confidence
+    // candidates anyway). When no `company_id` is set, we
+    // degrade to comparing against the candidates already
+    // surfaced via email/phone (the previous behaviour).
+    //
+    // Either path also picks up the `same email domain` boost
+    // when the candidate's email lands on a corporate domain.
     let candidate_norm = normalize_name(&inputs.candidate.primary_name);
     if !candidate_norm.is_empty() {
-        if let Some(domain) = email_domain(&inputs.candidate.primary_email) {
-            // The current `PersonStore` trait doesn't expose a
-            // domain-bucketed listing; we degrade to "compare
-            // the candidate against the email-matched persons
-            // we already saw". Future store extension can lift
-            // a `list_by_company`.
-            for owner_id in by_person.keys().cloned().collect::<Vec<_>>() {
-                if let Ok(Some(p)) = person_store.get(tenant_id, &owner_id).await {
-                    let other_norm = normalize_name(&p.primary_name);
-                    let jaccard = name_jaccard(&candidate_norm, &other_norm);
-                    let same_company =
-                        p.company_id == inputs.candidate.company_id
-                            && p.company_id.is_some();
-                    let mut conf = jaccard;
-                    if same_company {
-                        // Same explicit company → boost.
-                        conf = (conf + 0.20).min(1.0);
-                    } else if email_domain(&p.primary_email)
-                        .map(|d| d == domain)
-                        .unwrap_or(false)
-                    {
-                        // Same email domain (corporate proxy
-                        // for "same employer") → modest boost.
-                        conf = (conf + 0.10).min(1.0);
-                    }
-                    if conf >= FUZZY_FLOOR {
-                        let detail = format!(
-                            "name `{}` similar to existing `{}`",
-                            inputs.candidate.primary_name, p.primary_name,
-                        );
-                        upsert_candidate(
-                            &mut by_person,
-                            DuplicateCandidate {
-                                person_id: owner_id.clone(),
-                                confidence: conf,
-                                signal: "name_company_fuzzy".into(),
-                                detail,
-                            },
-                        );
+        let candidate_domain = email_domain(&inputs.candidate.primary_email);
+
+        // Build the comparison set.
+        let mut comparison_pool: Vec<Person> = Vec::new();
+        if let Some(company) = inputs.candidate.company_id.as_ref() {
+            match person_store
+                .list_by_company(tenant_id, &company.0, 200)
+                .await
+            {
+                Ok(rows) => {
+                    for p in rows {
+                        if p.id != inputs.candidate.id {
+                            comparison_pool.push(p);
+                        }
                     }
                 }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "marketing.duplicate",
+                        error = %e,
+                        company = %company.0,
+                        "person_store.list_by_company failed (degrading to email-pool fallback)"
+                    );
+                }
+            }
+        }
+        // Always also fold in the email/phone-matched persons
+        // (catches cross-domain cases where two emails point
+        // at the same company but the explicit `company_id`
+        // hasn't been resolved yet for one of them).
+        for owner_id in by_person.keys().cloned().collect::<Vec<_>>() {
+            if comparison_pool.iter().any(|p| p.id == owner_id) {
+                continue;
+            }
+            if let Ok(Some(p)) = person_store.get(tenant_id, &owner_id).await {
+                comparison_pool.push(p);
+            }
+        }
+
+        for p in comparison_pool {
+            let other_norm = normalize_name(&p.primary_name);
+            let jaccard = name_jaccard(&candidate_norm, &other_norm);
+            let same_company = p.company_id == inputs.candidate.company_id
+                && p.company_id.is_some();
+            let mut conf = jaccard;
+            if same_company {
+                // Same explicit company → boost.
+                conf = (conf + 0.20).min(1.0);
+            } else if candidate_domain
+                .zip(email_domain(&p.primary_email))
+                .map(|(a, b)| a == b)
+                .unwrap_or(false)
+            {
+                // Same email domain (corporate proxy for
+                // "same employer") → modest boost.
+                conf = (conf + 0.10).min(1.0);
+            }
+            if conf >= FUZZY_FLOOR {
+                let detail = format!(
+                    "name `{}` similar to existing `{}`",
+                    inputs.candidate.primary_name, p.primary_name,
+                );
+                upsert_candidate(
+                    &mut by_person,
+                    DuplicateCandidate {
+                        person_id: p.id.clone(),
+                        confidence: conf,
+                        signal: "name_company_fuzzy".into(),
+                        detail,
+                    },
+                );
             }
         }
     }
@@ -323,6 +358,30 @@ mod tests {
             _e: &str,
         ) -> Result<Option<Person>, IdentityError> {
             Ok(None)
+        }
+        async fn list_by_company(
+            &self,
+            tenant: &str,
+            company_id: &str,
+            limit: usize,
+        ) -> Result<Vec<Person>, IdentityError> {
+            let map = self.rows.lock().unwrap();
+            let mut hits: Vec<Person> = map
+                .iter()
+                .filter(|((t, _), p)| {
+                    t == tenant
+                        && p.company_id
+                            .as_ref()
+                            .map(|c| c.0 == company_id)
+                            .unwrap_or(false)
+                })
+                .map(|(_, p)| p.clone())
+                .collect();
+            // Mirror the SQLite impl's recency ordering for
+            // realistic test behaviour.
+            hits.sort_by(|a, b| b.last_seen_at_ms.cmp(&a.last_seen_at_ms));
+            hits.truncate(limit);
+            Ok(hits)
         }
         async fn delete_by_tenant(
             &self,
@@ -730,5 +789,178 @@ mod tests {
         .await
         .unwrap();
         assert!(r.is_empty());
+    }
+
+    // ─── F24 — broadened name+company search ──────────────────
+
+    #[tokio::test]
+    async fn fuzzy_finds_match_via_company_listing_without_email_overlap() {
+        // F24 — pre-broadening, this candidate would NOT
+        // surface because no email or phone match seeds the
+        // comparison pool. The new
+        // `PersonStore::list_by_company` call brings in every
+        // `globex` person; Jaccard + same-company boost lifts
+        // the existing "Juan Pérez" above the fuzzy floor.
+        let ps = FakePersonStore::default();
+        let es = FakeEmailStore::default();
+        let phs = FakePhoneStore::default();
+        // Existing Juan @ globex.
+        let existing = person(
+            "juan-existing",
+            "Juan Pérez",
+            "juan@globex.io",
+            Some("globex"),
+        );
+        ps.upsert("acme", &existing).await.unwrap();
+        // Candidate: same name + same company, but a totally
+        // different email (globex.com instead of globex.io —
+        // domain doesn't even match the existing record's).
+        // Email + phone signals miss; only the broadened
+        // company scan can surface the duplicate.
+        let candidate = person(
+            "juan-new",
+            "Juan Pérez",
+            "juan@globex.com",
+            Some("globex"),
+        );
+        let phones: Vec<String> = vec![];
+        let r = find_duplicate_candidates(
+            "acme",
+            &MatchInputs {
+                candidate: &candidate,
+                phones: &phones,
+            },
+            &es,
+            Some(&phs),
+            &ps,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].person_id.0, "juan-existing");
+        assert_eq!(r[0].signal, "name_company_fuzzy");
+        // 1.0 Jaccard on 2-token names + 0.20 same-company
+        // boost saturates to 1.0.
+        assert!(r[0].confidence >= 0.99);
+    }
+
+    #[tokio::test]
+    async fn fuzzy_company_scan_excludes_self() {
+        // Candidate IS the company-listed row. Must NOT
+        // surface itself.
+        let ps = FakePersonStore::default();
+        let es = FakeEmailStore::default();
+        let phs = FakePhoneStore::default();
+        let row = person(
+            "juan",
+            "Juan Pérez",
+            "juan@globex.io",
+            Some("globex"),
+        );
+        ps.upsert("acme", &row).await.unwrap();
+        let phones: Vec<String> = vec![];
+        let r = find_duplicate_candidates(
+            "acme",
+            &MatchInputs {
+                candidate: &row,
+                phones: &phones,
+            },
+            &es,
+            Some(&phs),
+            &ps,
+        )
+        .await
+        .unwrap();
+        assert!(r.is_empty(), "got {r:?}");
+    }
+
+    #[tokio::test]
+    async fn fuzzy_company_scan_below_floor_drops_candidate() {
+        // Existing row has same company but a name that
+        // shares zero tokens — Jaccard 0 + 0.20 boost = 0.20
+        // which is below the 0.40 fuzzy floor. Must NOT
+        // surface.
+        let ps = FakePersonStore::default();
+        let es = FakeEmailStore::default();
+        let phs = FakePhoneStore::default();
+        ps.upsert(
+            "acme",
+            &person(
+                "ghost",
+                "Maria Rodriguez",
+                "maria@globex.io",
+                Some("globex"),
+            ),
+        )
+        .await
+        .unwrap();
+        let candidate = person(
+            "juan-new",
+            "Juan Pérez",
+            "juan@globex.io",
+            Some("globex"),
+        );
+        let phones: Vec<String> = vec![];
+        let r = find_duplicate_candidates(
+            "acme",
+            &MatchInputs {
+                candidate: &candidate,
+                phones: &phones,
+            },
+            &es,
+            Some(&phs),
+            &ps,
+        )
+        .await
+        .unwrap();
+        assert!(
+            r.iter()
+                .all(|c| c.signal != "name_company_fuzzy"),
+            "fuzzy below floor must not surface: {r:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn no_company_id_falls_back_to_email_pool() {
+        // Candidate has no `company_id` — F24 broadening
+        // can't fire. The matcher falls back to the
+        // pre-F24 behaviour: only email/phone-matched
+        // persons are compared.
+        let ps = FakePersonStore::default();
+        let es = FakeEmailStore::default();
+        let phs = FakePhoneStore::default();
+        let existing = person(
+            "juan-existing",
+            "Juan Pérez",
+            "juan@globex.io",
+            None,
+        );
+        ps.upsert("acme", &existing).await.unwrap();
+        es.add("acme", &existing.id, "juan@globex.io", true)
+            .await
+            .unwrap();
+        let candidate = person(
+            "juan-new",
+            "Juan P.",
+            "juan@globex.io",
+            None,
+        );
+        let phones: Vec<String> = vec![];
+        let r = find_duplicate_candidates(
+            "acme",
+            &MatchInputs {
+                candidate: &candidate,
+                phones: &phones,
+            },
+            &es,
+            Some(&phs),
+            &ps,
+        )
+        .await
+        .unwrap();
+        // Email match still fires; the fuzzy signal also
+        // surfaces (same email domain boost).
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].person_id.0, "juan-existing");
     }
 }
