@@ -39,19 +39,36 @@ deduped, sort order, earliest at_ms preserved.
 86/86 frontend tests green (79 baseline + 7 new). Frontend
 0.0.76 → 0.0.77 · agent-creator 0.0.63 → 0.0.64.
 
-### F20 · Lead drawer: engagement badge (M15.23.a.4)
+### F20 · Lead drawer: engagement badge (M15.23.a.4) ✅ — done in agent-creator 0.0.72
 
-- **Origin:** M15.23.a.4 — `GET /tracking/msg/:msg_id/engagement`
-  returns `{ opens, clicks_by_link }` for an outbound
-  message. Endpoint shipped + tested but no UI consumes it.
-- **Plan:** lead drawer's outbound-message rows render a
-  badge ("📧 3 lecturas · 2 clicks") next to the timestamp;
-  click expands the per-link breakdown.
-- **Effort:** ~150 LOC frontend.
-- **Blocker:** real-world `msg_id`s only land when M22's
-  draft pipeline + `prepare_outbound_email` integration
-  fire. Today's outbound publisher is already wired to call
-  the prep helper once a draft consumer exists.
+`EngagementBadge` component reads
+`/api/marketing/tracking/msg/:msg_id/engagement` (new
+microapp proxy → existing extension endpoint) and renders
+"📧 N lecturas · M clicks" inline under each outbound
+thread row. Click on the badge expands a per-link
+breakdown when clicks > 0; the badge stays silent when
+both opens and clicks are zero (fresh send), on 404
+`tracking_disabled` (operator hasn't wired tracking yet),
+or on transient network failure — keeps the lead drawer
+quiet when there's nothing actionable.
+
+The blocker noted above resolved naturally: M15.21
+slice 2's approve handler stamps the
+`prepare_outbound_email` `msg_id` as the outbound
+`thread_messages` row's id, so the badge can query
+engagement directly via `msg.id`. Pre-tracking
+deployments stamp `outbound-<uuid>` placeholders that
+yield empty aggregates — the badge stays hidden there
+too.
+
+5 vitest cases on `getEngagement` (wire path, encoding,
+empty aggregate, 404 + 500 surfacing). 8 render specs on
+`EngagementBadge` (loading, silent-on-zero, singular vs
+plural labels, expand on click, silent on 404, silent on
+network error, refetch on prop change).
+
+Frontend 0.0.82 → 0.0.83 · agent-creator 0.0.71 → 0.0.72.
+145/145 vitest green (132 baseline + 13 new).
 
 ### F2.a · Publish `LeadReplied` ✅ — done in M15.40
 
