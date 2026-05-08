@@ -437,6 +437,11 @@ pub fn router(state: Arc<AdminState>) -> Router {
             "/config/draft_template",
             get(config::get_draft_template).put(config::put_draft_template),
         )
+        // Sandbox-render preview without persisting.
+        .route(
+            "/config/draft_template/preview",
+            axum::routing::post(config::preview_draft_template),
+        )
         .route(
             "/config/snippets",
             get(config::list_snippets).put(config::put_snippets),

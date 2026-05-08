@@ -709,6 +709,69 @@ pub async fn get_draft_template(
     }))
 }
 
+/// `POST /config/draft_template/preview`. Body:
+/// `{ template: "...", operator_hint?: "..." }`.
+///
+/// Renders the operator-typed template against the same
+/// fixture context the PUT validator uses, without
+/// persisting or hot-swapping. Lets the operator iterate
+/// on tone before committing — sandboxed Handlebars (F26)
+/// guarantees + the fixture context match what production
+/// generation hits.
+///
+/// Response: `{ rendered, fixture_summary }`. Errors fall
+/// through the same typed surface as PUT (`empty_template`
+/// / `invalid_template`).
+pub async fn preview_draft_template(
+    State(_state): State<Arc<AdminState>>,
+    Extension(_tenant_id): Extension<TenantId>,
+    Json(body): Json<Value>,
+) -> Response {
+    let template_str = match body.get("template").and_then(Value::as_str) {
+        Some(s) => s.to_string(),
+        None => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "missing_field",
+                "body must carry a 'template' string",
+            );
+        }
+    };
+    if template_str.trim().is_empty() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "empty_template",
+            "template body must be non-empty",
+        );
+    }
+    let mut fixture = crate::draft::validation_fixture_context();
+    if let Some(hint) = body.get("operator_hint").and_then(Value::as_str) {
+        let trimmed = hint.trim();
+        if !trimmed.is_empty() {
+            if let Value::Object(map) = &mut fixture {
+                map.insert(
+                    "operator_hint".into(),
+                    Value::String(trimmed.into()),
+                );
+            }
+        }
+    }
+    match nexo_microapp_sdk::templating::handlebars::render_handlebars(
+        &template_str,
+        &fixture,
+    ) {
+        Ok(rendered) => ok(json!({
+            "rendered": rendered,
+            "fixture_summary": "lead.subject=Subject preview · seller.name=Seller Preview · last_inbound.body=Preview body",
+        })),
+        Err(e) => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_template",
+            &format!("template failed sandbox render: {e}"),
+        ),
+    }
+}
+
 /// `PUT /config/draft_template`. Body: `{ template: "..." }`.
 ///
 /// Validates by sandbox-rendering against a fixture
@@ -1252,6 +1315,90 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let v = body_to_json(resp).await;
         assert_eq!(v["error"]["code"], "missing_field");
+    }
+
+    fn post_req(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .header("X-Tenant-Id", "acme")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn preview_renders_template_against_fixture() {
+        let (state, _tmp) = build_state_with_template(true).await;
+        let app = router(state);
+        let resp = app
+            .oneshot(post_req(
+                "/config/draft_template/preview",
+                serde_json::json!({
+                    "template": "Hola {{seller.name}} — {{lead.subject}}",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_to_json(resp).await;
+        let rendered = v["result"]["rendered"].as_str().unwrap();
+        assert!(rendered.contains("Seller Preview"));
+        assert!(rendered.contains("Subject preview"));
+    }
+
+    #[tokio::test]
+    async fn preview_uses_operator_hint_override() {
+        let (state, _tmp) = build_state_with_template(true).await;
+        let app = router(state);
+        let resp = app
+            .oneshot(post_req(
+                "/config/draft_template/preview",
+                serde_json::json!({
+                    "template": "Hint: {{operator_hint}}",
+                    "operator_hint": "Mencionar promo de mayo",
+                }),
+            ))
+            .await
+            .unwrap();
+        let v = body_to_json(resp).await;
+        let rendered = v["result"]["rendered"].as_str().unwrap();
+        assert!(rendered.contains("Mencionar promo de mayo"));
+    }
+
+    #[tokio::test]
+    async fn preview_rejects_malformed_handlebars() {
+        let (state, _tmp) = build_state_with_template(true).await;
+        let app = router(state);
+        let resp = app
+            .oneshot(post_req(
+                "/config/draft_template/preview",
+                serde_json::json!({
+                    "template": "Hola {{#if seller.name}}{{seller.name}}",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["error"]["code"], "invalid_template");
+    }
+
+    #[tokio::test]
+    async fn preview_rejects_empty_template() {
+        let (state, _tmp) = build_state_with_template(true).await;
+        let app = router(state);
+        let resp = app
+            .oneshot(post_req(
+                "/config/draft_template/preview",
+                serde_json::json!({ "template": "   \n   " }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["error"]["code"], "empty_template");
     }
 
     #[tokio::test]
