@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.13.1 — 2026-05-08 (M15.47 — render_summary fallback humanised)
+
+Closes F16. The `render_summary` function used a `(other, _)`
+catch-all that formatted the enum variant via `Debug`, so an
+operator could (in pathological flows) see
+`📧 LeadTransitioned · ...` literal in their WhatsApp/email
+notification. Replaced with explicit ES + EN arms for the 3
+remaining kinds:
+
+- `LeadTransitioned` → `🔄 Lead transicionó · {from}\n…`
+- `MeetingIntent` → `📅 Intent de reunión de {from}\n…`
+- `DraftPending` → `✉️ Draft pendiente de revisión · {from}\n…`
+
+Active publish paths still use the dedicated renderers
+(`render_transition_summary`, `render_intent_summary`); this
+fallback only fires when a future caller routes those kinds
+through `classify` (the shared parsed-inbound helper).
+
+### Test count
+
+138 unit + 8 cross-tenant + 6 microapp proxy + 25 plugin /
+firehose / admin + 7 thread + 26 config + 1 live-reload +
+9 forwarder + **20 notification (was 16, +4 fallback humanise
+sweep)** = **240 green** (was 236).
+
 ## 0.13.0 — 2026-05-08 (M15.44 — operator-supplied notification templates)
 
 Closes F10. Operators now author per-tenant template overrides

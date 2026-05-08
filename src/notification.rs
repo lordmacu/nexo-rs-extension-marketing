@@ -443,13 +443,41 @@ fn render_summary(
             subj = parsed.subject,
             ve = v.primary_email,
         ),
-        // Future kinds (Transitioned, DraftPending, MeetingIntent)
-        // — fall through with a generic stub that the WA
-        // forwarder can still display while we wire publish
-        // points (F2 in FOLLOWUPS).
-        (other, _) => format!(
-            "📧 {other:?} · {from} · {subj}",
+        // Kinds with their own dedicated renderers
+        // (`render_transition_summary`, `render_intent_summary`).
+        // Reach this path only if a future publisher routes
+        // them through `classify` instead. Render a reasonable
+        // human string so the operator never sees `Debug`-
+        // formatted output (closes F16).
+        (EmailNotificationKind::LeadTransitioned, "en") => format!(
+            "🔄 Lead transitioned · {from}\nThread: {subj}\nSeller: {ve}",
             subj = parsed.subject,
+            ve = v.primary_email,
+        ),
+        (EmailNotificationKind::LeadTransitioned, _) => format!(
+            "🔄 Lead transicionó · {from}\nHilo: {subj}\nSeller: {ve}",
+            subj = parsed.subject,
+            ve = v.primary_email,
+        ),
+        (EmailNotificationKind::MeetingIntent, "en") => format!(
+            "📅 Meeting intent from {from}\nThread: {subj}\nSeller: {ve}",
+            subj = parsed.subject,
+            ve = v.primary_email,
+        ),
+        (EmailNotificationKind::MeetingIntent, _) => format!(
+            "📅 Intent de reunión de {from}\nHilo: {subj}\nSeller: {ve}",
+            subj = parsed.subject,
+            ve = v.primary_email,
+        ),
+        (EmailNotificationKind::DraftPending, "en") => format!(
+            "✉️ Draft pending review · {from}\nThread: {subj}\nSeller: {ve}",
+            subj = parsed.subject,
+            ve = v.primary_email,
+        ),
+        (EmailNotificationKind::DraftPending, _) => format!(
+            "✉️ Draft pendiente de revisión · {from}\nHilo: {subj}\nSeller: {ve}",
+            subj = parsed.subject,
+            ve = v.primary_email,
         ),
     }
 }
@@ -889,5 +917,82 @@ mod tests {
             &parsed_inbound(),
         );
         assert!(matches!(out, NotificationOutcome::Publish { .. }));
+    }
+
+    // M15.47 — F16: render_summary fallback for the 3 kinds
+    // that don't normally route through this function. The
+    // dedicated renderers (`render_transition_summary`,
+    // `render_intent_summary`) own those kinds today, but if
+    // a future publisher uses `classify` for them, the
+    // operator should NOT see `Debug`-formatted output.
+
+    #[test]
+    fn render_summary_lead_transitioned_kind_uses_human_text() {
+        let v = seller_with("pedro", None, None);
+        let s = render_summary(
+            EmailNotificationKind::LeadTransitioned,
+            &parsed_inbound(),
+            &v,
+            None,
+            &lead_with("pedro"),
+        );
+        // ES default; emoji + verb visible — NOT `LeadTransitioned`
+        // Debug literal.
+        assert!(s.contains("🔄"));
+        assert!(s.contains("transicionó"));
+        assert!(!s.contains("LeadTransitioned"));
+    }
+
+    #[test]
+    fn render_summary_meeting_intent_kind_uses_human_text() {
+        let v = seller_with("pedro", None, None);
+        let s = render_summary(
+            EmailNotificationKind::MeetingIntent,
+            &parsed_inbound(),
+            &v,
+            None,
+            &lead_with("pedro"),
+        );
+        assert!(s.contains("📅"));
+        assert!(s.contains("Intent de reunión"));
+        assert!(!s.contains("MeetingIntent"));
+    }
+
+    #[test]
+    fn render_summary_draft_pending_kind_uses_human_text() {
+        let v = seller_with("pedro", None, None);
+        let s = render_summary(
+            EmailNotificationKind::DraftPending,
+            &parsed_inbound(),
+            &v,
+            None,
+            &lead_with("pedro"),
+        );
+        assert!(s.contains("✉️"));
+        assert!(s.contains("Draft pendiente"));
+        assert!(!s.contains("DraftPending"));
+    }
+
+    #[test]
+    fn render_summary_english_locale_for_fallback_kinds() {
+        let mut v = seller_with("pedro", None, None);
+        v.preferred_language = Some("en".into());
+        for kind in [
+            EmailNotificationKind::LeadTransitioned,
+            EmailNotificationKind::MeetingIntent,
+            EmailNotificationKind::DraftPending,
+        ] {
+            let s = render_summary(
+                kind.clone(),
+                &parsed_inbound(),
+                &v,
+                None,
+                &lead_with("pedro"),
+            );
+            // Defensive — neither locale should ever leak the
+            // Rust enum variant name to the operator.
+            assert!(!s.contains(&format!("{kind:?}")), "leaked Debug for {kind:?}: {s}");
+            assert!(s.contains("Thread:") || s.contains("Draft"));
+        }
     }
 }

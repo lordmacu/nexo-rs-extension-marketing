@@ -81,15 +81,17 @@ JSON editor (M15.34 pattern).
   that boots admin router + broker hop test fixtures.
 - **Effort:** ~150 LOC.
 
-### F16 · Summary fallback for non-LeadCreated kinds is `Debug`
+### F16 · Summary fallback no longer Debug-formatted ✅ — done in M15.47
 
-- **Origin:** M15.38
-- **Status:** `render_summary` only branches on `LeadCreated`;
-  other kinds fall through to `format!("{:?}", kind)` — operator
-  sees `📧 LeadTransitioned · ...` instead of human text.
-- **Plan:** complete templates for the 3 remaining kinds when
-  F2 lands.
-- **Effort:** ~30 LOC (paired with F2).
+`render_summary` gains explicit ES + EN arms for
+`LeadTransitioned`, `MeetingIntent`, `DraftPending` — every
+kind now renders human text (`🔄 Lead transicionó · …`,
+`📅 Intent de reunión de …`, `✉️ Draft pendiente de revisión …`).
+The dedicated renderers (`render_transition_summary`,
+`render_intent_summary`) still own those kinds in the active
+publish paths; this fallback only fires when a future caller
+routes through `classify` for them. 4 new tests (one per kind
++ EN-locale defensive sweep) assert no `Debug` leaks.
 
 ## 🔵 Low · nice-to-have
 
