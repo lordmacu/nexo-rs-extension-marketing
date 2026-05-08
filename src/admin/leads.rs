@@ -721,6 +721,139 @@ pub async fn delete_draft_handler(
     }
 }
 
+/// `POST /leads/:lead_id/transition` body
+/// `{ to: "engaged"|"meeting_scheduled"|"qualified"|"lost",
+///   reason?: "..." }`.
+///
+/// Operator-driven manual transition. Validates the target
+/// state + the from→to legality at the store layer (the
+/// store refuses cross-illegal moves like
+/// `qualified → cold`). Records an audit row + publishes a
+/// firehose event so SSE consumers (lead timeline) see it
+/// in real time.
+#[derive(Debug, Deserialize)]
+pub struct TransitionBody {
+    pub to: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+pub async fn transition_handler(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path(lead_id): Path<String>,
+    Json(payload): Json<TransitionBody>,
+) -> Response {
+    use nexo_tool_meta::marketing::TenantIdRef;
+    let store = match state.lookup_store(&tenant_id) {
+        Some(s) => s,
+        None => return server_error("store_missing", "tenant store not mounted"),
+    };
+    let target = match parse_state(&payload.to) {
+        Some(s) => s,
+        None => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_state",
+                "to must be one of: cold, engaged, meeting_scheduled, qualified, lost",
+            );
+        }
+    };
+    let id = LeadId(lead_id.clone());
+    // Capture the pre-transition state for the audit row +
+    // firehose event. Refuses 404 here so the caller gets a
+    // clean error before the store's validate_transition
+    // would surface a less-specific message.
+    let before = match store.get(&id).await {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            return error(
+                StatusCode::NOT_FOUND,
+                "lead_not_found",
+                &format!("no lead with id {lead_id:?} for the active tenant"),
+            );
+        }
+        Err(e) => return marketing_error(e),
+    };
+    let after = match store.transition(&id, target).await {
+        Ok(l) => l,
+        Err(crate::error::MarketingError::InvalidTransition {
+            lead_id: _,
+            from,
+            to,
+        }) => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "illegal_transition",
+                &format!(
+                    "lead state machine refuses {} → {}",
+                    state_label(from),
+                    state_label(to),
+                ),
+            );
+        }
+        Err(e) => return marketing_error(e),
+    };
+    let reason = payload
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("operator override")
+        .to_string();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    // ── Audit ──────────────────────────────────────────────
+    if let Some(audit) = state.audit.as_ref() {
+        let event = crate::audit::AuditEvent::LeadTransitioned {
+            tenant_id: tenant_id.as_str().to_string(),
+            lead_id: lead_id.clone(),
+            from: state_label(before.state).into(),
+            to: state_label(target).into(),
+            reason: reason.clone(),
+            at_ms: now_ms.max(0) as u64,
+        };
+        if let Err(e) = audit.record(event).await {
+            tracing::warn!(
+                target: "extension.marketing.transition",
+                error = %e,
+                "transition audit record failed (non-fatal)"
+            );
+        }
+    }
+
+    // ── Firehose ───────────────────────────────────────────
+    state.firehose.publish(
+        crate::firehose::LeadFirehoseEvent::Transitioned {
+            tenant_id: TenantIdRef(tenant_id.as_str().to_string()),
+            lead_id: id.clone(),
+            from: before.state,
+            to: target,
+            at_ms: now_ms,
+            reason: reason.clone(),
+        },
+    );
+
+    ok(json!({
+        "lead": after,
+        "from": state_label(before.state),
+        "to": state_label(target),
+        "reason": reason,
+    }))
+}
+
+/// Inverse of `parse_state` — used by the transition
+/// handler's audit + firehose payload.
+fn state_label(s: LeadState) -> &'static str {
+    match s {
+        LeadState::Cold => "cold",
+        LeadState::Engaged => "engaged",
+        LeadState::MeetingScheduled => "meeting_scheduled",
+        LeadState::Qualified => "qualified",
+        LeadState::Lost => "lost",
+    }
+}
+
 /// `GET /drafts?limit=N` — tenant-wide pending drafts
 /// queue. Returns rows joined with the lead context so the
 /// operator's drafts inbox renders subject + seller +
@@ -1450,6 +1583,95 @@ mod tests {
         let resp = app.oneshot(req("/drafts?limit=999")).await.unwrap();
         let v = body_to_json(resp).await;
         assert_eq!(v["result"]["limit"], 200);
+    }
+
+    // ── Manual state transitions ─────────────────────────────
+
+    #[tokio::test]
+    async fn transition_legal_move_returns_updated_lead() {
+        let state = build_state_with_lead().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(post(
+                "/leads/l-1/transition",
+                serde_json::json!({ "to": "engaged", "reason": "first reply" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["from"], "cold");
+        assert_eq!(v["result"]["to"], "engaged");
+        assert_eq!(v["result"]["reason"], "first reply");
+        assert_eq!(v["result"]["lead"]["state"], "engaged");
+    }
+
+    #[tokio::test]
+    async fn transition_uses_default_reason_when_blank() {
+        let state = build_state_with_lead().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(post(
+                "/leads/l-1/transition",
+                serde_json::json!({ "to": "engaged", "reason": "  " }),
+            ))
+            .await
+            .unwrap();
+        let v = body_to_json(resp).await;
+        assert_eq!(v["result"]["reason"], "operator override");
+    }
+
+    #[tokio::test]
+    async fn transition_invalid_state_returns_400() {
+        let state = build_state_with_lead().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(post(
+                "/leads/l-1/transition",
+                serde_json::json!({ "to": "foo" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["error"]["code"], "invalid_state");
+    }
+
+    #[tokio::test]
+    async fn transition_missing_lead_returns_404() {
+        let state = build_state_with_lead().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(post(
+                "/leads/ghost/transition",
+                serde_json::json!({ "to": "engaged" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["error"]["code"], "lead_not_found");
+    }
+
+    #[tokio::test]
+    async fn transition_illegal_returns_422() {
+        let state = build_state_with_lead().await;
+        // Push to qualified first (cold → engaged →
+        // meeting_scheduled → qualified would normally take
+        // multiple hops). Easier: jump straight to lost
+        // (cold → lost is illegal in the state machine).
+        let app = router(state);
+        let resp = app
+            .oneshot(post(
+                "/leads/l-1/transition",
+                serde_json::json!({ "to": "qualified" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["error"]["code"], "illegal_transition");
     }
 
     // ── Per-draft subject override ───────────────────────────

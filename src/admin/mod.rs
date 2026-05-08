@@ -364,6 +364,11 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/leads", get(leads::list_handler))
         .route("/leads/:lead_id", get(leads::get_handler))
         .route("/leads/:lead_id/thread", get(leads::thread_handler))
+        // Operator-driven manual state transition.
+        .route(
+            "/leads/:lead_id/transition",
+            axum::routing::post(leads::transition_handler),
+        )
         .route(
             "/leads/:lead_id/drafts",
             get(leads::list_drafts_handler).post(leads::create_draft_handler),
