@@ -30,17 +30,11 @@ Both publish via `BrokerSender::publish` post-success.
   recommended" in the README.
 - **Recommendation:** doc-only for now.
 
-### F7 · Stale `vendedor.agent_id` when agent deleted
+### F7 · Stale `vendedor.agent_id` when agent deleted ✅ — done in M15.42
 
-- **Origin:** M15.35
-- **Status:** if the operator deletes an agent via `/agents`,
-  vendedores referencing that agent silently fail (publish to
-  topic with no consumers).
-- **Plan:**
-  - Microapp's `agents/delete` handler scans vendedores +
-    null-eares the `agent_id`.
-  - VendedorForm's agent dropdown filters `active=true`.
-- **Effort:** ~80 LOC.
+Frontend `unbindVendedoresFromAgent` runs before
+`agents/delete`; cascade banner surfaces affected vendedores
+in the confirm modal. Dropdown filters inactive agents.
 
 ### F8 · `LeadReplied` notification ✅ — done in M15.40
 
