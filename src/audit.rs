@@ -94,6 +94,34 @@ pub enum AuditEvent {
         /// Wall-clock at_ms.
         at_ms: u64,
     },
+    /// One duplicate-person candidate surfaced for a lead's
+    /// resolved person. Recorded once per `(lead, candidate)`
+    /// pair so the operator's compliance view can render the
+    /// merge-prompt history without scanning the live store.
+    DuplicatePersonDetected {
+        /// Tenant scope.
+        tenant_id: String,
+        /// Lead the candidate was matched against.
+        lead_id: String,
+        /// Candidate person id (the row that may be the
+        /// same human as the lead's resolved person).
+        candidate_person_id: String,
+        /// Lead's resolved person id (\"this is who we
+        /// thought the lead was — but maybe it's actually
+        /// the candidate\").
+        resolved_person_id: String,
+        /// Stable signal label
+        /// (\`email_match\` / \`phone_match\` /
+        /// \`name_company_fuzzy\`).
+        signal: String,
+        /// 0.0..1.0 confidence band.
+        confidence: f32,
+        /// Operator-facing detail (\"matched email
+        /// \\\`juan@globex.io\\\`\").
+        detail: String,
+        /// Wall-clock at_ms.
+        at_ms: u64,
+    },
     /// One topic guardrail fired against the inbound body.
     /// Recorded BEFORE the routing decision so the operator's
     /// timeline shows the guardrail tag adjacent to the
@@ -147,6 +175,7 @@ impl EventMetadata for AuditEvent {
             Self::LeadTransitioned { .. } => "lead_transitioned",
             Self::NotificationPublished { .. } => "notification_published",
             Self::TopicGuardrailFired { .. } => "topic_guardrail_fired",
+            Self::DuplicatePersonDetected { .. } => "duplicate_person_detected",
         }
     }
 
@@ -161,6 +190,7 @@ impl EventMetadata for AuditEvent {
             Self::LeadTransitioned { lead_id, .. } => lead_id.as_str(),
             Self::NotificationPublished { lead_id, .. } => lead_id.as_str(),
             Self::TopicGuardrailFired { lead_id, .. } => lead_id.as_deref().unwrap_or(""),
+            Self::DuplicatePersonDetected { lead_id, .. } => lead_id.as_str(),
         }
     }
 
@@ -170,6 +200,7 @@ impl EventMetadata for AuditEvent {
             Self::LeadTransitioned { tenant_id, .. } => tenant_id.as_str(),
             Self::NotificationPublished { tenant_id, .. } => tenant_id.as_str(),
             Self::TopicGuardrailFired { tenant_id, .. } => tenant_id.as_str(),
+            Self::DuplicatePersonDetected { tenant_id, .. } => tenant_id.as_str(),
         })
     }
 
@@ -179,6 +210,7 @@ impl EventMetadata for AuditEvent {
             Self::LeadTransitioned { at_ms, .. } => *at_ms,
             Self::NotificationPublished { at_ms, .. } => *at_ms,
             Self::TopicGuardrailFired { at_ms, .. } => *at_ms,
+            Self::DuplicatePersonDetected { at_ms, .. } => *at_ms,
         }
     }
 }
