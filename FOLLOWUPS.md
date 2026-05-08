@@ -18,17 +18,16 @@ Both publish via `BrokerSender::publish` post-success.
 
 `DraftPending` still deferred to M22 (no draft pipeline yet).
 
-### F4 · Reconciliation race condition (M15.37)
+### F4 · Reconciliation race condition ✅ — doc-closed in M15.50
 
-- **Origin:** M15.37 (microapp)
-- **Status:** `saveSellers` + `agents/upsert` are separate
-  client-side calls. 2 operators saving simultaneously can produce
-  inconsistent agent bindings.
-- **Impact:** rare in 1-operator deployments; real at scale.
-- **Plan:** move reconciliation to a microapp backend route
-  behind a per-tenant mutex. OR: document "single-operator
-  recommended" in the README.
-- **Recommendation:** doc-only for now.
+`agent-creator-microapp/README.md` now carries an
+"Operational notes" section explaining the
+non-transactional `saveSellers` + `agents/upsert` pair, the
+single-operator-recommended posture, and the upgrade path
+(move reconciliation into a microapp backend route behind a
+per-tenant mutex when multi-operator concurrency becomes a
+real workload). Code-level fix deferred until that signal
+surfaces.
 
 ### F7 · Stale `seller.agent_id` when agent deleted ✅ — done in M15.42
 
