@@ -105,14 +105,14 @@ JSON editor (M15.34 pattern).
   enabled window, valid alt_emails.
 - `pickFormState` round-trips both blocks on edit.
 
-### F12 · Agent UI badge doesn't filter on click
+### F12 · Agent UI badge filters on click ✅ — done in M15.46
 
-- **Origin:** M15.36
-- **Status:** `📧 N email sellers` navigates to the full
-  sellers list — no filter applied.
-- **Plan:** querystring `?agent_id=pedro-agent` + sidebar
-  applies via `useUrlState`.
-- **Effort:** ~30 LOC.
+`Agents.tsx` badge click navigates to
+`/m/marketing/settings/sellers?agent_id=<id>`. The sellers
+tab reads the param via `useSearchParams`, filters
+`slice.data` at render-time + renders a violet "🔎 Filtrado a
+sellers de pedro-agent (3 de 12)" banner with a "Quitar
+filtro" button that strips the URL param.
 
 ### F13 · No edit-from-agent path
 
