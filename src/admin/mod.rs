@@ -368,6 +368,10 @@ pub fn router(state: Arc<AdminState>) -> Router {
             "/leads/:lead_id/drafts/generate",
             axum::routing::post(leads::generate_draft_handler),
         )
+        // Tenant-wide pending drafts queue. Path is a
+        // top-level sibling of `/leads` so it doesn't need
+        // a lead id in the URL.
+        .route("/drafts", get(leads::drafts_inbox_handler))
         // M15.21.b — person + enrichment surface.
         .route("/persons/:person_id", get(persons::get_handler))
         .route(

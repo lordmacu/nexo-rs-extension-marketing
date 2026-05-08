@@ -672,6 +672,43 @@ pub async fn delete_draft_handler(
     }
 }
 
+/// `GET /drafts?limit=N` — tenant-wide pending drafts
+/// queue. Returns rows joined with the lead context so the
+/// operator's drafts inbox renders subject + seller +
+/// state without a follow-up fetch per row. Newest first;
+/// `limit` defaults to 50, clamped to [1, 200].
+#[derive(Debug, Deserialize)]
+pub struct DraftsInboxQuery {
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+const DEFAULT_DRAFTS_LIMIT: u32 = 50;
+const MAX_DRAFTS_LIMIT: u32 = 200;
+
+pub async fn drafts_inbox_handler(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+    Query(q): Query<DraftsInboxQuery>,
+) -> Response {
+    let store = match state.lookup_store(&tenant_id) {
+        Some(s) => s,
+        None => return server_error("store_missing", "tenant store not mounted"),
+    };
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_DRAFTS_LIMIT)
+        .clamp(1, MAX_DRAFTS_LIMIT);
+    match store.list_pending_drafts_tenant_wide(limit).await {
+        Ok(rows) => ok(json!({
+            "drafts": rows,
+            "count": rows.len(),
+            "limit": limit,
+        })),
+        Err(e) => marketing_error(e),
+    }
+}
+
 /// `POST /leads/:lead_id/drafts/generate` — operator-pull
 /// draft generation (M15.21 slice 4). Resolves the lead +
 /// seller + last inbound message, hands the structured
@@ -1306,5 +1343,63 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let v = body_to_json(resp).await;
         assert_eq!(v["error"]["code"], "generator_empty_body");
+    }
+
+    // ── Drafts inbox queue (tenant-wide pending) ────────────
+
+    #[tokio::test]
+    async fn drafts_inbox_returns_tenant_wide_pending_rows() {
+        use crate::lead::{DraftStatus, MessageDirection, NewThreadMessage};
+        let state = build_state_with_lead().await;
+        let store = state
+            .lookup_store(&TenantId::new("acme").unwrap())
+            .unwrap();
+        store
+            .append_thread_message(
+                &LeadId("l-1".into()),
+                NewThreadMessage {
+                    message_id: "d-pending".into(),
+                    direction: MessageDirection::Draft,
+                    from_label: "AI".into(),
+                    body: "pending body".into(),
+                    at_ms: 100,
+                    draft_status: Some(DraftStatus::Pending),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append_thread_message(
+                &LeadId("l-1".into()),
+                NewThreadMessage {
+                    message_id: "d-approved".into(),
+                    direction: MessageDirection::Draft,
+                    from_label: "AI".into(),
+                    body: "approved body".into(),
+                    at_ms: 200,
+                    draft_status: Some(DraftStatus::Approved),
+                },
+            )
+            .await
+            .unwrap();
+        let app = router(state);
+        let resp = app.oneshot(req("/drafts")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["count"], 1);
+        assert_eq!(v["result"]["limit"], 50);
+        assert_eq!(v["result"]["drafts"][0]["message_id"], "d-pending");
+        assert_eq!(v["result"]["drafts"][0]["lead_id"], "l-1");
+        assert_eq!(v["result"]["drafts"][0]["lead_subject"], "Re: cot");
+    }
+
+    #[tokio::test]
+    async fn drafts_inbox_clamps_limit_above_max() {
+        let state = build_state_with_lead().await;
+        let app = router(state);
+        let resp = app.oneshot(req("/drafts?limit=999")).await.unwrap();
+        let v = body_to_json(resp).await;
+        assert_eq!(v["result"]["limit"], 200);
     }
 }

@@ -310,6 +310,43 @@ impl LeadStore {
         Ok(row.0)
     }
 
+    /// Tenant-wide queue of pending drafts joined with their
+    /// lead context. Powers the operator's "drafts inbox"
+    /// where every pending row across every lead lands in
+    /// one batch-approve list. Newest first so the operator
+    /// sees fresh drafts at the top. `limit` clamps the
+    /// result count; pass 0 for no extra rows.
+    pub async fn list_pending_drafts_tenant_wide(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<PendingDraftRow>, MarketingError> {
+        let rows: Vec<PendingDraftRowSql> = sqlx::query_as(
+            "SELECT \
+               m.lead_id AS lead_id, \
+               m.message_id AS message_id, \
+               m.from_label AS from_label, \
+               m.body AS body, \
+               m.at_ms AS at_ms, \
+               l.subject AS lead_subject, \
+               l.seller_id AS lead_seller_id, \
+               l.person_id AS lead_person_id, \
+               l.state AS lead_state \
+             FROM thread_messages m \
+             JOIN leads l \
+               ON l.tenant_id = m.tenant_id AND l.id = m.lead_id \
+             WHERE m.tenant_id = ? \
+               AND m.direction = 'draft' \
+               AND m.draft_status = 'pending' \
+             ORDER BY m.at_ms DESC \
+             LIMIT ?",
+        )
+        .bind(self.tenant_id.as_str())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(PendingDraftRowSql::into_row).collect())
+    }
+
     /// M15.24 — count thread_messages by direction since
     /// `since_ms`. Powers the dashboard's "emails-in /
     /// emails-out (last 24h)" headline. Caller-supplied
@@ -542,6 +579,52 @@ pub enum DraftStatus {
     Pending,
     Approved,
     Rejected,
+}
+
+/// Tenant-wide pending draft row with the lead context
+/// the operator needs to triage without a follow-up
+/// fetch (subject + assigned seller + state). Powers the
+/// drafts inbox queue.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PendingDraftRow {
+    pub lead_id: String,
+    pub message_id: String,
+    pub from_label: String,
+    pub body: String,
+    pub at_ms: i64,
+    pub lead_subject: String,
+    pub lead_seller_id: String,
+    pub lead_person_id: String,
+    pub lead_state: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct PendingDraftRowSql {
+    lead_id: String,
+    message_id: String,
+    from_label: String,
+    body: String,
+    at_ms: i64,
+    lead_subject: String,
+    lead_seller_id: String,
+    lead_person_id: String,
+    lead_state: String,
+}
+
+impl PendingDraftRowSql {
+    fn into_row(self) -> PendingDraftRow {
+        PendingDraftRow {
+            lead_id: self.lead_id,
+            message_id: self.message_id,
+            from_label: self.from_label,
+            body: self.body,
+            at_ms: self.at_ms,
+            lead_subject: self.lead_subject,
+            lead_seller_id: self.lead_seller_id,
+            lead_person_id: self.lead_person_id,
+            lead_state: self.lead_state,
+        }
+    }
 }
 
 fn direction_str(d: MessageDirection) -> &'static str {
@@ -1279,6 +1362,119 @@ mod tests {
         }
         assert_eq!(acme.count_drafts_pending().await.unwrap(), 1);
         assert_eq!(globex.count_drafts_pending().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_pending_drafts_tenant_wide_joins_lead_context() {
+        let s = fresh_store("acme").await;
+        let l1 = s.create(input("l-1", "p-1", "v-1")).await.unwrap();
+        let l2 = s.create(input("l-2", "p-2", "v-2")).await.unwrap();
+        // Pending on l1 + pending on l2 + approved on l1 (excluded).
+        s.append_thread_message(
+            &l1.id,
+            NewThreadMessage {
+                message_id: "d-1".into(),
+                direction: MessageDirection::Draft,
+                from_label: "AI".into(),
+                body: "older".into(),
+                at_ms: 100,
+                draft_status: Some(DraftStatus::Pending),
+            },
+        )
+        .await
+        .unwrap();
+        s.append_thread_message(
+            &l2.id,
+            NewThreadMessage {
+                message_id: "d-2".into(),
+                direction: MessageDirection::Draft,
+                from_label: "AI".into(),
+                body: "newer".into(),
+                at_ms: 300,
+                draft_status: Some(DraftStatus::Pending),
+            },
+        )
+        .await
+        .unwrap();
+        s.append_thread_message(
+            &l1.id,
+            NewThreadMessage {
+                message_id: "d-3".into(),
+                direction: MessageDirection::Draft,
+                from_label: "AI".into(),
+                body: "approved".into(),
+                at_ms: 200,
+                draft_status: Some(DraftStatus::Approved),
+            },
+        )
+        .await
+        .unwrap();
+        let rows = s.list_pending_drafts_tenant_wide(50).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest first.
+        assert_eq!(rows[0].body, "newer");
+        assert_eq!(rows[0].lead_id, "l-2");
+        assert_eq!(rows[0].lead_seller_id, "v-2");
+        assert_eq!(rows[1].body, "older");
+        assert_eq!(rows[1].lead_subject, "Re: cotización");
+    }
+
+    #[tokio::test]
+    async fn list_pending_drafts_tenant_wide_respects_limit() {
+        let s = fresh_store("acme").await;
+        let l = s.create(input("l-1", "p-1", "v-1")).await.unwrap();
+        for i in 0..5 {
+            s.append_thread_message(
+                &l.id,
+                NewThreadMessage {
+                    message_id: format!("d-{i}"),
+                    direction: MessageDirection::Draft,
+                    from_label: "AI".into(),
+                    body: format!("body-{i}"),
+                    at_ms: i as i64 + 1,
+                    draft_status: Some(DraftStatus::Pending),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let rows = s.list_pending_drafts_tenant_wide(2).await.unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_pending_drafts_tenant_wide_is_tenant_scoped() {
+        let acme = fresh_store("acme").await;
+        let globex = fresh_store("globex").await;
+        let la = acme.create(input("l-1", "p", "v")).await.unwrap();
+        let lg = globex.create(input("l-1", "p", "v")).await.unwrap();
+        for (s, l, body) in [
+            (&acme, &la, "acme draft"),
+            (&globex, &lg, "globex draft"),
+        ] {
+            s.append_thread_message(
+                &l.id,
+                NewThreadMessage {
+                    message_id: "d".into(),
+                    direction: MessageDirection::Draft,
+                    from_label: "AI".into(),
+                    body: body.into(),
+                    at_ms: 1,
+                    draft_status: Some(DraftStatus::Pending),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let acme_rows = acme.list_pending_drafts_tenant_wide(50).await.unwrap();
+        assert_eq!(acme_rows.len(), 1);
+        assert_eq!(acme_rows[0].body, "acme draft");
+        let globex_rows = globex
+            .list_pending_drafts_tenant_wide(50)
+            .await
+            .unwrap();
+        assert_eq!(globex_rows.len(), 1);
+        assert_eq!(globex_rows[0].body, "globex draft");
     }
 
     #[tokio::test]
