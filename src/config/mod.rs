@@ -305,6 +305,7 @@ mod tests {
             agent_id: None,
             model_override: None,
             notification_settings: None,
+            smtp_credential: None,
         }
     }
 

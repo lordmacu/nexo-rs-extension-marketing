@@ -510,6 +510,7 @@ mod tests {
             agent_id: agent_id.map(|s| s.into()),
             model_override: None,
             notification_settings: settings,
+            smtp_credential: None,
         }
     }
 

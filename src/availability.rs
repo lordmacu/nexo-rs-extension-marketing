@@ -246,6 +246,7 @@ mod tests {
             preferred_language: None,
             agent_id: None,
             notification_settings: Some(SellerNotificationSettings::default()),
+            smtp_credential: None,
             model_override: None,
         }
     }
