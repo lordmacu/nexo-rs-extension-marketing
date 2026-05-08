@@ -379,6 +379,7 @@ pub async fn handle_inbound_event(
     templates: Option<&crate::notification::TemplateLookup>,
     broker: Option<BrokerSender>,
     dedup: Option<&crate::notification_dedup::DedupCache>,
+    audit: Option<&crate::audit::AuditLog>,
 ) -> HandledOutcome {
     if !topic.starts_with("plugin.inbound.email.") && topic != "plugin.inbound.email" {
         return HandledOutcome::Skipped;
@@ -605,6 +606,35 @@ pub async fn handle_inbound_event(
                 resolver = %resolver_source,
                 "created cold lead from inbound email"
             );
+            // M15.23.c — audit row for the routing decision.
+            // Fire-and-forget: a failure here logs warn but
+            // never sinks the live path — the lead row is
+            // already committed.
+            if let Some(log) = audit {
+                let rule_id = lead
+                    .why_routed
+                    .iter()
+                    .find_map(|s| s.strip_prefix("rule:").map(str::to_string));
+                let event = crate::audit::AuditEvent::RoutingDecided {
+                    tenant_id: tenant_id.as_str().to_string(),
+                    lead_id: Some(lead.id.0.clone()),
+                    from_email: parsed.from_email.clone(),
+                    chosen_seller_id: Some(lead.seller_id.0.clone()),
+                    rule_id,
+                    why: lead.why_routed.clone(),
+                    score: lead_score.value(),
+                    score_reasons: lead_score.reasons().to_vec(),
+                    at_ms: now_ms.max(0) as u64,
+                };
+                if let Err(e) = log.record(event).await {
+                    tracing::warn!(
+                        target: "plugin.marketing.broker",
+                        error = %e,
+                        lead_id = %lead.id.0,
+                        "audit record failed (non-fatal)"
+                    );
+                }
+            }
             // Seed the thread with the inbound that triggered
             // creation — the operator opens the lead detail and
             // sees the original email immediately.
@@ -937,6 +967,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(out, HandledOutcome::Skipped);
@@ -954,6 +985,7 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
             None,
             None,
             None,
@@ -982,6 +1014,7 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
             None,
             None,
             None,
@@ -1052,6 +1085,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -1089,6 +1123,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         let HandledOutcome::LeadCreated {
@@ -1104,6 +1139,7 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
             None,
             None,
             None,
@@ -1146,6 +1182,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -1178,6 +1215,7 @@ mod tests {
             Some(&router),
             Some(&identity),
             Some(&bus),
+            None,
             None,
             None,
             None,
@@ -1230,6 +1268,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         let _consume_created = rx.recv().await;
@@ -1242,6 +1281,7 @@ mod tests {
             Some(&router),
             Some(&identity),
             Some(&bus),
+            None,
             None,
             None,
             None,

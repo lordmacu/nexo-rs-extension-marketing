@@ -143,11 +143,38 @@ async fn main() -> anyhow::Result<()> {
     // surface is suppressed by the other.
     let dedup = Arc::new(nexo_marketing::notification_dedup::DedupCache::new());
 
+    // M15.23.c — AI decision audit log. One SQLite file per
+    // tenant under `<state_root>/<tenant>/audit.db`, table
+    // `marketing_audit_events`. Same `EventStore<T>` infra the
+    // SDK ships for the firehose so producers (broker hop +
+    // tools + notification publish) and the `/audit` query
+    // endpoint share one Arc.
+    let audit_db_path = tenant.state_dir(&state_root).join("audit.db");
+    if let Some(parent) = audit_db_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+    let audit_store = nexo_microapp_sdk::events::EventStore::<
+        nexo_marketing::audit::AuditEvent,
+    >::open(&audit_db_path, nexo_marketing::audit::AUDIT_TABLE)
+    .await
+    .with_context(|| format!("open audit log at {}", audit_db_path.display()))?;
+    let audit_log = Arc::new(nexo_marketing::audit::AuditLog::new(Arc::new(
+        audit_store,
+    )));
+    tracing::info!(
+        tenant = %tenant,
+        path = %audit_db_path.display(),
+        "audit log ready"
+    );
+
     let plugin_deps = PluginDeps::new(tenant.clone(), lead_store.clone(), router.clone())
         .with_identity(identity.clone())
         .with_sellers(seller_lookup.clone())
         .with_templates(template_lookup.clone())
-        .with_dedup(dedup.clone());
+        .with_dedup(dedup.clone())
+        .with_audit(audit_log.clone());
 
     // ─── Lead lifecycle bus (firehose) ────────────────────────
     // Shared between the broker handler (producer) and the
@@ -215,7 +242,8 @@ async fn main() -> anyhow::Result<()> {
         .with_state_root(state_root.clone())
         .with_router(router.clone())
         .with_seller_lookup(seller_lookup.clone())
-        .with_template_lookup(template_lookup.clone());
+        .with_template_lookup(template_lookup.clone())
+        .with_audit(audit_log.clone());
     if let Some(deps) = tracking_deps.clone() {
         admin_state_builder = admin_state_builder.with_tracking(deps);
     }
@@ -243,6 +271,7 @@ async fn main() -> anyhow::Result<()> {
     let broker_sellers = seller_lookup.clone();
     let broker_templates = template_lookup.clone();
     let broker_dedup = dedup.clone();
+    let broker_audit = audit_log.clone();
     PluginAdapter::new(MANIFEST)?
         .with_server_version(version)
         .declare_tools(marketing_tool_defs())
@@ -266,6 +295,7 @@ async fn main() -> anyhow::Result<()> {
                 let sellers = broker_sellers.clone();
                 let templates = broker_templates.clone();
                 let dedup = broker_dedup.clone();
+                let audit_log = broker_audit.clone();
                 async move {
                     // M15.39 — single broker subscriber, two
                     // dispatchers. Topic prefix routes between:
@@ -299,6 +329,7 @@ async fn main() -> anyhow::Result<()> {
                         Some(&templates),
                         Some(broker),
                         Some(dedup.as_ref()),
+                        Some(audit_log.as_ref()),
                     )
                     .await;
                 }

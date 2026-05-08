@@ -86,6 +86,12 @@ pub struct PluginDeps {
     /// duplicate hits short-circuit the publish silently.
     /// `None` disables dedup (tests + minimal setups).
     pub dedup: Option<Arc<DedupCache>>,
+    /// M15.23.c — AI decision audit log. When `Some`, the
+    /// broker hop's create path + the state-transition tools
+    /// + the notification publish branches record entries.
+    /// `None` ⇒ producers skip the recorder silently
+    /// (tests + minimal setups).
+    pub audit: Option<Arc<crate::audit::AuditLog>>,
 }
 
 impl PluginDeps {
@@ -102,6 +108,7 @@ impl PluginDeps {
             sellers: None,
             templates: None,
             dedup: None,
+            audit: None,
         }
     }
 
@@ -135,6 +142,16 @@ impl PluginDeps {
     /// one TTL window.
     pub fn with_dedup(mut self, cache: Arc<DedupCache>) -> Self {
         self.dedup = Some(cache);
+        self
+    }
+
+    /// Builder-style wiring for the audit log. Same `Arc`
+    /// captured by the admin `/audit` query endpoint + every
+    /// producer (broker hop + tools + notification publish)
+    /// so the operator's compliance view sees a unified
+    /// timeline.
+    pub fn with_audit(mut self, log: Arc<crate::audit::AuditLog>) -> Self {
+        self.audit = Some(log);
         self
     }
 }

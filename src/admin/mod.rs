@@ -24,6 +24,7 @@ use crate::lead::{LeadStore, RouterHandle};
 use crate::notification::{SellerLookup, TemplateLookup};
 use crate::tenant::TenantId;
 
+pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod firehose;
@@ -75,6 +76,12 @@ pub struct AdminState {
     /// recipients' email clients). `None` ⇒ tracking
     /// disabled and the ingest routes 404.
     pub tracking: Option<Arc<crate::tracking::TrackingDeps>>,
+    /// M15.23.c — AI decision audit log. When `Some`, the
+    /// `/audit` query endpoint mounts + producers (broker
+    /// hop, transition tools, notification publish) record
+    /// events. `None` ⇒ audit disabled (tests / minimal
+    /// setups).
+    pub audit: Option<Arc<crate::audit::AuditLog>>,
 }
 
 impl AdminState {
@@ -88,6 +95,7 @@ impl AdminState {
             seller_lookup: None,
             template_lookup: None,
             tracking: None,
+            audit: None,
         }
     }
 
@@ -156,6 +164,16 @@ impl AdminState {
         self
     }
 
+    /// Inject the AI decision audit log. When `Some`, the
+    /// `/audit` query endpoint mounts + the broker hop /
+    /// tools record entries. The same `Arc` should be
+    /// threaded through `PluginDeps` so producers + the
+    /// query endpoint share one store.
+    pub fn with_audit(mut self, log: Arc<crate::audit::AuditLog>) -> Self {
+        self.audit = Some(log);
+        self
+    }
+
     pub fn lookup_store(&self, tenant_id: &TenantId) -> Option<Arc<LeadStore>> {
         self.stores.get(tenant_id).cloned()
     }
@@ -200,6 +218,7 @@ pub fn router(state: Arc<AdminState>) -> Router {
             "/tracking/msg/:msg_id/engagement",
             get(tracking::engagement_handler),
         )
+        .route("/audit", get(audit::handler))
         .layer(auth_layer);
 
     // M15.23.a.3 — public ingest routes for the open pixel +

@@ -20,6 +20,7 @@
 //! point, modules are wiring details.
 
 pub mod admin;
+pub mod audit;
 pub mod availability;
 pub mod broker;
 pub mod compliance;
