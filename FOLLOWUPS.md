@@ -5,6 +5,37 @@ Each entry: origin milestone · estimated effort · acceptance criteria.
 
 ## 🟠 High · UX visible
 
+### F19 · Lead drawer: duplicate-person merge prompt (M15.23.e)
+
+- **Origin:** M15.23.e.5 — broker hop now records
+  `AuditEvent::DuplicatePersonDetected` whenever a new
+  lead's resolved person collides with an existing one
+  (email / phone / name+company signals). The audit row is
+  queryable via `GET /audit?kind=duplicate_person_detected&lead_id=<id>`
+  but no UI consumes it.
+- **Plan:** lead drawer reads the audit endpoint on mount,
+  renders a violet "🔀 Posible duplicado" banner when 1+
+  candidates exist; banner shows the candidate's
+  `primary_name` + `primary_email` + signal label +
+  confidence; "Confirmar merge" / "Descartar" buttons.
+- **Effort:** ~250 LOC frontend (banner component + API
+  integration + zustand state for the candidate list).
+- **Blocker:** none — backend ready.
+
+### F20 · Lead drawer: engagement badge (M15.23.a.4)
+
+- **Origin:** M15.23.a.4 — `GET /tracking/msg/:msg_id/engagement`
+  returns `{ opens, clicks_by_link }` for an outbound
+  message. Endpoint shipped + tested but no UI consumes it.
+- **Plan:** lead drawer's outbound-message rows render a
+  badge ("📧 3 lecturas · 2 clicks") next to the timestamp;
+  click expands the per-link breakdown.
+- **Effort:** ~150 LOC frontend.
+- **Blocker:** real-world `msg_id`s only land when M22's
+  draft pipeline + `prepare_outbound_email` integration
+  fire. Today's outbound publisher is already wired to call
+  the prep helper once a draft consumer exists.
+
 ### F2.a · Publish `LeadReplied` ✅ — done in M15.40
 
 ### F2.b · `LeadTransitioned` + `MeetingIntent` ✅ — done in M15.41
@@ -38,6 +69,104 @@ in the confirm modal. Dropdown filters inactive agents.
 ### F8 · `LeadReplied` notification ✅ — done in M15.40
 
 ## 🟡 Medium · technical debt
+
+### F21 · WhatsApp-side `PersonPhone` ingest (M15.23.e WA half)
+
+- **Origin:** M15.23.e — marketing-side matcher consumes
+  `PersonPhoneStore::find_owner` but no producer populates
+  the table. WA contacts never become candidates.
+- **Plan:** new subscriber in marketing extension's broker
+  loop on `plugin.inbound.whatsapp.*`. Decode
+  `InboundEvent::Message { from, ... }`, parse JID via
+  `nexo_microapp_sdk::identity::parse_jid` (rejects groups
+  / status / bots), resolve tenant via the existing
+  `TenantResolver` chain (mirroring the email subscriber's
+  account_id → tenant lookup), upsert `Person` (deterministic
+  uuid5 from JID) + `PersonPhone` (canonical
+  `<user>@<server>` form).
+- **Effort:** ~150 LOC + 4-6 tests + boot wiring of the
+  whatsapp tenant resolver fallback.
+- **Acceptance:** an inbound WA message from a contact
+  whose JID matches an email-side person triggers a
+  `DuplicatePersonDetected` audit row.
+
+### F22 · Outbound publisher integration of tracking prep helper
+
+- **Origin:** M15.23.a.3 — `prepare_outbound_email(deps,
+  tenant, &mut html_body) -> MsgId` is wired + tested but
+  the marketing extension's `OutboundPublisher::dispatch`
+  never calls it (the AI-draft → outbound send path lands
+  in M22).
+- **Plan:** when M22 ships the draft pipeline, the
+  publisher calls `prepare_outbound_email` between the
+  compliance gate and the broker publish. The returned
+  `msg_id` lands on the audit log + becomes the
+  `Message-Id:` header so engagement events thread back to
+  the originating draft.
+- **Effort:** ~30 LOC (the heavy lift was the helper
+  itself).
+- **Blocker:** M22 draft pipeline.
+
+### F23 · `LidPnMapping` store in SDK
+
+- **Origin:** Mining Baileys + whatsmeow during M15.23.e
+  surfaced LID↔PN migration as a first-class concept both
+  libraries track. Today's SDK keeps the two namespaces
+  distinct (`same_user(pn, lid) == false` even for the
+  same human).
+- **Plan:** new `LidPnMappingStore` trait + `SqliteLidPnMappingStore`
+  default impl. WA side persists pairs whenever the
+  protocol announces a migration. Duplicate matcher
+  consults the mapping when comparing JIDs across
+  namespaces.
+- **Effort:** ~100 LOC + ~6 tests + matcher tweak.
+- **Priority:** low — current marketing volume rarely
+  spans WA account migrations; promote when LID-only
+  contacts become common.
+
+### F24 · Duplicate matcher: broaden name+company search
+
+- **Origin:** M15.23.e.3 — `find_duplicate_candidates`'s
+  fuzzy-name signal currently only compares the candidate
+  against persons already surfaced via email or phone
+  match (a programming convenience to avoid a full
+  `PersonStore` table scan).
+- **Plan:** lift `PersonStore::list_by_company(tenant,
+  company_id, limit)` so the matcher pulls every person
+  with the same explicit company, scores all of them.
+  Index on `(tenant_id, company_id)` already exists in the
+  schema.
+- **Effort:** ~80 LOC (1 trait method + 1 SQL query + 3
+  tests).
+
+### F25 · Cross-restart notification dedup via sled
+
+- **Origin:** F9 (M15.53) shipped in-memory `DedupCache`
+  with `Mutex<HashMap>`. NATS at-least-once redelivery
+  across a process restart bypasses the cache.
+- **Plan:** swap the inner `HashMap` for a `sled` keyspace.
+  Public surface kept narrow on purpose so the swap is a
+  1-file change.
+- **Effort:** ~120 LOC + 1 new dep (`sled = "0.34"`).
+- **Priority:** low — extension restarts are operator-
+  triggered + NATS doesn't retain `plugin.inbound.*` events
+  across consumer restarts in our config (covers ~95% of
+  the threat).
+
+### F26 · Sandboxed Handlebars feature
+
+- **Origin:** M15.23.b — current renderer is mustache-lite
+  (`{{path.to.field}}` only). Spec called for "sandboxed
+  Handlebars" with full conditionals + loops; the slim
+  slice covers ~80% of operator templates without the
+  helper machinery.
+- **Plan:** new `templating-handlebars` feature on the SDK
+  pulling `handlebars` crate. `Template::render_with_helpers`
+  variant. Custom `compile` step rejects helpers with IO
+  side-effects.
+- **Effort:** ~200 LOC + new dep + 10-15 tests.
+- **Priority:** low — operator templates haven't outgrown
+  mustache-lite yet.
 
 ### F6 · Reconciler walk affected agents only ✅ — done in M15.51-2
 
@@ -112,6 +241,58 @@ routes through `classify` for them. 4 new tests (one per kind
 + EN-locale defensive sweep) assert no `Debug` leaks.
 
 ## 🔵 Low · nice-to-have
+
+### F27 · `/marketing/audit` UI tab
+
+- **Origin:** M15.23.c — `/audit` query endpoint shipped
+  with all 4 producers wiring rows. No UI consumes it.
+- **Plan:** new tab in `/marketing/settings/audit` (or as a
+  dedicated module rail entry) — table with filter chips
+  for kind / lead_id / since_ms; row click expands the
+  `detail` field. Pagination via `limit` + `since_ms`
+  cursor.
+- **Effort:** ~250 LOC frontend + 4-6 vitest cases.
+
+### F28 · Smoke test E2E vs real mailbox (M15.26)
+
+- **Origin:** M15.26 done-criterion never executed.
+- **Plan:** operator runs the extension against a real
+  Gmail / Outlook mailbox with a small test seller list.
+  Validates DKIM/SPF, threading, deliverability, anti-loop.
+  Captures any framework gap as a fresh sub-phase in
+  `proyecto/PHASES-microapps.md`.
+- **Effort:** wall-clock 30-60 min smoke session, no LOC.
+- **Blocker:** M22 outbound draft pipeline (smoke needs
+  end-to-end send to validate).
+
+### F29 · SDK lift sweep — final pass (M15.27)
+
+- **Origin:** M15.27 done-criterion. M15.* sub-phases
+  shipped continuous lifts (tracking, scoring, audit,
+  guardrails, templating, identity::jid). One pass over
+  every M15-touched file confirms nothing microapp-
+  agnostic stayed inside the marketing extension by
+  accident.
+- **Plan:** review `crate::tracking`, `crate::audit`,
+  `crate::scoring`, `crate::guardrails`, `crate::duplicate`,
+  `crate::availability`, `crate::threading`. For each:
+  apply the heuristics from `proyecto/CLAUDE.md`'s SDK lift
+  rule. Anything that DOESN'T graduate gets a one-line
+  "marketing-specific by design" comment so the next
+  reviewer doesn't re-litigate.
+- **Effort:** ~2-3h review session, may surface 1-2 lift
+  candidates of ~50 LOC each.
+
+### F30 · Frontend granular guardrail compile errors
+
+- **Origin:** M15.23.d — `PUT /config/topic_guardrails`
+  returns a typed body on regex / dup-id / empty-pattern
+  failure. Frontend renders the message in the modal banner
+  but doesn't highlight the offending rule row.
+- **Plan:** parse the 400 body's `rule_id` / `index` fields
+  in the modal, scroll to the offending rule + paint a red
+  border + inline tooltip with the `regex` crate error.
+- **Effort:** ~80 LOC frontend.
 
 ### F11 · `working_hours` + `alt_emails` editable ✅ — done in M15.45
 
