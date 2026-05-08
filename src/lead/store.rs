@@ -294,6 +294,44 @@ impl LeadStore {
         Ok(row.0)
     }
 
+    /// M15.24 — count pending drafts across every lead.
+    /// Powers the telemetry dashboard's "drafts awaiting
+    /// approval" headline. Tenant-scoped by construction
+    /// (the store carries its own `tenant_id`).
+    pub async fn count_drafts_pending(&self) -> Result<i64, MarketingError> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM thread_messages \
+             WHERE tenant_id = ? AND direction = 'draft' \
+             AND draft_status = 'pending'",
+        )
+        .bind(self.tenant_id.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// M15.24 — count thread_messages by direction since
+    /// `since_ms`. Powers the dashboard's "emails-in /
+    /// emails-out (last 24h)" headline. Caller-supplied
+    /// window so the same helper covers daily / weekly /
+    /// monthly variants without a schema change.
+    pub async fn count_messages_by_direction_since(
+        &self,
+        direction: MessageDirection,
+        since_ms: i64,
+    ) -> Result<i64, MarketingError> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM thread_messages \
+             WHERE tenant_id = ? AND direction = ? AND at_ms >= ?",
+        )
+        .bind(self.tenant_id.as_str())
+        .bind(direction_str(direction))
+        .bind(since_ms)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
     /// Append a message to a lead's thread. Idempotent on
     /// `(tenant_id, lead_id, message_id)` — re-running with the
     /// same message id is a no-op so the broker hop's natural
@@ -1146,5 +1184,153 @@ mod tests {
         // Globex still pristine.
         let g = globex.list_drafts(&globex_lead.id, None).await.unwrap();
         assert_eq!(g[0].body, "globex body");
+    }
+
+    // ─── M15.24 — telemetry helpers ──────────────────────────
+
+    #[tokio::test]
+    async fn count_drafts_pending_only_pending_rows() {
+        let s = fresh_store("acme").await;
+        let lead = s.create(input("l-1", "p-1", "v-1")).await.unwrap();
+        s.append_thread_message(
+            &lead.id,
+            NewThreadMessage {
+                message_id: "d-1".into(),
+                direction: MessageDirection::Draft,
+                from_label: "AI".into(),
+                body: "p1".into(),
+                at_ms: 1,
+                draft_status: Some(DraftStatus::Pending),
+            },
+        )
+        .await
+        .unwrap();
+        s.append_thread_message(
+            &lead.id,
+            NewThreadMessage {
+                message_id: "d-2".into(),
+                direction: MessageDirection::Draft,
+                from_label: "AI".into(),
+                body: "p2".into(),
+                at_ms: 2,
+                draft_status: Some(DraftStatus::Pending),
+            },
+        )
+        .await
+        .unwrap();
+        // One approved → does NOT count.
+        s.append_thread_message(
+            &lead.id,
+            NewThreadMessage {
+                message_id: "d-3".into(),
+                direction: MessageDirection::Draft,
+                from_label: "AI".into(),
+                body: "p3".into(),
+                at_ms: 3,
+                draft_status: Some(DraftStatus::Approved),
+            },
+        )
+        .await
+        .unwrap();
+        // Inbound message — also doesn't count.
+        s.append_thread_message(
+            &lead.id,
+            NewThreadMessage {
+                message_id: "in-1".into(),
+                direction: MessageDirection::Inbound,
+                from_label: "Cliente".into(),
+                body: "hi".into(),
+                at_ms: 4,
+                draft_status: None,
+            },
+        )
+        .await
+        .unwrap();
+        let n = s.count_drafts_pending().await.unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn count_drafts_pending_is_tenant_scoped() {
+        let acme = fresh_store("acme").await;
+        let globex = fresh_store("globex").await;
+        let l1 = acme.create(input("l-1", "p-1", "v-1")).await.unwrap();
+        let l2 = globex.create(input("l-1", "p-1", "v-1")).await.unwrap();
+        for store in [&acme, &globex] {
+            let lead = if store.tenant_id().as_str() == "acme" {
+                &l1
+            } else {
+                &l2
+            };
+            store
+                .append_thread_message(
+                    &lead.id,
+                    NewThreadMessage {
+                        message_id: "d-1".into(),
+                        direction: MessageDirection::Draft,
+                        from_label: "AI".into(),
+                        body: "x".into(),
+                        at_ms: 1,
+                        draft_status: Some(DraftStatus::Pending),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(acme.count_drafts_pending().await.unwrap(), 1);
+        assert_eq!(globex.count_drafts_pending().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn count_messages_by_direction_window_filters_inclusive() {
+        let s = fresh_store("acme").await;
+        let lead = s.create(input("l-1", "p-1", "v-1")).await.unwrap();
+        for (id, dir, at_ms) in [
+            ("in-old", MessageDirection::Inbound, 100_i64),
+            ("in-new", MessageDirection::Inbound, 200),
+            ("out-mid", MessageDirection::Outbound, 150),
+        ] {
+            s.append_thread_message(
+                &lead.id,
+                NewThreadMessage {
+                    message_id: id.into(),
+                    direction: dir,
+                    from_label: "x".into(),
+                    body: "x".into(),
+                    at_ms,
+                    draft_status: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // Window since=150 ⇒ inbound counts only `in-new` (200);
+        // boundary `at_ms == since_ms` is inclusive (>=).
+        let inbound = s
+            .count_messages_by_direction_since(
+                MessageDirection::Inbound,
+                150,
+            )
+            .await
+            .unwrap();
+        assert_eq!(inbound, 1);
+        let outbound = s
+            .count_messages_by_direction_since(
+                MessageDirection::Outbound,
+                150,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outbound, 1);
+        // Window since=0 ⇒ everything in the corresponding
+        // direction.
+        let all_inbound = s
+            .count_messages_by_direction_since(
+                MessageDirection::Inbound,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(all_inbound, 2);
     }
 }

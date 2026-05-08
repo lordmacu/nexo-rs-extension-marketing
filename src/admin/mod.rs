@@ -31,6 +31,7 @@ pub mod firehose;
 pub mod healthz;
 pub mod leads;
 pub mod persons;
+pub mod telemetry;
 pub mod tracking;
 
 pub use auth::{require_tenant_id, AuthState, AUTH_HEADER, TENANT_HEADER};
@@ -413,6 +414,8 @@ pub fn router(state: Arc<AdminState>) -> Router {
             get(tracking::engagement_handler),
         )
         .route("/audit", get(audit::handler))
+        // M15.24 — operator dashboard aggregate snapshot.
+        .route("/telemetry", get(telemetry::handler))
         .layer(auth_layer);
 
     // M15.23.a.3 — public ingest routes for the open pixel +
