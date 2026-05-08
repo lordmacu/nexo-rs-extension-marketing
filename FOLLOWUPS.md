@@ -134,14 +134,41 @@ tab reads the param via `useSearchParams`, filters
 sellers de pedro-agent (3 de 12)" banner with a "Quitar
 filtro" button that strips the URL param.
 
-### F13 · No edit-from-agent path
+### F13 · Edit-from-agent path ✅ — done in M15.54
 
-- **Origin:** M15.36
-- **Status:** to associate / disassociate seller from agent,
-  operator must navigate to the marketing tab.
-- **Plan:** "Email sellers" section in agent edit modal with
-  add/remove inline.
-- **Effort:** ~150 LOC.
+`Agents.tsx` edit modal's old "Bindings (solo lectura)"
+section split into:
+- "📧 Email sellers" — editable. Each marketing binding
+  renders a row with the seller id (deeplink to
+  `/m/marketing/settings/sellers?agent_id=<id>`) + a
+  "× Desvincular" button. A "+ Vincular seller" picker at
+  the bottom lists every seller not yet bound to this agent
+  (sellers bound elsewhere show "(mover desde otro-agent)" —
+  picking moves the binding).
+- "Otros bindings (solo lectura)" — whatsapp / telegram /
+  future, unchanged from before.
+
+Two new helpers in `api/agents.ts`:
+- `bindSellerToAgent(seller_id, target_agent_id)` — patches
+  the matching seller's `agent_id` + saves + reconciles.
+- `unbindSellerFromAgent(seller_id)` — strips `agent_id` +
+  `notification_settings` + `model_override` + saves +
+  reconciles.
+
+Both run the M15.37 reconciler with `previousSellers` (so
+the F6 fast path applies — only the affected agents are
+walked) and return the reconcile outcome so the modal
+surfaces partial-failure banners.
+
+Modal state: `bindings_busy` + `bindings_error` + `bind_pick`.
+Post-bind/unbind: `refresh_sellers` (re-fetch the full list
++ regroup by `agent_id` for the badge column) + a targeted
+`agents/get` to refresh `draft.inbound_bindings` without
+losing unsaved system_prompt / model edits.
+
+6 new vitest cases in `tests/api/agent-seller-bind.test.ts`
+covering bind / move / unbind / strip-aux-fields / no-match
+no-op / error bubble.
 
 ### F14 · `/agents` badge stays fresh ✅ — done in M15.51
 
