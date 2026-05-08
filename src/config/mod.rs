@@ -174,6 +174,15 @@ pub fn save_sellers(
     save_yaml_list(state_root, tenant, "sellers.yaml", rows)
 }
 
+/// Write `topic_guardrails.yaml`. Same full-replace contract.
+pub fn save_topic_guardrails(
+    state_root: impl AsRef<Path>,
+    tenant: &TenantId,
+    rows: &Vec<GuardrailRule>,
+) -> Result<(), MarketingError> {
+    save_yaml_list(state_root, tenant, "topic_guardrails.yaml", rows)
+}
+
 /// Write `followup_profiles.yaml`. Same full-replace contract.
 pub fn save_followup_profiles(
     state_root: impl AsRef<Path>,

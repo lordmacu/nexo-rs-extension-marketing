@@ -82,6 +82,11 @@ pub struct AdminState {
     /// events. `None` ⇒ audit disabled (tests / minimal
     /// setups).
     pub audit: Option<Arc<crate::audit::AuditLog>>,
+    /// M15.23.d — operator-supplied topic guardrails. When
+    /// `Some`, `PUT /config/topic_guardrails` rebuilds +
+    /// swaps the inner `Arc` so subsequent broker-hop scans
+    /// pick up the override without a process restart.
+    pub guardrails: Option<crate::guardrails::GuardrailHandle>,
 }
 
 impl AdminState {
@@ -96,6 +101,7 @@ impl AdminState {
             template_lookup: None,
             tracking: None,
             audit: None,
+            guardrails: None,
         }
     }
 
@@ -174,6 +180,18 @@ impl AdminState {
         self
     }
 
+    /// Inject the topic guardrail handle the broker hop
+    /// captured at boot. `PUT /config/topic_guardrails`
+    /// rebuilds + swaps the inner Arc so subsequent scans
+    /// pick up the new rules.
+    pub fn with_guardrails(
+        mut self,
+        handle: crate::guardrails::GuardrailHandle,
+    ) -> Self {
+        self.guardrails = Some(handle);
+        self
+    }
+
     pub fn lookup_store(&self, tenant_id: &TenantId) -> Option<Arc<LeadStore>> {
         self.stores.get(tenant_id).cloned()
     }
@@ -212,6 +230,11 @@ pub fn router(state: Arc<AdminState>) -> Router {
             "/config/notification_templates",
             get(config::get_notification_templates)
                 .put(config::put_notification_templates),
+        )
+        .route(
+            "/config/topic_guardrails",
+            get(config::list_topic_guardrails)
+                .put(config::put_topic_guardrails),
         )
         .route("/firehose", get(firehose::handler))
         .route(

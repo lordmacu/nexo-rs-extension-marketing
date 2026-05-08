@@ -26,9 +26,10 @@ use serde_json::{json, Value};
 use super::AdminState;
 use crate::config::{
     load_followup_profiles, load_mailboxes, load_notification_templates, load_sellers,
-    save_followup_profiles, save_mailboxes, save_notification_templates, save_rules,
-    save_sellers,
+    load_topic_guardrails, save_followup_profiles, save_mailboxes,
+    save_notification_templates, save_rules, save_sellers, save_topic_guardrails,
 };
+use nexo_microapp_sdk::guardrails::{GuardrailRule, GuardrailSet};
 use crate::error::MarketingError;
 use crate::lead::router::load_rule_set;
 use crate::lead::LeadRouter;
@@ -414,6 +415,97 @@ pub async fn put_notification_templates(
     };
     ok(json!({
         "templates": templates,
+        "reloaded": reloaded,
+        "restart_required": !reloaded,
+    }))
+}
+
+/// `GET /config/topic_guardrails` — list of guardrail rules
+/// from `topic_guardrails.yaml`. Empty list when missing.
+pub async fn list_topic_guardrails(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+) -> Response {
+    let root = match &state.state_root {
+        Some(r) => r,
+        None => return state_root_missing(),
+    };
+    match load_topic_guardrails(root, &tenant_id) {
+        Ok(rows) => {
+            let count = rows.len();
+            ok(json!({ "guardrails": rows, "count": count }))
+        }
+        Err(e) => marketing_error(e),
+    }
+}
+
+/// `PUT /config/topic_guardrails`. Body: `{ "guardrails":
+/// [...GuardrailRule...] }`. Compiles + live-reloads the
+/// in-memory handle. Compilation failure ⇒ 400 with the
+/// guardrail-loader error so the operator sees the precise
+/// regex / id / pattern issue.
+pub async fn put_topic_guardrails(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+    Json(body): Json<Value>,
+) -> Response {
+    let root = match &state.state_root {
+        Some(r) => r,
+        None => return state_root_missing(),
+    };
+    let guardrails_value = match body.get("guardrails") {
+        Some(v) => v.clone(),
+        None => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "missing_field",
+                "body must carry a 'guardrails' array",
+            );
+        }
+    };
+    let rows: Vec<GuardrailRule> = match serde_json::from_value(guardrails_value) {
+        Ok(v) => v,
+        Err(e) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_payload",
+                &format!("guardrails failed validation: {e}"),
+            );
+        }
+    };
+    // Compile FIRST — refuse to persist a YAML the in-memory
+    // tagger would reject. The operator sees a 400 with a
+    // typed body instead of a green PUT followed by a quiet
+    // "didn't actually swap" runtime hiccup.
+    let compiled = match GuardrailSet::build(rows.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "guardrail_compile",
+                &e.to_string(),
+            );
+        }
+    };
+    if let Err(e) = save_topic_guardrails(root, &tenant_id, &rows) {
+        return marketing_error(e);
+    }
+    let reloaded = match &state.guardrails {
+        Some(handle) => {
+            handle.store(std::sync::Arc::new(compiled));
+            tracing::info!(
+                target: "extension.marketing.config",
+                tenant = %tenant_id.as_str(),
+                rule_count = rows.len(),
+                "topic_guardrails live-reloaded"
+            );
+            true
+        }
+        None => false,
+    };
+    ok(json!({
+        "guardrails": rows,
+        "count": rows.len(),
         "reloaded": reloaded,
         "restart_required": !reloaded,
     }))

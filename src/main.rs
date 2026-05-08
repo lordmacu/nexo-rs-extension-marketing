@@ -265,7 +265,8 @@ async fn main() -> anyhow::Result<()> {
         .with_router(router.clone())
         .with_seller_lookup(seller_lookup.clone())
         .with_template_lookup(template_lookup.clone())
-        .with_audit(audit_log.clone());
+        .with_audit(audit_log.clone())
+        .with_guardrails(guardrails.clone());
     if let Some(deps) = tracking_deps.clone() {
         admin_state_builder = admin_state_builder.with_tracking(deps);
     }
