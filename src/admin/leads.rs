@@ -144,6 +144,236 @@ pub async fn thread_handler(
     }
 }
 
+// ── M15.21 slice 1 — draft CRUD endpoints ──────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct DraftListQuery {
+    /// `pending | approved | rejected`. Omitted ⇒ every status.
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+/// `GET /leads/:lead_id/drafts?status=pending`
+pub async fn list_drafts_handler(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path(lead_id): Path<String>,
+    Query(q): Query<DraftListQuery>,
+) -> Response {
+    let store = match state.lookup_store(&tenant_id) {
+        Some(s) => s,
+        None => return server_error("store_missing", "tenant store not mounted"),
+    };
+    let id = LeadId(lead_id.clone());
+    if matches!(store.get(&id).await, Ok(None)) {
+        return error(
+            StatusCode::NOT_FOUND,
+            "lead_not_found",
+            &format!("no lead with id {lead_id:?} for the active tenant"),
+        );
+    }
+    let status_filter = q.status.as_deref().and_then(parse_draft_status);
+    if q.status.is_some() && status_filter.is_none() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_status",
+            "status must be one of: pending, approved, rejected",
+        );
+    }
+    match store.list_drafts(&id, status_filter).await {
+        Ok(drafts) => ok(json!({
+            "lead_id": lead_id,
+            "drafts": drafts,
+            "count": drafts.len(),
+        })),
+        Err(e) => marketing_error(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateDraftBody {
+    /// Required — body of the proposed reply. Subject is
+    /// inherited from the lead row at send time (M15.21
+    /// slice 2); operator can override later via PUT.
+    pub body: String,
+    /// Optional operator-facing label. Defaults to "AI" so
+    /// the lead drawer reads consistently regardless of
+    /// who authored the draft (LLM tool / operator manual /
+    /// auto-template).
+    #[serde(default)]
+    pub from_label: Option<String>,
+}
+
+/// `POST /leads/:lead_id/drafts` — body `{ body, from_label? }`.
+/// Generates a fresh `draft-<uuidv4>` message id, inserts as
+/// `direction=draft / status=pending`. Returns the created
+/// row so the caller has the id for subsequent PUT/DELETE.
+pub async fn create_draft_handler(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path(lead_id): Path<String>,
+    Json(payload): Json<CreateDraftBody>,
+) -> Response {
+    if payload.body.trim().is_empty() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "empty_body",
+            "draft body must be non-empty",
+        );
+    }
+    let store = match state.lookup_store(&tenant_id) {
+        Some(s) => s,
+        None => return server_error("store_missing", "tenant store not mounted"),
+    };
+    let id = LeadId(lead_id.clone());
+    if matches!(store.get(&id).await, Ok(None)) {
+        return error(
+            StatusCode::NOT_FOUND,
+            "lead_not_found",
+            &format!("no lead with id {lead_id:?} for the active tenant"),
+        );
+    }
+    let message_id = format!("draft-{}", uuid::Uuid::new_v4());
+    let from_label = payload
+        .from_label
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "AI".into());
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let new_msg = crate::lead::NewThreadMessage {
+        message_id: message_id.clone(),
+        direction: crate::lead::MessageDirection::Draft,
+        from_label,
+        body: payload.body,
+        at_ms: now_ms,
+        draft_status: Some(crate::lead::DraftStatus::Pending),
+    };
+    if let Err(e) = store.append_thread_message(&id, new_msg).await {
+        return marketing_error(e);
+    }
+    // Read back so the response carries the canonical row.
+    let drafts = match store
+        .list_drafts(&id, Some(crate::lead::DraftStatus::Pending))
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => return marketing_error(e),
+    };
+    let row = drafts.into_iter().find(|d| d.id == message_id);
+    match row {
+        Some(d) => (
+            StatusCode::CREATED,
+            Json(json!({ "ok": true, "result": { "draft": d } })),
+        )
+            .into_response(),
+        None => server_error(
+            "draft_persist_inconsistency",
+            "draft inserted but read-back failed to find it",
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateDraftBody {
+    pub body: String,
+}
+
+/// `PUT /leads/:lead_id/drafts/:message_id` — body `{ body }`.
+/// Only succeeds when the draft is `pending`; approved or
+/// rejected drafts return 409.
+pub async fn update_draft_handler(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path((lead_id, message_id)): Path<(String, String)>,
+    Json(payload): Json<UpdateDraftBody>,
+) -> Response {
+    if payload.body.trim().is_empty() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "empty_body",
+            "draft body must be non-empty",
+        );
+    }
+    let store = match state.lookup_store(&tenant_id) {
+        Some(s) => s,
+        None => return server_error("store_missing", "tenant store not mounted"),
+    };
+    let id = LeadId(lead_id);
+    match store
+        .update_draft_body(&id, &message_id, &payload.body)
+        .await
+    {
+        Ok(0) => error(
+            StatusCode::CONFLICT,
+            "draft_locked",
+            "draft is approved/rejected or doesn't exist for this lead",
+        ),
+        Ok(_) => ok(json!({ "draft_id": message_id })),
+        Err(e) => marketing_error(e),
+    }
+}
+
+/// `POST /leads/:lead_id/drafts/:message_id/reject` — sets
+/// `draft_status = rejected`. Idempotent on already-rejected
+/// rows (returns 409 once locked). The approve handler lands
+/// in M15.21 slice 2 alongside the publisher wiring.
+pub async fn reject_draft_handler(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path((lead_id, message_id)): Path<(String, String)>,
+) -> Response {
+    let store = match state.lookup_store(&tenant_id) {
+        Some(s) => s,
+        None => return server_error("store_missing", "tenant store not mounted"),
+    };
+    let id = LeadId(lead_id);
+    match store
+        .set_draft_status(&id, &message_id, crate::lead::DraftStatus::Rejected)
+        .await
+    {
+        Ok(0) => error(
+            StatusCode::CONFLICT,
+            "draft_not_pending",
+            "draft is already approved/rejected or doesn't exist",
+        ),
+        Ok(_) => ok(json!({ "draft_id": message_id, "status": "rejected" })),
+        Err(e) => marketing_error(e),
+    }
+}
+
+/// `DELETE /leads/:lead_id/drafts/:message_id` — operator
+/// dismisses the draft entirely. Hard delete; tenant-scoped;
+/// only `direction=draft` rows match.
+pub async fn delete_draft_handler(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path((lead_id, message_id)): Path<(String, String)>,
+) -> Response {
+    let store = match state.lookup_store(&tenant_id) {
+        Some(s) => s,
+        None => return server_error("store_missing", "tenant store not mounted"),
+    };
+    let id = LeadId(lead_id);
+    match store.delete_draft(&id, &message_id).await {
+        Ok(0) => error(
+            StatusCode::NOT_FOUND,
+            "draft_not_found",
+            "no draft with that id on the active lead",
+        ),
+        Ok(_) => ok(json!({ "draft_id": message_id, "deleted": true })),
+        Err(e) => marketing_error(e),
+    }
+}
+
+fn parse_draft_status(s: &str) -> Option<crate::lead::DraftStatus> {
+    match s {
+        "pending" => Some(crate::lead::DraftStatus::Pending),
+        "approved" => Some(crate::lead::DraftStatus::Approved),
+        "rejected" => Some(crate::lead::DraftStatus::Rejected),
+        _ => None,
+    }
+}
+
 fn parse_state(s: &str) -> Option<LeadState> {
     match s {
         "cold" => Some(LeadState::Cold),

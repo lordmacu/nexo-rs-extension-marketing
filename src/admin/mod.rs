@@ -211,6 +211,19 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/leads/:lead_id", get(leads::get_handler))
         .route("/leads/:lead_id/thread", get(leads::thread_handler))
         .route(
+            "/leads/:lead_id/drafts",
+            get(leads::list_drafts_handler).post(leads::create_draft_handler),
+        )
+        .route(
+            "/leads/:lead_id/drafts/:message_id",
+            axum::routing::put(leads::update_draft_handler)
+                .delete(leads::delete_draft_handler),
+        )
+        .route(
+            "/leads/:lead_id/drafts/:message_id/reject",
+            axum::routing::post(leads::reject_draft_handler),
+        )
+        .route(
             "/config/mailboxes",
             get(config::list_mailboxes).put(config::put_mailboxes),
         )

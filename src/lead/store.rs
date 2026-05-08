@@ -325,6 +325,117 @@ impl LeadStore {
         Ok(())
     }
 
+    /// M15.21 slice 1 — update a draft's body. Only works
+    /// while the draft is `pending`; once approved or
+    /// rejected the row is locked. Returns the rows-affected
+    /// count so the caller can distinguish "not found / not
+    /// pending" (0) from "updated" (1).
+    pub async fn update_draft_body(
+        &self,
+        lead_id: &LeadId,
+        message_id: &str,
+        body: &str,
+    ) -> Result<u64, MarketingError> {
+        let r = sqlx::query(
+            "UPDATE thread_messages \
+             SET body = ? \
+             WHERE tenant_id = ? AND lead_id = ? AND message_id = ? \
+               AND direction = 'draft' AND draft_status = 'pending'",
+        )
+        .bind(body)
+        .bind(self.tenant_id.as_str())
+        .bind(&lead_id.0)
+        .bind(message_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// M15.21 slice 1 — transition a draft's status. Refuses
+    /// to update non-`draft` rows + non-`pending` drafts so a
+    /// double-approve from the operator can't fire the
+    /// publisher twice.
+    pub async fn set_draft_status(
+        &self,
+        lead_id: &LeadId,
+        message_id: &str,
+        to: DraftStatus,
+    ) -> Result<u64, MarketingError> {
+        let r = sqlx::query(
+            "UPDATE thread_messages \
+             SET draft_status = ? \
+             WHERE tenant_id = ? AND lead_id = ? AND message_id = ? \
+               AND direction = 'draft' AND draft_status = 'pending'",
+        )
+        .bind(draft_status_str(to))
+        .bind(self.tenant_id.as_str())
+        .bind(&lead_id.0)
+        .bind(message_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// M15.21 slice 1 — operator dismisses a draft. Hard
+    /// delete + tenant-scoped + `direction = draft`-scoped so
+    /// an outbound or inbound row can't be deleted by mistake.
+    pub async fn delete_draft(
+        &self,
+        lead_id: &LeadId,
+        message_id: &str,
+    ) -> Result<u64, MarketingError> {
+        let r = sqlx::query(
+            "DELETE FROM thread_messages \
+             WHERE tenant_id = ? AND lead_id = ? AND message_id = ? \
+               AND direction = 'draft'",
+        )
+        .bind(self.tenant_id.as_str())
+        .bind(&lead_id.0)
+        .bind(message_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// M15.21 slice 1 — list every draft on a lead (any
+    /// status). Caller-supplied `status_filter = Some(...)`
+    /// narrows to a single state; `None` returns all three.
+    pub async fn list_drafts(
+        &self,
+        lead_id: &LeadId,
+        status_filter: Option<DraftStatus>,
+    ) -> Result<Vec<ThreadMessage>, MarketingError> {
+        let rows: Vec<ThreadMessageRow> = match status_filter {
+            Some(status) => {
+                sqlx::query_as(
+                    "SELECT message_id, direction, from_label, body, at_ms, draft_status \
+                     FROM thread_messages \
+                     WHERE tenant_id = ? AND lead_id = ? \
+                       AND direction = 'draft' AND draft_status = ? \
+                     ORDER BY at_ms ASC, message_id ASC",
+                )
+                .bind(self.tenant_id.as_str())
+                .bind(&lead_id.0)
+                .bind(draft_status_str(status))
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT message_id, direction, from_label, body, at_ms, draft_status \
+                     FROM thread_messages \
+                     WHERE tenant_id = ? AND lead_id = ? AND direction = 'draft' \
+                     ORDER BY at_ms ASC, message_id ASC",
+                )
+                .bind(self.tenant_id.as_str())
+                .bind(&lead_id.0)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows.into_iter().map(ThreadMessage::from).collect())
+    }
+
     /// Load a lead's thread in chronological order (oldest
     /// first). Empty vec when the lead has no messages yet
     /// (placeholder leads created before thread persistence
@@ -797,5 +908,243 @@ mod tests {
         let thread = s.list_thread(&lead.id).await.unwrap();
         assert_eq!(thread[0].direction, MessageDirection::Draft);
         assert_eq!(thread[0].draft_status, Some(DraftStatus::Pending));
+    }
+
+    // ─── M15.21 slice 1 — draft mutation methods ─────────────
+
+    async fn store_with_draft(
+        body: &str,
+        status: DraftStatus,
+    ) -> (LeadStore, LeadId, String) {
+        let s = fresh_store("acme").await;
+        let lead = s.create(input("l-d", "p-1", "v-1")).await.unwrap();
+        let msg_id = "draft-1".to_string();
+        s.append_thread_message(
+            &lead.id,
+            NewThreadMessage {
+                message_id: msg_id.clone(),
+                direction: MessageDirection::Draft,
+                from_label: "AI".into(),
+                body: body.into(),
+                at_ms: 1,
+                draft_status: Some(status),
+            },
+        )
+        .await
+        .unwrap();
+        (s, lead.id.clone(), msg_id)
+    }
+
+    #[tokio::test]
+    async fn update_draft_body_round_trips() {
+        let (s, lead, msg) = store_with_draft("v1", DraftStatus::Pending).await;
+        let n = s.update_draft_body(&lead, &msg, "v2").await.unwrap();
+        assert_eq!(n, 1);
+        let drafts = s.list_drafts(&lead, None).await.unwrap();
+        assert_eq!(drafts[0].body, "v2");
+    }
+
+    #[tokio::test]
+    async fn update_draft_body_refuses_when_already_approved() {
+        let (s, lead, msg) =
+            store_with_draft("locked", DraftStatus::Approved).await;
+        let n = s.update_draft_body(&lead, &msg, "must not stick")
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "approved drafts are immutable");
+        let drafts = s.list_drafts(&lead, None).await.unwrap();
+        assert_eq!(drafts[0].body, "locked");
+    }
+
+    #[tokio::test]
+    async fn update_draft_body_misses_unknown_message_id() {
+        let (s, lead, _) =
+            store_with_draft("v1", DraftStatus::Pending).await;
+        let n = s.update_draft_body(&lead, "ghost-id", "x").await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn set_draft_status_pending_to_approved() {
+        let (s, lead, msg) =
+            store_with_draft("ok", DraftStatus::Pending).await;
+        let n = s
+            .set_draft_status(&lead, &msg, DraftStatus::Approved)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let drafts = s.list_drafts(&lead, None).await.unwrap();
+        assert_eq!(drafts[0].draft_status, Some(DraftStatus::Approved));
+    }
+
+    #[tokio::test]
+    async fn set_draft_status_pending_to_rejected() {
+        let (s, lead, msg) =
+            store_with_draft("ok", DraftStatus::Pending).await;
+        let n = s
+            .set_draft_status(&lead, &msg, DraftStatus::Rejected)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let drafts = s.list_drafts(&lead, None).await.unwrap();
+        assert_eq!(drafts[0].draft_status, Some(DraftStatus::Rejected));
+    }
+
+    #[tokio::test]
+    async fn set_draft_status_refuses_double_approve() {
+        let (s, lead, msg) =
+            store_with_draft("ok", DraftStatus::Pending).await;
+        let _ = s
+            .set_draft_status(&lead, &msg, DraftStatus::Approved)
+            .await
+            .unwrap();
+        let n = s
+            .set_draft_status(&lead, &msg, DraftStatus::Approved)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "double-approve must NOT fire the publisher twice");
+    }
+
+    #[tokio::test]
+    async fn delete_draft_removes_pending_row() {
+        let (s, lead, msg) =
+            store_with_draft("ok", DraftStatus::Pending).await;
+        let n = s.delete_draft(&lead, &msg).await.unwrap();
+        assert_eq!(n, 1);
+        let drafts = s.list_drafts(&lead, None).await.unwrap();
+        assert!(drafts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_draft_does_not_touch_outbound_rows() {
+        // Defense in depth: caller bug passing an outbound
+        // message_id must NOT delete the outbound row.
+        let s = fresh_store("acme").await;
+        let lead = s.create(input("l-d", "p-1", "v-1")).await.unwrap();
+        s.append_thread_message(
+            &lead.id,
+            NewThreadMessage {
+                message_id: "out-1".into(),
+                direction: MessageDirection::Outbound,
+                from_label: "Pedro".into(),
+                body: "real reply".into(),
+                at_ms: 1,
+                draft_status: None,
+            },
+        )
+        .await
+        .unwrap();
+        let n = s.delete_draft(&lead.id, "out-1").await.unwrap();
+        assert_eq!(n, 0, "outbound row must survive");
+        let thread = s.list_thread(&lead.id).await.unwrap();
+        assert_eq!(thread.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_drafts_filters_by_status() {
+        let s = fresh_store("acme").await;
+        let lead = s.create(input("l-d", "p-1", "v-1")).await.unwrap();
+        for (i, status) in
+            [(1, DraftStatus::Pending), (2, DraftStatus::Approved)].iter()
+        {
+            s.append_thread_message(
+                &lead.id,
+                NewThreadMessage {
+                    message_id: format!("draft-{i}"),
+                    direction: MessageDirection::Draft,
+                    from_label: "AI".into(),
+                    body: format!("body {i}"),
+                    at_ms: *i as i64,
+                    draft_status: Some(*status),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let pending =
+            s.list_drafts(&lead.id, Some(DraftStatus::Pending)).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let approved = s
+            .list_drafts(&lead.id, Some(DraftStatus::Approved))
+            .await
+            .unwrap();
+        assert_eq!(approved.len(), 1);
+        let all = s.list_drafts(&lead.id, None).await.unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_drafts_excludes_inbound_and_outbound() {
+        let s = fresh_store("acme").await;
+        let lead = s.create(input("l-d", "p-1", "v-1")).await.unwrap();
+        for (id, dir, status) in [
+            ("in-1", MessageDirection::Inbound, None),
+            ("draft-1", MessageDirection::Draft, Some(DraftStatus::Pending)),
+            ("out-1", MessageDirection::Outbound, None),
+        ] {
+            s.append_thread_message(
+                &lead.id,
+                NewThreadMessage {
+                    message_id: id.into(),
+                    direction: dir,
+                    from_label: "x".into(),
+                    body: "x".into(),
+                    at_ms: 1,
+                    draft_status: status,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let drafts = s.list_drafts(&lead.id, None).await.unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].id, "draft-1");
+    }
+
+    #[tokio::test]
+    async fn draft_methods_tenant_scoped() {
+        // Same lead id + same draft id under DIFFERENT
+        // tenants — operations on tenant A must NOT touch
+        // tenant B's row.
+        let acme = fresh_store("acme").await;
+        let acme_lead = acme.create(input("l-d", "p-1", "v-1")).await.unwrap();
+        acme.append_thread_message(
+            &acme_lead.id,
+            NewThreadMessage {
+                message_id: "draft-1".into(),
+                direction: MessageDirection::Draft,
+                from_label: "AI".into(),
+                body: "acme body".into(),
+                at_ms: 1,
+                draft_status: Some(DraftStatus::Pending),
+            },
+        )
+        .await
+        .unwrap();
+        let globex = fresh_store("globex").await;
+        let globex_lead =
+            globex.create(input("l-d", "p-1", "v-1")).await.unwrap();
+        globex
+            .append_thread_message(
+                &globex_lead.id,
+                NewThreadMessage {
+                    message_id: "draft-1".into(),
+                    direction: MessageDirection::Draft,
+                    from_label: "AI".into(),
+                    body: "globex body".into(),
+                    at_ms: 1,
+                    draft_status: Some(DraftStatus::Pending),
+                },
+            )
+            .await
+            .unwrap();
+        // Update under acme.
+        let _ = acme
+            .update_draft_body(&acme_lead.id, "draft-1", "acme v2")
+            .await
+            .unwrap();
+        // Globex still pristine.
+        let g = globex.list_drafts(&globex_lead.id, None).await.unwrap();
+        assert_eq!(g[0].body, "globex body");
     }
 }
