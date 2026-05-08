@@ -19,7 +19,7 @@ use nexo_microapp_sdk::{ToolError, ToolReply};
 use nexo_tool_meta::marketing::{LeadId, LeadState, TenantIdRef};
 
 use crate::error::MarketingError;
-use crate::lead::LeadStore;
+use crate::lead::{state_str as state_label, LeadStore};
 use crate::notification::{
     maybe_notify_lead_transitioned, NotificationOutcome, SellerLookup,
 };
@@ -42,6 +42,7 @@ pub async fn handle(
     templates: Option<&crate::notification::TemplateLookup>,
     broker: Option<&BrokerSender>,
     dedup: Option<&crate::notification_dedup::DedupCache>,
+    audit: Option<&crate::audit::AuditLog>,
     args: Value,
 ) -> Result<ToolReply, ToolError> {
     let parsed: Args = serde_json::from_value(args)
@@ -62,6 +63,28 @@ pub async fn handle(
 
     match store.transition(&parsed.lead_id, LeadState::Qualified).await {
         Ok(updated) => {
+            // M15.23.c — audit row for the transition.
+            // Fire-and-forget; failure logs warn but never
+            // sinks the tool reply.
+            if let (Some(log), Some(from)) = (audit, from_state) {
+                let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                let event = crate::audit::AuditEvent::LeadTransitioned {
+                    tenant_id: expected_tenant.as_str().to_string(),
+                    lead_id: updated.id.0.clone(),
+                    from: state_label(from).into(),
+                    to: state_label(LeadState::Qualified).into(),
+                    reason: parsed.reason.clone(),
+                    at_ms: now_ms,
+                };
+                if let Err(e) = log.record(event).await {
+                    tracing::warn!(
+                        target: "tool.marketing.lead_mark_qualified",
+                        error = %e,
+                        lead_id = %updated.id.0,
+                        "audit record failed (non-fatal)"
+                    );
+                }
+            }
             // Fire-and-forget notification publish post-transition.
             // Only fires when ALL of: tool ctx provides broker,
             // seller lookup is wired, seller opted in via
@@ -93,6 +116,11 @@ pub async fn handle(
                         let is_dup = dedup
                             .map(|c| c.is_duplicate(&dedup_key))
                             .unwrap_or(false);
+                        let channel_str = if is_dup {
+                            crate::audit::CHANNEL_DEDUPED
+                        } else {
+                            crate::audit::channel_label(&payload.channel)
+                        };
                         if is_dup {
                             tracing::debug!(
                                 target: "tool.marketing.lead_mark_qualified",
@@ -113,6 +141,25 @@ pub async fn handle(
                                     error = %e,
                                     topic = %topic,
                                     "lead_transitioned notification publish failed (non-fatal)"
+                                );
+                            }
+                        }
+                        // M15.23.c — audit row regardless of dedupe
+                        // so compliance sees every attempt.
+                        if let Some(log) = audit {
+                            let event = crate::audit::AuditEvent::NotificationPublished {
+                                tenant_id: expected_tenant.as_str().to_string(),
+                                lead_id: updated.id.0.clone(),
+                                seller_id: updated.seller_id.0.clone(),
+                                notification_kind: "lead_transitioned".into(),
+                                channel: channel_str.to_string(),
+                                at_ms: payload.at_ms.max(0) as u64,
+                            };
+                            if let Err(e) = log.record(event).await {
+                                tracing::warn!(
+                                    target: "tool.marketing.lead_mark_qualified",
+                                    error = %e,
+                                    "audit record failed (non-fatal)"
                                 );
                             }
                         }
@@ -194,7 +241,7 @@ mod tests {
     #[tokio::test]
     async fn meeting_to_qualified_persists() {
         let s = store_with_lead_in(LeadState::MeetingScheduled).await;
-        let r = handle(&TenantId::new("acme").unwrap(), s, None, None, None, None, args())
+        let r = handle(&TenantId::new("acme").unwrap(), s, None, None, None, None, None, args())
             .await
             .unwrap();
         let v = r.as_value();
@@ -206,7 +253,7 @@ mod tests {
     #[tokio::test]
     async fn cold_to_qualified_invalid_transition() {
         let s = store_with_lead_in(LeadState::Cold).await;
-        let r = handle(&TenantId::new("acme").unwrap(), s, None, None, None, None, args())
+        let r = handle(&TenantId::new("acme").unwrap(), s, None, None, None, None, None, args())
             .await
             .unwrap();
         let v = r.as_value();

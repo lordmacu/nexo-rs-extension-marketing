@@ -55,6 +55,7 @@ pub async fn handle(
     templates: Option<&crate::notification::TemplateLookup>,
     broker: Option<&BrokerSender>,
     dedup: Option<&crate::notification_dedup::DedupCache>,
+    audit: Option<&crate::audit::AuditLog>,
     args: Value,
 ) -> Result<ToolReply, ToolError> {
     let parsed: Args = serde_json::from_value(args).map_err(|e| {
@@ -104,6 +105,11 @@ pub async fn handle(
                         let is_dup = dedup
                             .map(|c| c.is_duplicate(&dedup_key))
                             .unwrap_or(false);
+                        let channel_str = if is_dup {
+                            crate::audit::CHANNEL_DEDUPED
+                        } else {
+                            crate::audit::channel_label(&payload.channel)
+                        };
                         if is_dup {
                             tracing::debug!(
                                 target: "tool.marketing.lead_detect_meeting_intent",
@@ -124,6 +130,27 @@ pub async fn handle(
                                     error = %e,
                                     topic = %topic,
                                     "meeting_intent notification publish failed (non-fatal)"
+                                );
+                            }
+                        }
+                        // M15.23.c — audit row regardless of dedupe
+                        // / publish-error so the compliance view
+                        // sees every attempt, not just successful
+                        // sends.
+                        if let Some(log) = audit {
+                            let event = crate::audit::AuditEvent::NotificationPublished {
+                                tenant_id: expected_tenant.as_str().to_string(),
+                                lead_id: lead.id.0.clone(),
+                                seller_id: lead.seller_id.0.clone(),
+                                notification_kind: "meeting_intent".into(),
+                                channel: channel_str.to_string(),
+                                at_ms: payload.at_ms.max(0) as u64,
+                            };
+                            if let Err(e) = log.record(event).await {
+                                tracing::warn!(
+                                    target: "tool.marketing.lead_detect_meeting_intent",
+                                    error = %e,
+                                    "audit record failed (non-fatal)"
                                 );
                             }
                         }
@@ -264,6 +291,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             args("acme", "Yes, Tuesday at 3pm works for me."),
         )
         .await
@@ -284,6 +312,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             args("acme", "Perfecto, el martes a las 15:00 me sirve."),
         )
         .await
@@ -298,6 +327,7 @@ mod tests {
         let r = handle(
             &TenantId::new("acme").unwrap(),
             s,
+            None,
             None,
             None,
             None,
@@ -325,6 +355,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             args("acme", "Gracias por la información, lo voy a revisar."),
         )
         .await
@@ -340,6 +371,7 @@ mod tests {
         let r = handle(
             &TenantId::new("acme").unwrap(),
             s,
+            None,
             None,
             None,
             None,

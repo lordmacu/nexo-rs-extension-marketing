@@ -471,6 +471,7 @@ pub async fn handle_inbound_event(
                         "lead_replied",
                         payload.at_ms,
                     );
+                    let mut deduped_short_circuit = false;
                     if let Some(cache) = dedup {
                         if cache.is_duplicate(&dedup_key) {
                             tracing::debug!(
@@ -478,33 +479,60 @@ pub async fn handle_inbound_event(
                                 key = %dedup_key.as_str(),
                                 "lead_replied notification deduped"
                             );
-                            return HandledOutcome::LeadUpdated {
-                                lead_id: lead.id.clone(),
-                                thread_id: parsed.thread_id,
-                            };
+                            deduped_short_circuit = true;
                         }
                     }
-                    let json_payload = serde_json::to_value(&payload)
-                        .unwrap_or_else(|_| serde_json::json!({}));
-                    let event = nexo_microapp_sdk::BrokerEvent::new(
-                        topic.clone(),
-                        "marketing.notification",
-                        json_payload,
-                    );
-                    if let Err(e) = broker_sender.publish(&topic, event).await {
-                        tracing::warn!(
-                            target: "plugin.marketing.broker",
-                            error = %e,
-                            topic = %topic,
-                            "lead_replied notification publish failed (non-fatal)"
-                        );
+                    let channel_str = if deduped_short_circuit {
+                        crate::audit::CHANNEL_DEDUPED
                     } else {
-                        tracing::debug!(
-                            target: "plugin.marketing.broker",
-                            topic = %topic,
-                            channel = ?payload.channel,
-                            "lead_replied notification published"
+                        crate::audit::channel_label(&payload.channel)
+                    };
+                    if !deduped_short_circuit {
+                        let json_payload = serde_json::to_value(&payload)
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                        let event = nexo_microapp_sdk::BrokerEvent::new(
+                            topic.clone(),
+                            "marketing.notification",
+                            json_payload,
                         );
+                        if let Err(e) = broker_sender.publish(&topic, event).await {
+                            tracing::warn!(
+                                target: "plugin.marketing.broker",
+                                error = %e,
+                                topic = %topic,
+                                "lead_replied notification publish failed (non-fatal)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                target: "plugin.marketing.broker",
+                                topic = %topic,
+                                channel = ?payload.channel,
+                                "lead_replied notification published"
+                            );
+                        }
+                    }
+                    if let Some(log) = audit {
+                        let event = crate::audit::AuditEvent::NotificationPublished {
+                            tenant_id: tenant_id.as_str().to_string(),
+                            lead_id: lead.id.0.clone(),
+                            seller_id: lead.seller_id.0.clone(),
+                            notification_kind: "lead_replied".into(),
+                            channel: channel_str.to_string(),
+                            at_ms: payload.at_ms.max(0) as u64,
+                        };
+                        if let Err(e) = log.record(event).await {
+                            tracing::warn!(
+                                target: "plugin.marketing.broker",
+                                error = %e,
+                                "audit record failed (non-fatal)"
+                            );
+                        }
+                    }
+                    if deduped_short_circuit {
+                        return HandledOutcome::LeadUpdated {
+                            lead_id: lead.id.clone(),
+                            thread_id: parsed.thread_id,
+                        };
                     }
                 }
                 other => {
@@ -679,6 +707,11 @@ pub async fn handle_inbound_event(
                         let is_dup = dedup
                             .map(|c| c.is_duplicate(&dedup_key))
                             .unwrap_or(false);
+                        let channel_str = if is_dup {
+                            crate::audit::CHANNEL_DEDUPED
+                        } else {
+                            crate::audit::channel_label(&payload.channel)
+                        };
                         if is_dup {
                             tracing::debug!(
                                 target: "plugin.marketing.broker",
@@ -706,6 +739,23 @@ pub async fn handle_inbound_event(
                                     topic = %topic,
                                     channel = ?payload.channel,
                                     "lead_created notification published"
+                                );
+                            }
+                        }
+                        if let Some(log) = audit {
+                            let event = crate::audit::AuditEvent::NotificationPublished {
+                                tenant_id: tenant_id.as_str().to_string(),
+                                lead_id: lead.id.0.clone(),
+                                seller_id: lead.seller_id.0.clone(),
+                                notification_kind: "lead_created".into(),
+                                channel: channel_str.to_string(),
+                                at_ms: payload.at_ms.max(0) as u64,
+                            };
+                            if let Err(e) = log.record(event).await {
+                                tracing::warn!(
+                                    target: "plugin.marketing.broker",
+                                    error = %e,
+                                    "audit record failed (non-fatal)"
                                 );
                             }
                         }

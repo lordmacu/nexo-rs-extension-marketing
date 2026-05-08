@@ -488,7 +488,10 @@ impl LeadRow {
     }
 }
 
-fn state_str(s: LeadState) -> &'static str {
+/// Convert a `LeadState` to its stable lowercase label.
+/// Public so audit producers + tests share the same wire
+/// shape as the SQL store without re-stringifying.
+pub fn state_str(s: LeadState) -> &'static str {
     match s {
         LeadState::Cold => "cold",
         LeadState::Engaged => "engaged",

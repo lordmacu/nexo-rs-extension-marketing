@@ -80,6 +80,7 @@ pub async fn dispatch(
                 deps.templates.as_ref(),
                 ctx.map(|c| &c.broker),
                 deps.dedup.as_deref(),
+                deps.audit.as_deref(),
                 inv.args,
             )
             .await
@@ -94,6 +95,7 @@ pub async fn dispatch(
                 deps.templates.as_ref(),
                 ctx.map(|c| &c.broker),
                 deps.dedup.as_deref(),
+                deps.audit.as_deref(),
                 inv.args,
             )
             .await

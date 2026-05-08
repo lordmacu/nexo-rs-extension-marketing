@@ -15,5 +15,6 @@ pub use router::{
 pub use score::{score_lead, ScoreContribution, ScoreInputs, ScoreOutput};
 pub use state::{validate_transition, LegalTransitions};
 pub use store::{
-    DraftStatus, LeadStore, MessageDirection, NewLead, NewThreadMessage, ThreadMessage,
+    state_str, DraftStatus, LeadStore, MessageDirection, NewLead, NewThreadMessage,
+    ThreadMessage,
 };

@@ -35,6 +35,7 @@ use std::sync::Arc;
 
 use nexo_microapp_sdk::events::{EventMetadata, EventStore, ListFilter};
 use nexo_microapp_sdk::scoring::ScoreReason;
+use nexo_tool_meta::marketing::NotificationChannel;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -152,6 +153,23 @@ impl EventMetadata for AuditEvent {
         }
     }
 }
+
+/// Stable channel label for audit rows + the operator UI's
+/// compliance view. `\"deduped\"` is reserved for callers that
+/// want to record the F9 dedup short-circuit without claiming
+/// the publish actually fired.
+pub fn channel_label(channel: &NotificationChannel) -> &'static str {
+    match channel {
+        NotificationChannel::Disabled => "disabled",
+        NotificationChannel::Whatsapp { .. } => "whatsapp",
+        NotificationChannel::Email { .. } => "email",
+    }
+}
+
+/// Channel label for the dedup short-circuit. Returned as a
+/// `&'static str` so it composes with [`channel_label`] in
+/// match arms without an extra alloc.
+pub const CHANNEL_DEDUPED: &str = "deduped";
 
 /// Reasons recording an audit row can fail. Producers map
 /// every variant to a `tracing::warn` and continue — audit
