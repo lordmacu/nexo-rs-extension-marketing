@@ -93,14 +93,17 @@ JSON editor (M15.34 pattern).
 
 ## 🔵 Low · nice-to-have
 
-### F11 · `working_hours` + `alt_emails` not editable in form
+### F11 · `working_hours` + `alt_emails` editable ✅ — done in M15.45
 
-- **Origin:** M15.35
-- **Status:** form preserves whatever is in YAML; no UI to
-  create/change.
-- **Plan:** mini-editor for each. Working hours = 7 weekday
-  slider rows + timezone picker. alt_emails = chip input.
-- **Effort:** ~200 LOC.
+`SellerForm` gains:
+- `ChipInput` component for `alt_emails` with Enter/comma to
+  add, backspace on empty to remove last, click × to remove.
+- Working hours editor (toggle to enable, IANA timezone text
+  input, 3 weekday rows: mon_fri / saturday / sunday — each
+  with enabled checkbox + HH:MM start/end time inputs).
+- `buildPayload` validates HH:MM format, start < end per
+  enabled window, valid alt_emails.
+- `pickFormState` round-trips both blocks on edit.
 
 ### F12 · Agent UI badge doesn't filter on click
 
