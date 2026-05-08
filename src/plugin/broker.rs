@@ -345,6 +345,7 @@ pub async fn handle_inbound_event(
     sellers: Option<&SellerLookup>,
     templates: Option<&crate::notification::TemplateLookup>,
     broker: Option<BrokerSender>,
+    dedup: Option<&crate::notification_dedup::DedupCache>,
 ) -> HandledOutcome {
     if !topic.starts_with("plugin.inbound.email.") && topic != "plugin.inbound.email" {
         return HandledOutcome::Skipped;
@@ -425,6 +426,30 @@ pub async fn handle_inbound_event(
         if let (Some(lookup), Some(broker_sender)) = (sellers, broker.as_ref()) {
             match maybe_notify_lead_replied(tenant_id, lookup, templates, &lead, &parsed) {
                 NotificationOutcome::Publish { topic, payload } => {
+                    // M15.53 / F9 — dedupe under TTL window so a
+                    // NATS redelivery of the same inbound doesn't
+                    // ping the operator twice. Cache hit ⇒ skip
+                    // publish silently; cache miss records + falls
+                    // through to publish.
+                    let dedup_key = crate::notification_dedup::DedupKey::new(
+                        tenant_id.as_str(),
+                        &lead.id.0,
+                        "lead_replied",
+                        payload.at_ms,
+                    );
+                    if let Some(cache) = dedup {
+                        if cache.is_duplicate(&dedup_key) {
+                            tracing::debug!(
+                                target: "plugin.marketing.broker",
+                                key = %dedup_key.as_str(),
+                                "lead_replied notification deduped"
+                            );
+                            return HandledOutcome::LeadUpdated {
+                                lead_id: lead.id.clone(),
+                                thread_id: parsed.thread_id,
+                            };
+                        }
+                    }
                     let json_payload = serde_json::to_value(&payload)
                         .unwrap_or_else(|_| serde_json::json!({}));
                     let event = nexo_microapp_sdk::BrokerEvent::new(
@@ -564,27 +589,47 @@ pub async fn handle_inbound_event(
             if let (Some(lookup), Some(broker_sender)) = (sellers, broker.as_ref()) {
                 match maybe_notify_lead_created(tenant_id, lookup, templates, &lead, &parsed) {
                     NotificationOutcome::Publish { topic, payload } => {
-                        let json_payload = serde_json::to_value(&payload)
-                            .unwrap_or_else(|_| serde_json::json!({}));
-                        let event = nexo_microapp_sdk::BrokerEvent::new(
-                            topic.clone(),
-                            "marketing.notification",
-                            json_payload,
+                        // M15.53 / F9 — dedupe under TTL window so
+                        // a NATS redelivery of the same inbound
+                        // doesn't ping the operator twice.
+                        let dedup_key = crate::notification_dedup::DedupKey::new(
+                            tenant_id.as_str(),
+                            &lead.id.0,
+                            "lead_created",
+                            payload.at_ms,
                         );
-                        if let Err(e) = broker_sender.publish(&topic, event).await {
-                            tracing::warn!(
-                                target: "plugin.marketing.broker",
-                                error = %e,
-                                topic = %topic,
-                                "notification publish failed (non-fatal)"
-                            );
-                        } else {
+                        let is_dup = dedup
+                            .map(|c| c.is_duplicate(&dedup_key))
+                            .unwrap_or(false);
+                        if is_dup {
                             tracing::debug!(
                                 target: "plugin.marketing.broker",
-                                topic = %topic,
-                                channel = ?payload.channel,
-                                "lead_created notification published"
+                                key = %dedup_key.as_str(),
+                                "lead_created notification deduped"
                             );
+                        } else {
+                            let json_payload = serde_json::to_value(&payload)
+                                .unwrap_or_else(|_| serde_json::json!({}));
+                            let event = nexo_microapp_sdk::BrokerEvent::new(
+                                topic.clone(),
+                                "marketing.notification",
+                                json_payload,
+                            );
+                            if let Err(e) = broker_sender.publish(&topic, event).await {
+                                tracing::warn!(
+                                    target: "plugin.marketing.broker",
+                                    error = %e,
+                                    topic = %topic,
+                                    "notification publish failed (non-fatal)"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    target: "plugin.marketing.broker",
+                                    topic = %topic,
+                                    channel = ?payload.channel,
+                                    "lead_created notification published"
+                                );
+                            }
                         }
                     }
                     other => {
@@ -713,6 +758,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(out, HandledOutcome::Skipped);
@@ -730,6 +776,7 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
             None,
             None,
             None,
@@ -757,6 +804,7 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
             None,
             None,
             None,
@@ -825,6 +873,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -861,6 +910,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         let HandledOutcome::LeadCreated {
@@ -876,6 +926,7 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
             None,
             None,
             None,
@@ -916,6 +967,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -948,6 +1000,7 @@ mod tests {
             Some(&router),
             Some(&identity),
             Some(&bus),
+            None,
             None,
             None,
             None,
@@ -998,6 +1051,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         let _consume_created = rx.recv().await;
@@ -1010,6 +1064,7 @@ mod tests {
             Some(&router),
             Some(&identity),
             Some(&bus),
+            None,
             None,
             None,
             None,

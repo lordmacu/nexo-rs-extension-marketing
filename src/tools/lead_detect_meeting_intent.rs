@@ -54,6 +54,7 @@ pub async fn handle(
     sellers: Option<&SellerLookup>,
     templates: Option<&crate::notification::TemplateLookup>,
     broker: Option<&BrokerSender>,
+    dedup: Option<&crate::notification_dedup::DedupCache>,
     args: Value,
 ) -> Result<ToolReply, ToolError> {
     let parsed: Args = serde_json::from_value(args).map_err(|e| {
@@ -91,20 +92,40 @@ pub async fn handle(
                     &outcome.evidence,
                 ) {
                     NotificationOutcome::Publish { topic, payload } => {
-                        let json_payload = serde_json::to_value(&payload)
-                            .unwrap_or_else(|_| serde_json::json!({}));
-                        let event = nexo_microapp_sdk::BrokerEvent::new(
-                            topic.clone(),
-                            "marketing.notification",
-                            json_payload,
+                        // M15.53 / F9 — dedupe under TTL window so
+                        // a tool retry inside the same minute
+                        // doesn't ping the operator twice.
+                        let dedup_key = crate::notification_dedup::DedupKey::new(
+                            expected_tenant.as_str(),
+                            &lead.id.0,
+                            "meeting_intent",
+                            payload.at_ms,
                         );
-                        if let Err(e) = sender.publish(&topic, event).await {
-                            tracing::warn!(
+                        let is_dup = dedup
+                            .map(|c| c.is_duplicate(&dedup_key))
+                            .unwrap_or(false);
+                        if is_dup {
+                            tracing::debug!(
                                 target: "tool.marketing.lead_detect_meeting_intent",
-                                error = %e,
-                                topic = %topic,
-                                "meeting_intent notification publish failed (non-fatal)"
+                                key = %dedup_key.as_str(),
+                                "meeting_intent notification deduped"
                             );
+                        } else {
+                            let json_payload = serde_json::to_value(&payload)
+                                .unwrap_or_else(|_| serde_json::json!({}));
+                            let event = nexo_microapp_sdk::BrokerEvent::new(
+                                topic.clone(),
+                                "marketing.notification",
+                                json_payload,
+                            );
+                            if let Err(e) = sender.publish(&topic, event).await {
+                                tracing::warn!(
+                                    target: "tool.marketing.lead_detect_meeting_intent",
+                                    error = %e,
+                                    topic = %topic,
+                                    "meeting_intent notification publish failed (non-fatal)"
+                                );
+                            }
                         }
                     }
                     other => {
@@ -242,6 +263,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             args("acme", "Yes, Tuesday at 3pm works for me."),
         )
         .await
@@ -261,6 +283,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             args("acme", "Perfecto, el martes a las 15:00 me sirve."),
         )
         .await
@@ -275,6 +298,7 @@ mod tests {
         let r = handle(
             &TenantId::new("acme").unwrap(),
             s,
+            None,
             None,
             None,
             None,
@@ -300,6 +324,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             args("acme", "Gracias por la información, lo voy a revisar."),
         )
         .await
@@ -315,6 +340,7 @@ mod tests {
         let r = handle(
             &TenantId::new("acme").unwrap(),
             s,
+            None,
             None,
             None,
             None,

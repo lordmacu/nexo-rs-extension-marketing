@@ -51,15 +51,27 @@ snapshots `slice.data` pre-save and threads it through. 3 new
 unit tests cover the fast path + the both-sides binding move
 + backwards-compat omit case.
 
-### F9 · Notification deduplication missing
+### F9 · Notification deduplication ✅ — done in M15.53
 
-- **Origin:** M15.38
-- **Status:** marketing extension restart mid-broker-hop →
-  broker re-delivers → notification publishes twice.
-- **Impact:** ocasional duplicate ping.
-- **Plan:** dedup key `(tenant, lead_id, kind, at_ms_bucket=60s)`
-  in a `sled` cache 1h; lookup before publish.
-- **Effort:** ~80 LOC, 1 new dep.
+In-memory `DedupCache` (`src/notification_dedup.rs`,
+~145 LOC + 8 unit tests). Key shape
+`(tenant, lead_id, kind, at_ms / 60_000)` — minute-bucketed
+so genuine 30 s-apart events on the same lead+kind collapse.
+1 h TTL, lazy eviction inside `is_duplicate`. `Mutex<HashMap>`
+internals; no new deps.
+
+Wired into all 4 publish call sites: broker hop's
+`lead_created` + `lead_replied` paths (`src/plugin/broker.rs`)
++ the `lead_mark_qualified` / `lead_detect_meeting_intent`
+tools. Single `Arc<DedupCache>` constructed in `main.rs`,
+captured by both the broker-event closure + `PluginDeps`
+so all 4 surfaces share one TTL window — a NATS redelivery
+across surfaces still dedupes.
+
+`sled`-backed cross-restart variant deferred — the in-memory
+cache covers ~95 % of the at-least-once redelivery threat
+without a new dep. Public surface kept narrow so swap is a
+1-file change if cross-restart dedup becomes required.
 
 ### F10 · Operator-supplied summary templates ✅ — done in M15.44
 

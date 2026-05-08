@@ -41,6 +41,7 @@ pub async fn handle(
     sellers: Option<&SellerLookup>,
     templates: Option<&crate::notification::TemplateLookup>,
     broker: Option<&BrokerSender>,
+    dedup: Option<&crate::notification_dedup::DedupCache>,
     args: Value,
 ) -> Result<ToolReply, ToolError> {
     let parsed: Args = serde_json::from_value(args)
@@ -80,20 +81,40 @@ pub async fn handle(
                     &parsed.reason,
                 ) {
                     NotificationOutcome::Publish { topic, payload } => {
-                        let json_payload = serde_json::to_value(&payload)
-                            .unwrap_or_else(|_| serde_json::json!({}));
-                        let event = nexo_microapp_sdk::BrokerEvent::new(
-                            topic.clone(),
-                            "marketing.notification",
-                            json_payload,
+                        // M15.53 / F9 — dedupe under TTL window so
+                        // a tool retry inside the same minute
+                        // doesn't ping the operator twice.
+                        let dedup_key = crate::notification_dedup::DedupKey::new(
+                            expected_tenant.as_str(),
+                            &updated.id.0,
+                            "lead_transitioned",
+                            payload.at_ms,
                         );
-                        if let Err(e) = sender.publish(&topic, event).await {
-                            tracing::warn!(
+                        let is_dup = dedup
+                            .map(|c| c.is_duplicate(&dedup_key))
+                            .unwrap_or(false);
+                        if is_dup {
+                            tracing::debug!(
                                 target: "tool.marketing.lead_mark_qualified",
-                                error = %e,
-                                topic = %topic,
-                                "lead_transitioned notification publish failed (non-fatal)"
+                                key = %dedup_key.as_str(),
+                                "lead_transitioned notification deduped"
                             );
+                        } else {
+                            let json_payload = serde_json::to_value(&payload)
+                                .unwrap_or_else(|_| serde_json::json!({}));
+                            let event = nexo_microapp_sdk::BrokerEvent::new(
+                                topic.clone(),
+                                "marketing.notification",
+                                json_payload,
+                            );
+                            if let Err(e) = sender.publish(&topic, event).await {
+                                tracing::warn!(
+                                    target: "tool.marketing.lead_mark_qualified",
+                                    error = %e,
+                                    topic = %topic,
+                                    "lead_transitioned notification publish failed (non-fatal)"
+                                );
+                            }
                         }
                     }
                     other => {
@@ -172,7 +193,7 @@ mod tests {
     #[tokio::test]
     async fn meeting_to_qualified_persists() {
         let s = store_with_lead_in(LeadState::MeetingScheduled).await;
-        let r = handle(&TenantId::new("acme").unwrap(), s, None, None, None, args())
+        let r = handle(&TenantId::new("acme").unwrap(), s, None, None, None, None, args())
             .await
             .unwrap();
         let v = r.as_value();
@@ -184,7 +205,7 @@ mod tests {
     #[tokio::test]
     async fn cold_to_qualified_invalid_transition() {
         let s = store_with_lead_in(LeadState::Cold).await;
-        let r = handle(&TenantId::new("acme").unwrap(), s, None, None, None, args())
+        let r = handle(&TenantId::new("acme").unwrap(), s, None, None, None, None, args())
             .await
             .unwrap();
         let v = r.as_value();

@@ -21,6 +21,7 @@ use nexo_microapp_sdk::identity::{PersonEmailStore, PersonStore};
 use crate::firehose::LeadEventBus;
 use crate::lead::{LeadStore, RouterHandle};
 use crate::notification::{SellerLookup, TemplateLookup};
+use crate::notification_dedup::DedupCache;
 use crate::tenant::TenantId;
 
 pub mod broker;
@@ -77,6 +78,14 @@ pub struct PluginDeps {
     /// PUT `/config/notification_templates` rebuilds + swaps
     /// the inner Arc using the same arc_swap pattern.
     pub templates: Option<TemplateLookup>,
+    /// M15.53 / F9 — in-memory dedup cache for notification
+    /// publishes. NATS at-least-once redelivery (transient
+    /// disconnect) → broker hop runs twice → would publish
+    /// the same `EmailNotification` twice. The cache holds
+    /// a 1h time-bucket key per (tenant, lead, kind, minute);
+    /// duplicate hits short-circuit the publish silently.
+    /// `None` disables dedup (tests + minimal setups).
+    pub dedup: Option<Arc<DedupCache>>,
 }
 
 impl PluginDeps {
@@ -92,6 +101,7 @@ impl PluginDeps {
             identity: None,
             sellers: None,
             templates: None,
+            dedup: None,
         }
     }
 
@@ -116,6 +126,15 @@ impl PluginDeps {
     /// open; tests skip it for the placeholder path.
     pub fn with_identity(mut self, identity: IdentityDeps) -> Self {
         self.identity = Some(identity);
+        self
+    }
+
+    /// Builder-style wiring for the notification dedup cache.
+    /// Same `Arc` captured by the broker hop + every tool that
+    /// publishes notifications, so all publish call sites share
+    /// one TTL window.
+    pub fn with_dedup(mut self, cache: Arc<DedupCache>) -> Self {
+        self.dedup = Some(cache);
         self
     }
 }

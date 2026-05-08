@@ -136,10 +136,18 @@ async fn main() -> anyhow::Result<()> {
     let identity = IdentityDeps::new(persons, person_emails, chain);
     tracing::info!(tenant = %tenant, "identity stores + resolver chain ready");
 
+    // M15.53 / F9 — single dedup cache shared between the broker
+    // hop's notification publish (inbound emails) + the tools'
+    // post-success publish (LeadTransitioned, MeetingIntent).
+    // Same `Arc`, same TTL window, so a redelivery in either
+    // surface is suppressed by the other.
+    let dedup = Arc::new(nexo_marketing::notification_dedup::DedupCache::new());
+
     let plugin_deps = PluginDeps::new(tenant.clone(), lead_store.clone(), router.clone())
         .with_identity(identity.clone())
         .with_sellers(seller_lookup.clone())
-        .with_templates(template_lookup.clone());
+        .with_templates(template_lookup.clone())
+        .with_dedup(dedup.clone());
 
     // ─── Lead lifecycle bus (firehose) ────────────────────────
     // Shared between the broker handler (producer) and the
@@ -179,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
     let broker_firehose = firehose_bus.clone();
     let broker_sellers = seller_lookup.clone();
     let broker_templates = template_lookup.clone();
+    let broker_dedup = dedup.clone();
     PluginAdapter::new(MANIFEST)?
         .with_server_version(version)
         .declare_tools(marketing_tool_defs())
@@ -201,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
                 let firehose = broker_firehose.clone();
                 let sellers = broker_sellers.clone();
                 let templates = broker_templates.clone();
+                let dedup = broker_dedup.clone();
                 async move {
                     // M15.39 — single broker subscriber, two
                     // dispatchers. Topic prefix routes between:
@@ -233,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
                         Some(&sellers),
                         Some(&templates),
                         Some(broker),
+                        Some(dedup.as_ref()),
                     )
                     .await;
                 }
