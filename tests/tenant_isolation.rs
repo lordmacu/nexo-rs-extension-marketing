@@ -44,6 +44,7 @@ fn lead_input(id: &str) -> NewLead {
         person_id: PersonId("p".into()),
         seller_id: SellerId("v".into()),
         last_activity_ms: 1_700_000_000_000,
+        score: 0,
         why_routed: vec!["fixture".into()],
     }
 }

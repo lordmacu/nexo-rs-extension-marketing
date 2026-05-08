@@ -36,6 +36,12 @@ pub struct NewLead {
     pub seller_id: SellerId,
     pub last_activity_ms: i64,
     pub why_routed: Vec<String>,
+    /// M15.23.f — initial heuristic score (0..=100). Caller
+    /// runs the scorer at create time so the row lands with
+    /// signal already attached. Default `0` keeps the broker
+    /// hop's existing tests + the placeholder path working
+    /// without touching every fixture.
+    pub score: u8,
 }
 
 const MIGRATION_SQL: &str = r#"
@@ -122,7 +128,7 @@ impl LeadStore {
              (id, tenant_id, thread_id, subject, person_id, seller_id, \
               state, score, sentiment, intent, topic_tags_json, \
               last_activity_ms, next_check_at_ms, followup_attempts, why_routed_json) \
-             VALUES (?,?,?,?,?,?,'cold',0,'neutral','browsing','[]',?,?,0,?) \
+             VALUES (?,?,?,?,?,?,'cold',?,'neutral','browsing','[]',?,?,0,?) \
              ON CONFLICT(tenant_id, id) DO NOTHING",
         )
         .bind(&input.id.0)
@@ -131,6 +137,7 @@ impl LeadStore {
         .bind(&input.subject)
         .bind(&input.person_id.0)
         .bind(&input.seller_id.0)
+        .bind(input.score as i64)
         .bind(input.last_activity_ms)
         .bind(Option::<i64>::None)
         .bind(&why_json)
@@ -577,6 +584,7 @@ mod tests {
             person_id: PersonId(person.into()),
             seller_id: SellerId(seller.into()),
             last_activity_ms: 1_700_000_000_000,
+            score: 0,
             why_routed: vec!["fixture".into()],
         }
     }

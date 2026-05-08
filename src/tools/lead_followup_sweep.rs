@@ -76,6 +76,7 @@ mod tests {
             person_id: PersonId("p".into()),
             seller_id: SellerId("v".into()),
             last_activity_ms: 0,
+            score: 0,
             why_routed: vec![],
         })
         .await
@@ -150,6 +151,7 @@ mod tests {
                 person_id: PersonId("p".into()),
                 seller_id: SellerId("v".into()),
                 last_activity_ms: 0,
+                score: 0,
                 why_routed: vec![],
             })
             .await

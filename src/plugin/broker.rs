@@ -571,6 +571,20 @@ pub async fn handle_inbound_event(
     why_routed.push(format!("resolver:{resolver_source}"));
     let lead_id = LeadId(Uuid::new_v4().to_string());
     let now_ms = Utc::now().timestamp_millis();
+    // M15.23.f — heuristic score on lead create. Composing
+    // through the SDK trait keeps the door open for
+    // sentiment / intent / BANT scorers to land alongside
+    // (each adds its own contributions, the trace stays
+    // unified). Score reasons are merged into `why_routed`
+    // so the operator audit log surfaces the full
+    // explanation in one place.
+    let lead_score = crate::scoring::score_lead(&parsed);
+    for reason in lead_score.reasons() {
+        why_routed.push(format!(
+            "score:{}:{}",
+            reason.delta, reason.label
+        ));
+    }
     let new_lead = NewLead {
         id: lead_id.clone(),
         thread_id: parsed.thread_id.clone(),
@@ -578,6 +592,7 @@ pub async fn handle_inbound_event(
         person_id,
         seller_id,
         last_activity_ms: now_ms,
+        score: lead_score.value(),
         why_routed,
     };
     match store.create(new_lead).await {
