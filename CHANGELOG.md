@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.11.0 — 2026-05-08 (M15.41 — LeadTransitioned + MeetingIntent notifications)
+
+Closes F2.b in `FOLLOWUPS.md`. Tools that mutate state
+(`lead_mark_qualified` for transitions) and tools that detect
+intent (`lead_detect_meeting_intent`) now publish typed
+`EmailNotification` frames to the same forwarder pipeline that
+M15.39 wired for `LeadCreated` / `LeadReplied`.
+
+### Framework dep
+
+Picks up `nexo-microapp-sdk` Phase 81.17.c.ctx — new
+`ToolContext` struct (carries `BrokerSender` + `plugin_id`)
++ `PluginAdapter::on_tool_with_context(handler)` builder.
+Existing plain `on_tool` path stays for plugins that don't
+need broker access from tools.
+
+### Implemented
+
+- `notification.rs`:
+  - `maybe_notify_lead_transitioned(tenant, lookup, lead, from, to, reason)`
+    — fires from `lead_mark_qualified` after a successful
+    state transition. Summary: `🔄 Lead transicionó · {from}→{to}\nMotivo: {reason}\nVendedor: {ve}`.
+  - `maybe_notify_meeting_intent(tenant, lookup, lead, confidence, evidence)`
+    — fires from `lead_detect_meeting_intent` when
+    `confidence ≥ 0.7`. Summary: `📅 Intent de reunión detectado ({pct}%)\nEvidencia: {evidence}\nVendedor: {ve}`.
+  - Both ES + EN locales rendered.
+- `tools/lead_mark_qualified.rs`:
+  - Signature gains `vendedores: Option<&VendedorLookup>` +
+    `broker: Option<&BrokerSender>`. Snapshot the lead's
+    state BEFORE transitioning so the notification carries
+    the correct `from`. Fire-and-forget publish post-success.
+- `tools/lead_detect_meeting_intent.rs`:
+  - Signature gains `store: Arc<LeadStore>` +
+    `vendedores: Option<&VendedorLookup>` +
+    `broker: Option<&BrokerSender>`.
+  - New optional `lead_id` arg in the JSON schema. When
+    present + classifier confidence ≥ 0.7, the tool fetches
+    the lead from the store + publishes `MeetingIntent`.
+- `plugin/dispatch.rs`:
+  - `dispatch` signature gains `ctx: Option<&ToolContext>`.
+    When `ctx.is_some()`, threads the broker into the 2
+    affected tools.
+- `main.rs`:
+  - Switches from `on_tool(handler)` to
+    `on_tool_with_context(handler)`. Tools that don't need
+    broker access ignore the ctx parameter — backwards-
+    compatible at the marketing dispatch level.
+
+### Test count
+
+138 unit + 8 cross-tenant + 6 microapp proxy + 25 plugin /
+firehose / admin + 7 thread + 23 config + 1 live-reload +
+9 forwarder + **16 notification (was 12, +4 transitioned + intent)**
+= **233 green** (was 229).
+
 ## 0.10.1 — 2026-05-07 (M15.40 — LeadReplied notification)
 
 Adds the "client replied to an active thread" notification —

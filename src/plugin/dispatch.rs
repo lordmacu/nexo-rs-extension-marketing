@@ -11,7 +11,7 @@
 
 use serde_json::Value;
 
-use nexo_microapp_sdk::plugin::{ToolInvocation, ToolInvocationError};
+use nexo_microapp_sdk::plugin::{ToolContext, ToolInvocation, ToolInvocationError};
 use nexo_microapp_sdk::ToolError;
 
 use crate::plugin::PluginDeps;
@@ -56,6 +56,7 @@ fn map_tool_error(e: ToolError) -> ToolInvocationError {
 pub async fn dispatch(
     deps: PluginDeps,
     inv: ToolInvocation,
+    ctx: Option<&ToolContext>,
 ) -> Result<Value, ToolInvocationError> {
     let tenant = &deps.tenant_id;
     let result = match inv.tool_name.as_str() {
@@ -67,10 +68,31 @@ pub async fn dispatch(
             tools::lead_schedule_followup::handle(tenant, deps.lead_store.clone(), inv.args).await
         }
         "marketing_lead_mark_qualified" => {
-            tools::lead_mark_qualified::handle(tenant, deps.lead_store.clone(), inv.args).await
+            // Phase 81.17.c.ctx — tool gets BrokerSender via
+            // ToolContext, publishes LeadTransitioned
+            // notification post-transition. Vendedor lookup
+            // resolved from PluginDeps (live-reloaded by PUT
+            // /config/vendedores).
+            tools::lead_mark_qualified::handle(
+                tenant,
+                deps.lead_store.clone(),
+                deps.vendedores.as_ref(),
+                ctx.map(|c| &c.broker),
+                inv.args,
+            )
+            .await
         }
         "marketing_lead_detect_meeting_intent" => {
-            tools::lead_detect_meeting_intent::handle(tenant, inv.args).await
+            // Same pattern — high-confidence intents publish
+            // a MeetingIntent notification.
+            tools::lead_detect_meeting_intent::handle(
+                tenant,
+                deps.lead_store.clone(),
+                deps.vendedores.as_ref(),
+                ctx.map(|c| &c.broker),
+                inv.args,
+            )
+            .await
         }
         "marketing_lead_followup_sweep" => {
             tools::lead_followup_sweep::handle(tenant, deps.lead_store.clone(), inv.args).await
@@ -120,7 +142,7 @@ mod tests {
             args: json!({}),
             agent_id: None,
         };
-        let err = dispatch(deps, inv).await.unwrap_err();
+        let err = dispatch(deps, inv, None).await.unwrap_err();
         assert!(matches!(err, ToolInvocationError::NotFound(_)));
     }
 
@@ -134,7 +156,7 @@ mod tests {
             args: json!({ "tenant_id": "acme" }),
             agent_id: None,
         };
-        let err = dispatch(deps, inv).await.unwrap_err();
+        let err = dispatch(deps, inv, None).await.unwrap_err();
         assert!(
             matches!(err, ToolInvocationError::ArgumentInvalid(_)),
             "expected ArgumentInvalid, got {err:?}"
@@ -162,7 +184,7 @@ mod tests {
             }),
             agent_id: None,
         };
-        let v = dispatch(deps, inv).await.expect("ok reply");
+        let v = dispatch(deps, inv, None).await.expect("ok reply");
         assert_eq!(v["ok"], false);
         assert_eq!(v["error"]["code"], "tenant_unauthorised");
     }
@@ -176,7 +198,7 @@ mod tests {
             args: json!({ "tenant_id": "acme", "limit": 10 }),
             agent_id: None,
         };
-        let v = dispatch(deps, inv).await.expect("sweep should succeed");
+        let v = dispatch(deps, inv, None).await.expect("sweep should succeed");
         // Empty store → empty list, but the envelope is present.
         // Reply shape: `{ ok: true, result: { due: [], now_ms } }`.
         assert_eq!(v["ok"], true, "ok flag missing: {v}");

@@ -4,14 +4,33 @@
 //! LLM lands later (M18); this commit ships the regex stage
 //! + a `Some(0.5)` confidence stub when text is ambiguous so
 //! callers can defer to operator review.
+//!
+//! M15.41 — when the optional `lead_id` arg is present + the
+//! classifier hits confidence ≥ 0.7 + the tool ctx provides
+//! a `BrokerSender` + the vendedor opted in via
+//! `on_meeting_intent`, publishes a `MeetingIntent`
+//! notification. Fire-and-forget — never sinks the tool reply.
+
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::Value;
 
+use nexo_microapp_sdk::plugin::BrokerSender;
 use nexo_microapp_sdk::{ToolError, ToolReply};
-use nexo_tool_meta::marketing::{MeetingIntent, TenantIdRef};
+use nexo_tool_meta::marketing::{LeadId, MeetingIntent, TenantIdRef};
 
+use crate::lead::LeadStore;
+use crate::notification::{
+    maybe_notify_meeting_intent, NotificationOutcome, VendedorLookup,
+};
 use crate::tenant::TenantId;
+
+/// Confidence floor for firing a `MeetingIntent` notification.
+/// 0.7 = the same threshold the SDK fallback chain uses for
+/// "trust the source"; below this we treat the classifier
+/// output as a hint that the operator should still confirm.
+const NOTIFY_CONFIDENCE_FLOOR: f32 = 0.7;
 
 #[derive(Debug, Deserialize)]
 struct Args {
@@ -21,10 +40,19 @@ struct Args {
     /// later for context-aware LLM stage.
     #[serde(default)]
     history: Vec<String>,
+    /// Optional lead context. When present + confidence high,
+    /// the tool publishes a `MeetingIntent` notification.
+    /// Without it, the tool stays pure-classifier (back-compat
+    /// with callers that just want the regex outcome).
+    #[serde(default)]
+    lead_id: Option<LeadId>,
 }
 
 pub async fn handle(
     expected_tenant: &TenantId,
+    store: Arc<LeadStore>,
+    vendedores: Option<&VendedorLookup>,
+    broker: Option<&BrokerSender>,
     args: Value,
 ) -> Result<ToolReply, ToolError> {
     let parsed: Args = serde_json::from_value(args).map_err(|e| {
@@ -38,6 +66,57 @@ pub async fn handle(
     }
 
     let outcome = classify_regex(&parsed.body, &parsed.history);
+
+    // Publish notification when ALL of:
+    //   - outcome confidence ≥ floor
+    //   - lead_id arg supplied + the lead exists for this tenant
+    //   - tool ctx provides BrokerSender + vendedor lookup
+    //   - vendedor opted in (gated inside the classifier)
+    if outcome.confidence >= NOTIFY_CONFIDENCE_FLOOR {
+        if let (Some(lead_id), Some(lookup), Some(sender)) =
+            (&parsed.lead_id, vendedores, broker)
+        {
+            // Look up the lead — needed for the payload's
+            // vendedor_id resolution. Errors degrade silently
+            // so a transient store hiccup never sinks the tool
+            // reply.
+            if let Ok(Some(lead)) = store.get(lead_id).await {
+                match maybe_notify_meeting_intent(
+                    expected_tenant,
+                    lookup,
+                    &lead,
+                    outcome.confidence,
+                    &outcome.evidence,
+                ) {
+                    NotificationOutcome::Publish { topic, payload } => {
+                        let json_payload = serde_json::to_value(&payload)
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                        let event = nexo_microapp_sdk::BrokerEvent::new(
+                            topic.clone(),
+                            "marketing.notification",
+                            json_payload,
+                        );
+                        if let Err(e) = sender.publish(&topic, event).await {
+                            tracing::warn!(
+                                target: "tool.marketing.lead_detect_meeting_intent",
+                                error = %e,
+                                topic = %topic,
+                                "meeting_intent notification publish failed (non-fatal)"
+                            );
+                        }
+                    }
+                    other => {
+                        tracing::trace!(
+                            target: "tool.marketing.lead_detect_meeting_intent",
+                            outcome = ?other,
+                            "meeting_intent notification skipped"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     Ok(ToolReply::ok_json(serde_json::json!({
         "ok": true,
         "result": outcome,
@@ -133,6 +212,17 @@ fn extract_first_url(s: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    async fn fresh_store() -> Arc<LeadStore> {
+        Arc::new(
+            LeadStore::open(
+                std::path::PathBuf::from(":memory:"),
+                TenantId::new("acme").unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
     fn args(t: &str, body: &str) -> Value {
         serde_json::json!({
             "tenant_id": t,
@@ -143,8 +233,12 @@ mod tests {
 
     #[tokio::test]
     async fn english_affirmation_with_day_hits() {
+        let s = fresh_store().await;
         let r = handle(
             &TenantId::new("acme").unwrap(),
+            s,
+            None,
+            None,
             args("acme", "Yes, Tuesday at 3pm works for me."),
         )
         .await
@@ -157,8 +251,12 @@ mod tests {
 
     #[tokio::test]
     async fn spanish_affirmation_with_hour_hits() {
+        let s = fresh_store().await;
         let r = handle(
             &TenantId::new("acme").unwrap(),
+            s,
+            None,
+            None,
             args("acme", "Perfecto, el martes a las 15:00 me sirve."),
         )
         .await
@@ -169,8 +267,12 @@ mod tests {
 
     #[tokio::test]
     async fn calendly_url_high_confidence() {
+        let s = fresh_store().await;
         let r = handle(
             &TenantId::new("acme").unwrap(),
+            s,
+            None,
+            None,
             args("acme", "Te paso link: https://calendly.com/luis/30min."),
         )
         .await
@@ -186,8 +288,12 @@ mod tests {
 
     #[tokio::test]
     async fn ambiguous_text_returns_zero_confidence() {
+        let s = fresh_store().await;
         let r = handle(
             &TenantId::new("acme").unwrap(),
+            s,
+            None,
+            None,
             args("acme", "Gracias por la información, lo voy a revisar."),
         )
         .await
@@ -199,9 +305,16 @@ mod tests {
 
     #[tokio::test]
     async fn tenant_mismatch_unauthorised() {
-        let r = handle(&TenantId::new("acme").unwrap(), args("globex", "Yes Tuesday"))
-            .await
-            .unwrap();
+        let s = fresh_store().await;
+        let r = handle(
+            &TenantId::new("acme").unwrap(),
+            s,
+            None,
+            None,
+            args("globex", "Yes Tuesday"),
+        )
+        .await
+        .unwrap();
         assert_eq!(r.as_value()["ok"], false);
     }
 }

@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use nexo_tool_meta::marketing::{
-    EmailNotification, EmailNotificationKind, Lead, NotificationChannel, TenantIdRef,
-    Vendedor, VendedorId,
+    EmailNotification, EmailNotificationKind, Lead, LeadState, NotificationChannel,
+    TenantIdRef, Vendedor, VendedorId,
 };
 
 use crate::broker::inbound::ParsedInbound;
@@ -107,6 +107,142 @@ pub fn maybe_notify_lead_replied(
         EmailNotificationKind::LeadReplied,
         |s| s.on_lead_replied,
     )
+}
+
+/// M15.41 — `LeadTransitioned` notification fired after a
+/// successful state transition (`lead_mark_qualified` tool
+/// today; future tools mounting on the same store hook lead).
+/// Doesn't take a `ParsedInbound` because transitions don't
+/// originate from an inbound — the summary describes the
+/// state delta + the operator-supplied reason.
+pub fn maybe_notify_lead_transitioned(
+    tenant_id: &TenantId,
+    vendedores: &VendedorLookup,
+    lead: &Lead,
+    from: LeadState,
+    to: LeadState,
+    reason: &str,
+) -> NotificationOutcome {
+    let map = vendedores.load();
+    let v = match map.get(&lead.vendedor_id) {
+        Some(v) => v,
+        None => return NotificationOutcome::VendedorMissing,
+    };
+    let settings = match &v.notification_settings {
+        Some(s) => s,
+        None => return NotificationOutcome::NotConfigured,
+    };
+    if !settings.on_lead_transitioned {
+        return NotificationOutcome::EventDisabled;
+    }
+    let agent_id = match &v.agent_id {
+        Some(a) => a.clone(),
+        None => return NotificationOutcome::NoAgentBound,
+    };
+    if matches!(settings.channel, NotificationChannel::Disabled) {
+        return NotificationOutcome::ChannelDisabled;
+    }
+
+    let summary = render_transition_summary(from, to, reason, v);
+    let payload = EmailNotification {
+        kind: EmailNotificationKind::LeadTransitioned,
+        tenant_id: TenantIdRef(tenant_id.as_str().into()),
+        agent_id: agent_id.clone(),
+        lead_id: lead.id.clone(),
+        vendedor_id: v.id.clone(),
+        vendedor_email: v.primary_email.clone(),
+        from_email: format!("transition:{from:?}->{to:?}"),
+        subject: lead.subject.clone(),
+        at_ms: Utc::now().timestamp_millis(),
+        summary,
+        channel: settings.channel.clone(),
+    };
+    NotificationOutcome::Publish {
+        topic: format!("agent.email.notification.{agent_id}"),
+        payload,
+    }
+}
+
+/// M15.41 — `MeetingIntent` notification fired by the
+/// `lead_detect_meeting_intent` tool when confidence ≥ 0.7.
+/// Operator gets pinged so they can confirm + book the
+/// meeting before the AI auto-responds.
+pub fn maybe_notify_meeting_intent(
+    tenant_id: &TenantId,
+    vendedores: &VendedorLookup,
+    lead: &Lead,
+    confidence: f32,
+    evidence_span: &str,
+) -> NotificationOutcome {
+    let map = vendedores.load();
+    let v = match map.get(&lead.vendedor_id) {
+        Some(v) => v,
+        None => return NotificationOutcome::VendedorMissing,
+    };
+    let settings = match &v.notification_settings {
+        Some(s) => s,
+        None => return NotificationOutcome::NotConfigured,
+    };
+    if !settings.on_meeting_intent {
+        return NotificationOutcome::EventDisabled;
+    }
+    let agent_id = match &v.agent_id {
+        Some(a) => a.clone(),
+        None => return NotificationOutcome::NoAgentBound,
+    };
+    if matches!(settings.channel, NotificationChannel::Disabled) {
+        return NotificationOutcome::ChannelDisabled;
+    }
+
+    let summary = render_intent_summary(confidence, evidence_span, v);
+    let payload = EmailNotification {
+        kind: EmailNotificationKind::MeetingIntent,
+        tenant_id: TenantIdRef(tenant_id.as_str().into()),
+        agent_id: agent_id.clone(),
+        lead_id: lead.id.clone(),
+        vendedor_id: v.id.clone(),
+        vendedor_email: v.primary_email.clone(),
+        from_email: "intent:meeting".into(),
+        subject: lead.subject.clone(),
+        at_ms: Utc::now().timestamp_millis(),
+        summary,
+        channel: settings.channel.clone(),
+    };
+    NotificationOutcome::Publish {
+        topic: format!("agent.email.notification.{agent_id}"),
+        payload,
+    }
+}
+
+fn render_transition_summary(
+    from: LeadState,
+    to: LeadState,
+    reason: &str,
+    v: &Vendedor,
+) -> String {
+    let lang = v.preferred_language.as_deref().unwrap_or("es");
+    let arrow = format!("{from:?} → {to:?}");
+    if lang == "en" {
+        format!("🔄 Lead transitioned · {arrow}\nReason: {reason}\nVendedor: {ve}", ve = v.primary_email)
+    } else {
+        format!("🔄 Lead transicionó · {arrow}\nMotivo: {reason}\nVendedor: {ve}", ve = v.primary_email)
+    }
+}
+
+fn render_intent_summary(confidence: f32, evidence: &str, v: &Vendedor) -> String {
+    let lang = v.preferred_language.as_deref().unwrap_or("es");
+    let pct = (confidence * 100.0).round() as i32;
+    if lang == "en" {
+        format!(
+            "📅 Meeting intent detected ({pct}%)\nEvidence: {evidence}\nVendedor: {ve}",
+            ve = v.primary_email
+        )
+    } else {
+        format!(
+            "📅 Intent de reunión detectado ({pct}%)\nEvidencia: {evidence}\nVendedor: {ve}",
+            ve = v.primary_email
+        )
+    }
 }
 
 /// Common classifier shared between `lead_created` +
@@ -514,6 +650,97 @@ mod tests {
                     "EN summary should use 'replied': {}",
                     payload.summary
                 );
+            }
+            other => panic!("expected Publish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lead_transitioned_classifier_uses_dedicated_toggle() {
+        // Default settings have on_lead_transitioned=false so
+        // the classifier should EventDisabled even with full
+        // vendedor + agent setup.
+        let s = VendedorNotificationSettings::default();
+        let v = vendedor_with("pedro", Some("pedro-agent"), Some(s));
+        let lk = lookup(vec![v]);
+        let out = maybe_notify_lead_transitioned(
+            &TenantId::new("acme").unwrap(),
+            &lk,
+            &lead_with("pedro"),
+            LeadState::MeetingScheduled,
+            LeadState::Qualified,
+            "demo agendada",
+        );
+        assert_eq!(out, NotificationOutcome::EventDisabled);
+    }
+
+    #[test]
+    fn lead_transitioned_with_toggle_on_publishes() {
+        let mut s = VendedorNotificationSettings::default();
+        s.on_lead_transitioned = true;
+        let v = vendedor_with("pedro", Some("pedro-agent"), Some(s));
+        let lk = lookup(vec![v]);
+        let out = maybe_notify_lead_transitioned(
+            &TenantId::new("acme").unwrap(),
+            &lk,
+            &lead_with("pedro"),
+            LeadState::MeetingScheduled,
+            LeadState::Qualified,
+            "demo agendada confirmada",
+        );
+        match out {
+            NotificationOutcome::Publish { topic, payload } => {
+                assert_eq!(topic, "agent.email.notification.pedro-agent");
+                assert_eq!(payload.kind, EmailNotificationKind::LeadTransitioned);
+                assert!(
+                    payload.summary.contains("MeetingScheduled → Qualified"),
+                    "summary should carry from→to: {}",
+                    payload.summary
+                );
+                assert!(payload.summary.contains("demo agendada confirmada"));
+            }
+            other => panic!("expected Publish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn meeting_intent_classifier_uses_dedicated_toggle() {
+        let mut s = VendedorNotificationSettings::default();
+        s.on_meeting_intent = false;
+        let v = vendedor_with("pedro", Some("pedro-agent"), Some(s));
+        let lk = lookup(vec![v]);
+        let out = maybe_notify_meeting_intent(
+            &TenantId::new("acme").unwrap(),
+            &lk,
+            &lead_with("pedro"),
+            0.85,
+            "Yes, Tuesday at 3pm",
+        );
+        assert_eq!(out, NotificationOutcome::EventDisabled);
+    }
+
+    #[test]
+    fn meeting_intent_publishes_with_confidence_in_summary() {
+        let s = VendedorNotificationSettings::default();
+        let v = vendedor_with("pedro", Some("pedro-agent"), Some(s));
+        let lk = lookup(vec![v]);
+        let out = maybe_notify_meeting_intent(
+            &TenantId::new("acme").unwrap(),
+            &lk,
+            &lead_with("pedro"),
+            0.85,
+            "Yes, Tuesday at 3pm",
+        );
+        match out {
+            NotificationOutcome::Publish { topic, payload } => {
+                assert_eq!(topic, "agent.email.notification.pedro-agent");
+                assert_eq!(payload.kind, EmailNotificationKind::MeetingIntent);
+                assert!(
+                    payload.summary.contains("85%"),
+                    "summary should carry rounded confidence pct: {}",
+                    payload.summary
+                );
+                assert!(payload.summary.contains("Tuesday at 3pm"));
             }
             other => panic!("expected Publish, got {other:?}"),
         }

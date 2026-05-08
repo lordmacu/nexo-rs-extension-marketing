@@ -7,34 +7,16 @@ Each entry: origin milestone · estimated effort · acceptance criteria.
 
 ### F2.a · Publish `LeadReplied` ✅ — done in M15.40
 
-### F2.b · `LeadTransitioned` + `MeetingIntent` (blocked on SDK lift)
+### F2.b · `LeadTransitioned` + `MeetingIntent` ✅ — done in M15.41
 
-- **Origin:** M15.38
-- **Status:** classifiers blocked because tools don't have
-  `BrokerSender` access in the current `nexo-microapp-sdk`
-  `on_tool` signature. Marketing's `lead_mark_qualified` +
-  `lead_detect_meeting_intent` tools fire transitions /
-  intents but can't publish to the broker.
-- **Plan (in order):**
-  1. **SDK lift** in `nexo-microapp-sdk`:
-     - `#[derive(Clone)]` on `BrokerSender` (single line).
-     - New `PluginAdapter::on_tool_with_context(handler)` method
-       where `handler: Fn(ToolInvocation, ToolContext) -> Fut`
-       and `ToolContext` carries `broker: BrokerSender` +
-       extensible. Backwards-compatible alongside `on_tool`.
-     - Wire SDK to construct ToolContext in `dispatch_loop`
-       at `tool.invoke` handling (already has writer/pending/
-       next_id Arcs in scope).
-  2. **Marketing extension migration**:
-     - `plugin/dispatch.rs` switches to `on_tool_with_context`.
-     - `tools::lead_mark_qualified::handle` accepts
-       `broker: &BrokerSender, vendedores: Option<&VendedorLookup>`,
-       publishes notification post-transition.
-     - `tools::lead_detect_meeting_intent::handle` similar
-       when `confidence >= 0.7`.
-  3. **`DraftPending`** — defer to M22 (draft pipeline doesn't
-     exist yet).
-- **Effort:** ~80 LOC SDK + ~120 LOC marketing + 5 new tests.
+SDK lift shipped in `nexo-microapp-sdk` Phase 81.17.c.ctx:
+new `ToolContext` + `ToolHandlerWithContext` trait +
+`PluginAdapter::on_tool_with_context` builder. Marketing
+extension migrated `plugin/dispatch.rs` + the 2 affected
+tools (`lead_mark_qualified`, `lead_detect_meeting_intent`).
+Both publish via `BrokerSender::publish` post-success.
+
+`DraftPending` still deferred to M22 (no draft pipeline yet).
 
 ### F4 · Reconciliation race condition (M15.37)
 

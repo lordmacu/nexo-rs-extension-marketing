@@ -41,7 +41,7 @@ use nexo_microapp_sdk::identity::{
     open_pool, PersonEmailStore, PersonStore, SqliteCompanyStore, SqlitePersonEmailStore,
     SqlitePersonStore,
 };
-use nexo_microapp_sdk::plugin::{BrokerSender, PluginAdapter, ToolInvocation};
+use nexo_microapp_sdk::plugin::{BrokerSender, PluginAdapter, ToolContext, ToolInvocation};
 use nexo_microapp_sdk::BrokerEvent;
 
 const DEFAULT_BIND: &str = "127.0.0.1";
@@ -169,9 +169,15 @@ async fn main() -> anyhow::Result<()> {
     PluginAdapter::new(MANIFEST)?
         .with_server_version(version)
         .declare_tools(marketing_tool_defs())
-        .on_tool(move |inv: ToolInvocation| {
+        // Phase 81.17.c.ctx — tools get a ToolContext with
+        // BrokerSender so M15.41 can publish LeadTransitioned
+        // + MeetingIntent notifications from inside tool
+        // bodies. Plain `on_tool` works too for backwards-
+        // compat (browser plugin uses it); ToolContext is
+        // additive.
+        .on_tool_with_context(move |inv: ToolInvocation, ctx: ToolContext| {
             let deps = dispatch_deps.clone();
-            async move { plugin_dispatch(deps, inv).await }
+            async move { plugin_dispatch(deps, inv, Some(&ctx)).await }
         })
         .on_broker_event(
             move |topic: String, event: BrokerEvent, broker: BrokerSender| {

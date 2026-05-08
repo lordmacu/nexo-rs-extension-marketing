@@ -103,6 +103,10 @@ pub fn marketing_tool_defs() -> Vec<ToolDef> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Last 3-5 thread messages, oldest first."
+                    },
+                    "lead_id": {
+                        "type": "string",
+                        "description": "Optional. When set + confidence ≥ 0.7, the tool publishes a MeetingIntent notification to agent.email.notification.<agent_id>."
                     }
                 },
                 "required": ["tenant_id", "body"]

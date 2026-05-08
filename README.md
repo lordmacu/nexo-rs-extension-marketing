@@ -36,7 +36,7 @@ M15 milestones A–I + M15.27 (plugin contract):
 - Cross-tenant isolation suite (8 assertions, release-blocker)
 - **Stdio JSON-RPC plugin contract** + broker subscriber
 
-**226/226 tests** green (138 unit + 8 cross-tenant + 6
+**233/233 tests** green (138 unit + 8 cross-tenant + 6
 microapp proxy + 25 plugin / firehose / admin + 7 thread +
 24 config CRUD + live-reload). Lead lifecycle streams live
 via `/firehose` SSE; threads persist + serve through
