@@ -75,6 +75,7 @@ mod tests {
             seller_id: SellerId("v".into()),
             last_activity_ms: 1,
             score: 0,
+            topic_tags: vec![],
             why_routed: vec![],
         })
         .await

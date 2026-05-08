@@ -29,6 +29,7 @@ pub mod enrichment;
 pub mod error;
 pub mod firehose;
 pub mod forwarder;
+pub mod guardrails;
 pub mod identity;
 pub mod lead;
 pub mod notification;

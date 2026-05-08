@@ -380,6 +380,7 @@ pub async fn handle_inbound_event(
     broker: Option<BrokerSender>,
     dedup: Option<&crate::notification_dedup::DedupCache>,
     audit: Option<&crate::audit::AuditLog>,
+    guardrails: Option<&crate::guardrails::GuardrailHandle>,
 ) -> HandledOutcome {
     if !topic.starts_with("plugin.inbound.email.") && topic != "plugin.inbound.email" {
         return HandledOutcome::Skipped;
@@ -614,6 +615,31 @@ pub async fn handle_inbound_event(
             reason.delta, reason.label
         ));
     }
+
+    // M15.23.d — topic guardrail scan. Operator-supplied
+    // regex tagger fires against the inbound body excerpt;
+    // every match becomes a topic tag on the lead row + an
+    // audit row with the matched excerpt. The actual
+    // \"force-approval\" / \"block\" demotion lands when the
+    // M22 draft pipeline is wired — for now we capture the
+    // signal so compliance can review.
+    let guardrail_hits = guardrails
+        .map(|h| h.load_full().scan(&parsed.body_excerpt))
+        .unwrap_or_default();
+    for hit in &guardrail_hits {
+        why_routed.push(format!(
+            "guardrail:{}:{}",
+            match hit.action {
+                nexo_microapp_sdk::guardrails::GuardrailAction::ForceApproval =>
+                    "force_approval",
+                nexo_microapp_sdk::guardrails::GuardrailAction::Block => "block",
+            },
+            hit.rule_id,
+        ));
+    }
+    let topic_tags: Vec<String> =
+        guardrail_hits.iter().map(|h| h.rule_id.clone()).collect();
+
     let new_lead = NewLead {
         id: lead_id.clone(),
         thread_id: parsed.thread_id.clone(),
@@ -622,6 +648,7 @@ pub async fn handle_inbound_event(
         seller_id,
         last_activity_ms: now_ms,
         score: lead_score.value(),
+        topic_tags: topic_tags.clone(),
         why_routed,
     };
     match store.create(new_lead).await {
@@ -634,6 +661,37 @@ pub async fn handle_inbound_event(
                 resolver = %resolver_source,
                 "created cold lead from inbound email"
             );
+            // M15.23.d — one audit row per guardrail hit,
+            // recorded BEFORE the routing-decided row so the
+            // operator's timeline shows the guardrail as the
+            // first signal on the lead.
+            if let Some(log) = audit {
+                for hit in &guardrail_hits {
+                    let event = crate::audit::AuditEvent::TopicGuardrailFired {
+                        tenant_id: tenant_id.as_str().to_string(),
+                        lead_id: Some(lead.id.0.clone()),
+                        from_email: parsed.from_email.clone(),
+                        rule_id: hit.rule_id.clone(),
+                        rule_name: hit.rule_name.clone(),
+                        action: match hit.action {
+                            nexo_microapp_sdk::guardrails::GuardrailAction::ForceApproval =>
+                                "force_approval".into(),
+                            nexo_microapp_sdk::guardrails::GuardrailAction::Block =>
+                                "block".into(),
+                        },
+                        excerpt: hit.excerpt.clone(),
+                        at_ms: now_ms.max(0) as u64,
+                    };
+                    if let Err(e) = log.record(event).await {
+                        tracing::warn!(
+                            target: "plugin.marketing.broker",
+                            error = %e,
+                            rule_id = %hit.rule_id,
+                            "guardrail audit record failed (non-fatal)"
+                        );
+                    }
+                }
+            }
             // M15.23.c — audit row for the routing decision.
             // Fire-and-forget: a failure here logs warn but
             // never sinks the live path — the lead row is
@@ -1018,6 +1076,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(out, HandledOutcome::Skipped);
@@ -1035,6 +1094,7 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
             None,
             None,
             None,
@@ -1064,6 +1124,7 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
             None,
             None,
             None,
@@ -1136,6 +1197,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -1174,6 +1236,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         let HandledOutcome::LeadCreated {
@@ -1189,6 +1252,7 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
             None,
             None,
             None,
@@ -1233,6 +1297,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -1265,6 +1330,7 @@ mod tests {
             Some(&router),
             Some(&identity),
             Some(&bus),
+            None,
             None,
             None,
             None,
@@ -1319,6 +1385,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         let _consume_created = rx.recv().await;
@@ -1331,6 +1398,7 @@ mod tests {
             Some(&router),
             Some(&identity),
             Some(&bus),
+            None,
             None,
             None,
             None,

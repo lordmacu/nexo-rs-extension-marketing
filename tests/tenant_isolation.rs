@@ -45,6 +45,7 @@ fn lead_input(id: &str) -> NewLead {
         seller_id: SellerId("v".into()),
         last_activity_ms: 1_700_000_000_000,
         score: 0,
+        topic_tags: vec![],
         why_routed: vec!["fixture".into()],
     }
 }

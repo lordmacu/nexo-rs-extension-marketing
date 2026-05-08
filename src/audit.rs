@@ -94,6 +94,31 @@ pub enum AuditEvent {
         /// Wall-clock at_ms.
         at_ms: u64,
     },
+    /// One topic guardrail fired against the inbound body.
+    /// Recorded BEFORE the routing decision so the operator's
+    /// timeline shows the guardrail tag adjacent to the
+    /// `RoutingDecided` row.
+    TopicGuardrailFired {
+        /// Tenant scope.
+        tenant_id: String,
+        /// Lead the guardrail attached to. `None` when the
+        /// inbound was dropped pre-create (resolver / rule
+        /// drop) — operator still sees the row by querying
+        /// `kind = topic_guardrail_fired`.
+        lead_id: Option<String>,
+        /// Sender email for triage convenience.
+        from_email: String,
+        /// Stable rule id from the operator's YAML.
+        rule_id: String,
+        /// Operator-facing rule name.
+        rule_name: String,
+        /// `force_approval` | `block`.
+        action: String,
+        /// ±30-char excerpt around the matched fragment.
+        excerpt: String,
+        /// Wall-clock at_ms.
+        at_ms: u64,
+    },
     /// Operator-targeted notification published to the
     /// broker (LeadCreated / LeadReplied / LeadTransitioned /
     /// MeetingIntent).
@@ -121,6 +146,7 @@ impl EventMetadata for AuditEvent {
             Self::RoutingDecided { .. } => "routing_decided",
             Self::LeadTransitioned { .. } => "lead_transitioned",
             Self::NotificationPublished { .. } => "notification_published",
+            Self::TopicGuardrailFired { .. } => "topic_guardrail_fired",
         }
     }
 
@@ -134,6 +160,7 @@ impl EventMetadata for AuditEvent {
             Self::RoutingDecided { lead_id, .. } => lead_id.as_deref().unwrap_or(""),
             Self::LeadTransitioned { lead_id, .. } => lead_id.as_str(),
             Self::NotificationPublished { lead_id, .. } => lead_id.as_str(),
+            Self::TopicGuardrailFired { lead_id, .. } => lead_id.as_deref().unwrap_or(""),
         }
     }
 
@@ -142,6 +169,7 @@ impl EventMetadata for AuditEvent {
             Self::RoutingDecided { tenant_id, .. } => tenant_id.as_str(),
             Self::LeadTransitioned { tenant_id, .. } => tenant_id.as_str(),
             Self::NotificationPublished { tenant_id, .. } => tenant_id.as_str(),
+            Self::TopicGuardrailFired { tenant_id, .. } => tenant_id.as_str(),
         })
     }
 
@@ -150,6 +178,7 @@ impl EventMetadata for AuditEvent {
             Self::RoutingDecided { at_ms, .. } => *at_ms,
             Self::LeadTransitioned { at_ms, .. } => *at_ms,
             Self::NotificationPublished { at_ms, .. } => *at_ms,
+            Self::TopicGuardrailFired { at_ms, .. } => *at_ms,
         }
     }
 }

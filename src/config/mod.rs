@@ -23,6 +23,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use nexo_microapp_sdk::guardrails::GuardrailRule;
 use nexo_tool_meta::marketing::{
     FollowupProfile, MailboxConfig, NotificationTemplates, Seller,
 };
@@ -74,6 +75,16 @@ pub fn load_sellers(
     tenant: &TenantId,
 ) -> Result<Vec<Seller>, MarketingError> {
     load_yaml_list(state_root, tenant, "sellers.yaml")
+}
+
+/// Read `topic_guardrails.yaml`. Missing file → empty list
+/// (operator hasn't authored any guardrails yet → autonomous
+/// reply mode unrestricted).
+pub fn load_topic_guardrails(
+    state_root: impl AsRef<Path>,
+    tenant: &TenantId,
+) -> Result<Vec<GuardrailRule>, MarketingError> {
+    load_yaml_list(state_root, tenant, "topic_guardrails.yaml")
 }
 
 /// Read `followup_profiles.yaml`. Missing file → empty list.

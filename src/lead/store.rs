@@ -42,6 +42,11 @@ pub struct NewLead {
     /// hop's existing tests + the placeholder path working
     /// without touching every fixture.
     pub score: u8,
+    /// M15.23.d — guardrail topic tags. One entry per
+    /// guardrail rule that fired against the inbound body
+    /// (`pricing_quotes`, `legal_questions`, …). Default
+    /// empty.
+    pub topic_tags: Vec<String>,
 }
 
 const MIGRATION_SQL: &str = r#"
@@ -123,12 +128,14 @@ impl LeadStore {
     pub async fn create(&self, input: NewLead) -> Result<Lead, MarketingError> {
         let why_json = serde_json::to_string(&input.why_routed)
             .unwrap_or_else(|_| "[]".to_string());
+        let topic_tags_json = serde_json::to_string(&input.topic_tags)
+            .unwrap_or_else(|_| "[]".to_string());
         sqlx::query(
             "INSERT INTO leads \
              (id, tenant_id, thread_id, subject, person_id, seller_id, \
               state, score, sentiment, intent, topic_tags_json, \
               last_activity_ms, next_check_at_ms, followup_attempts, why_routed_json) \
-             VALUES (?,?,?,?,?,?,'cold',?,'neutral','browsing','[]',?,?,0,?) \
+             VALUES (?,?,?,?,?,?,'cold',?,'neutral','browsing',?,?,?,0,?) \
              ON CONFLICT(tenant_id, id) DO NOTHING",
         )
         .bind(&input.id.0)
@@ -138,6 +145,7 @@ impl LeadStore {
         .bind(&input.person_id.0)
         .bind(&input.seller_id.0)
         .bind(input.score as i64)
+        .bind(&topic_tags_json)
         .bind(input.last_activity_ms)
         .bind(Option::<i64>::None)
         .bind(&why_json)
@@ -588,6 +596,7 @@ mod tests {
             seller_id: SellerId(seller.into()),
             last_activity_ms: 1_700_000_000_000,
             score: 0,
+            topic_tags: vec![],
             why_routed: vec!["fixture".into()],
         }
     }

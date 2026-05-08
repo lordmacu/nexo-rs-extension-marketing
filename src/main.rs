@@ -143,6 +143,28 @@ async fn main() -> anyhow::Result<()> {
     // surface is suppressed by the other.
     let dedup = Arc::new(nexo_marketing::notification_dedup::DedupCache::new());
 
+    // M15.23.d — operator-supplied topic guardrails. Same
+    // arc_swap pattern as the router + seller lookup so the
+    // admin PUT can hot-swap a fresh set without a process
+    // restart. Empty file ⇒ empty handle (no rules fire).
+    let guardrail_rules =
+        nexo_marketing::config::load_topic_guardrails(&state_root, &tenant)
+            .unwrap_or_default();
+    let guardrails = match nexo_marketing::guardrails::handle_from_rules(
+        guardrail_rules,
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(
+                tenant = %tenant,
+                error = %e,
+                "topic_guardrails.yaml refused to compile — running with empty set"
+            );
+            nexo_marketing::guardrails::empty_handle()
+        }
+    };
+    let broker_guardrails = guardrails.clone();
+
     // M15.23.c — AI decision audit log. One SQLite file per
     // tenant under `<state_root>/<tenant>/audit.db`, table
     // `marketing_audit_events`. Same `EventStore<T>` infra the
@@ -296,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
                 let templates = broker_templates.clone();
                 let dedup = broker_dedup.clone();
                 let audit_log = broker_audit.clone();
+                let guardrails = broker_guardrails.clone();
                 async move {
                     // M15.39 — single broker subscriber, two
                     // dispatchers. Topic prefix routes between:
@@ -330,6 +353,7 @@ async fn main() -> anyhow::Result<()> {
                         Some(broker),
                         Some(dedup.as_ref()),
                         Some(audit_log.as_ref()),
+                        Some(&guardrails),
                     )
                     .await;
                 }
