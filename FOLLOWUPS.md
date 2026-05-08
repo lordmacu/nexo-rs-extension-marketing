@@ -132,22 +132,45 @@ already used.
   itself).
 - **Blocker:** M22 draft pipeline.
 
-### F23 · `LidPnMapping` store in SDK
+### F23 · `LidPnMapping` store in SDK ✅ — done in SDK 0.1.10 / marketing 0.17.0
 
-- **Origin:** Mining Baileys + whatsmeow during M15.23.e
-  surfaced LID↔PN migration as a first-class concept both
-  libraries track. Today's SDK keeps the two namespaces
-  distinct (`same_user(pn, lid) == false` even for the
-  same human).
-- **Plan:** new `LidPnMappingStore` trait + `SqliteLidPnMappingStore`
-  default impl. WA side persists pairs whenever the
-  protocol announces a migration. Duplicate matcher
-  consults the mapping when comparing JIDs across
-  namespaces.
-- **Effort:** ~100 LOC + ~6 tests + matcher tweak.
-- **Priority:** low — current marketing volume rarely
-  spans WA account migrations; promote when LID-only
-  contacts become common.
+`LidPnMappingStore` trait + `SqliteLidPnMappingStore`
+default impl in the SDK. Schema: `lid_pn_mappings` table
+PK on `(tenant_id, lid_user)` + index on
+`(tenant_id, pn_user)` for reverse lookups. Methods:
+`put / get_pn_for_lid / get_lid_for_pn / delete_by_tenant`.
+First-seen `observed_at_ms` semantics — re-upserting the
+same LID with a fresh PN updates the mapping but leaves
+the audit stamp intact.
+
+7 SDK unit tests + 5 marketing wa_ingest tests. SDK
+332/332 green (324 baseline + 7 lid_pn + 1 migration
+counter). Marketing 365/365 green (360 baseline + 5).
+
+`IdentityDeps` gains `lid_pn_mappings: Option<Arc<dyn
+LidPnMappingStore>>` + `with_lid_pn_mappings` builder.
+`main.rs` boots `SqliteLidPnMappingStore` against the
+existing identity pool — no extra DB file.
+
+WA ingest's `handle_inbound_whatsapp_event` consults the
+store when the inbound JID is LID-flavoured: a paired PN
+hit ⇒ the deterministic person id derives from the PN
+canonical form, so both LID + PN inbounds from the same
+human collapse onto a single Person row.
+
+`bridge_identity_via_lid_pn_mapping(parsed, store, tenant)`
+(private helper) holds the bridge logic. PN inbounds skip
+the lookup — they're already the canonical anchor.
+
+Discovery (operator / protocol announces a fresh pair)
+deferred to a sub-followup: a future
+`plugin.protocol.whatsapp.lid_mapping.*` subscriber or an
+admin `POST /api/marketing/lid_pn_mappings` endpoint will
+populate rows. Until then the store is consumer-ready —
+operators with manual mappings can populate via direct SQL.
+
+Versions: SDK 0.1.9 → 0.1.10 · marketing 0.16.2 → 0.17.0
+(minor: new pub IdentityDeps field + new wire shape).
 
 ### F24 · Duplicate matcher: broaden name+company search ✅ — done in marketing 0.16.1 / SDK 0.1.9
 

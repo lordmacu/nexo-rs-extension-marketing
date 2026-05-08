@@ -134,14 +134,25 @@ async fn main() -> anyhow::Result<()> {
     // one transactional surface.
     let person_phones: Arc<dyn nexo_microapp_sdk::identity::PersonPhoneStore> =
         Arc::new(nexo_microapp_sdk::identity::SqlitePersonPhoneStore::new(
-            identity_pool,
+            identity_pool.clone(),
         ));
+    // F23 — LID ↔ PN mapping store. Same identity pool;
+    // table created via the SDK's identity migration. WA
+    // ingest collapses cross-namespace inbounds into a
+    // single Person row when the mapping is populated.
+    let lid_pn_mappings: Arc<dyn nexo_microapp_sdk::identity::LidPnMappingStore> =
+        Arc::new(
+            nexo_microapp_sdk::identity::SqliteLidPnMappingStore::new(
+                identity_pool,
+            ),
+        );
     let chain = Arc::new(FallbackChain::new(
         vec![Box::new(DisplayNameParser), Box::new(ReplyToReader)],
         0.7,
     ));
     let identity = IdentityDeps::new(persons, person_emails, chain)
-        .with_person_phones(person_phones);
+        .with_person_phones(person_phones)
+        .with_lid_pn_mappings(lid_pn_mappings);
     tracing::info!(tenant = %tenant, "identity stores + resolver chain ready");
 
     // M15.53 / F9 — single dedup cache shared between the broker
@@ -371,6 +382,7 @@ async fn main() -> anyhow::Result<()> {
                                 event.payload,
                                 identity.persons.clone(),
                                 phone_store,
+                                identity.lid_pn_mappings.clone(),
                                 whatsapp_resolver.as_ref(),
                                 Some(audit_log.as_ref()),
                             )

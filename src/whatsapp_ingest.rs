@@ -37,7 +37,9 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use nexo_microapp_sdk::identity::{parse_jid, PersonPhoneStore, PersonStore};
+use nexo_microapp_sdk::identity::{
+    parse_jid, LidPnMappingStore, ParsedJid, PersonPhoneStore, PersonStore,
+};
 use nexo_tool_meta::marketing::{EnrichmentStatus, Person, PersonId, TenantIdRef};
 use serde::Deserialize;
 use uuid::Uuid;
@@ -124,6 +126,7 @@ pub async fn handle_inbound_whatsapp_event(
     payload: serde_json::Value,
     persons: Arc<dyn PersonStore>,
     person_phones: Arc<dyn PersonPhoneStore>,
+    lid_pn_mappings: Option<Arc<dyn LidPnMappingStore>>,
     tenant_resolver: &dyn crate::broker::TenantResolver,
     _audit: Option<&AuditLog>,
 ) -> IngestOutcome {
@@ -211,12 +214,28 @@ pub async fn handle_inbound_whatsapp_event(
         }
     };
 
+    // F23 — when the LID-PN mapping store has a record for
+    // this inbound's namespace counterpart, derive the
+    // person id from the canonical PN form so a LID inbound
+    // and its paired PN inbound land on the SAME Person row.
+    // Without a mapping, fall back to the inbound's own
+    // canonical (pre-F23 behaviour). The PersonPhone row is
+    // still keyed by the inbound's canonical so direct
+    // lookups by JID resolve.
+    let identity_canonical = bridge_identity_via_lid_pn_mapping(
+        &parsed,
+        lid_pn_mappings.as_deref(),
+        tenant.as_str(),
+    )
+    .await
+    .unwrap_or_else(|| canonical.clone());
+
     // Upsert Person — deterministic uuid5 over the
     // canonical JID so re-ingesting the same contact never
     // forks the row. We don't have a name yet (push_name
     // is in the InboundEvent but not in our wire shape;
     // promoting that is a follow-up).
-    let person = build_person_from_jid(&tenant, &canonical);
+    let person = build_person_from_jid(&tenant, &identity_canonical);
     if let Err(e) = persons.upsert(tenant.as_str(), &person).await {
         tracing::warn!(
             target: "marketing.whatsapp_ingest",
@@ -243,6 +262,46 @@ pub async fn handle_inbound_whatsapp_event(
         person_id: person.id,
         canonical_jid: canonical,
         tenant_id: tenant.as_str().to_string(),
+    }
+}
+
+/// F23 — when a LID inbound has a paired PN in the mapping
+/// store (or vice versa), return the canonical form of the
+/// "primary" namespace so both inbounds collapse onto the
+/// same Person row. PN is the primary anchor — it's the
+/// human's real phone number.
+///
+/// Returns `None` when no mapping store is wired or no
+/// pair exists; caller falls back to the inbound JID's own
+/// canonical.
+async fn bridge_identity_via_lid_pn_mapping(
+    parsed: &ParsedJid,
+    store: Option<&dyn LidPnMappingStore>,
+    tenant_id: &str,
+) -> Option<String> {
+    let store = store?;
+    match parsed.server.as_str() {
+        "lid" => {
+            // LID inbound — look up the paired PN.
+            match store.get_pn_for_lid(tenant_id, &parsed.user).await {
+                Ok(Some(pn_user)) => {
+                    Some(format!("{pn_user}@s.whatsapp.net"))
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "marketing.whatsapp_ingest",
+                        error = %e, lid = %parsed.user,
+                        "lid_pn_mapping.get_pn_for_lid failed (skipping bridge)"
+                    );
+                    None
+                }
+            }
+        }
+        // PN inbound — already the canonical anchor; no
+        // bridge needed (LID inbounds will collapse to the
+        // PN when their mapping fires).
+        _ => None,
     }
 }
 
@@ -408,6 +467,7 @@ mod tests {
             json!({}),
             persons,
             phones,
+            None,
             &resolver,
             None,
         )
@@ -425,6 +485,7 @@ mod tests {
             message_payload("573001234567@s.whatsapp.net"),
             persons.clone() as Arc<dyn PersonStore>,
             phones.clone() as Arc<dyn PersonPhoneStore>,
+            None,
             &resolver,
             None,
         )
@@ -460,7 +521,8 @@ mod tests {
                 message_payload("573001234567@s.whatsapp.net"),
                 persons.clone() as Arc<dyn PersonStore>,
                 phones.clone() as Arc<dyn PersonPhoneStore>,
-                &resolver,
+                None,
+            &resolver,
                 None,
             )
             .await;
@@ -483,7 +545,8 @@ mod tests {
                 message_payload(jid),
                 persons.clone() as Arc<dyn PersonStore>,
                 phones.clone() as Arc<dyn PersonPhoneStore>,
-                &resolver,
+                None,
+            &resolver,
                 None,
             )
             .await;
@@ -508,6 +571,7 @@ mod tests {
             message_payload("12345-67890@g.us"),
             persons.clone() as Arc<dyn PersonStore>,
             phones.clone() as Arc<dyn PersonPhoneStore>,
+            None,
             &resolver,
             None,
         )
@@ -533,6 +597,7 @@ mod tests {
             payload,
             persons.clone() as Arc<dyn PersonStore>,
             phones.clone() as Arc<dyn PersonPhoneStore>,
+            None,
             &resolver,
             None,
         )
@@ -550,6 +615,7 @@ mod tests {
             json!({ "no_kind": true }),
             persons,
             phones,
+            None,
             &resolver,
             None,
         )
@@ -573,7 +639,8 @@ mod tests {
                 message_payload(jid),
                 persons.clone() as Arc<dyn PersonStore>,
                 phones.clone() as Arc<dyn PersonPhoneStore>,
-                &resolver,
+                None,
+            &resolver,
                 None,
             )
             .await;
@@ -598,4 +665,214 @@ mod tests {
         assert_ne!(a, d);
     }
 
+    // ─── F23 — LID ↔ PN mapping bridge ────────────────────────
+
+    use nexo_microapp_sdk::identity::LidPnMapping;
+
+    #[derive(Default)]
+    struct FakeLidPnStore {
+        rows: Mutex<HashMap<(String, String), String>>, // (tenant, lid) -> pn
+    }
+
+    #[async_trait]
+    impl LidPnMappingStore for FakeLidPnStore {
+        async fn put(
+            &self,
+            tenant: &str,
+            lid_user: &str,
+            pn_user: &str,
+        ) -> Result<LidPnMapping, IdentityError> {
+            self.rows.lock().unwrap().insert(
+                (tenant.to_string(), lid_user.to_string()),
+                pn_user.to_string(),
+            );
+            Ok(LidPnMapping {
+                tenant_id: TenantIdRef(tenant.into()),
+                lid_user: lid_user.into(),
+                pn_user: pn_user.into(),
+                observed_at_ms: 0,
+            })
+        }
+        async fn get_pn_for_lid(
+            &self,
+            tenant: &str,
+            lid_user: &str,
+        ) -> Result<Option<String>, IdentityError> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&(tenant.to_string(), lid_user.to_string()))
+                .cloned())
+        }
+        async fn get_lid_for_pn(
+            &self,
+            _tenant: &str,
+            _pn_user: &str,
+        ) -> Result<Option<String>, IdentityError> {
+            Ok(None)
+        }
+        async fn delete_by_tenant(
+            &self,
+            _t: &str,
+        ) -> Result<u64, IdentityError> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn lid_inbound_with_mapping_collapses_to_pn_person_id() {
+        // Given: a LID ↔ PN mapping recorded for this tenant.
+        // When: a LID inbound lands, the deterministic
+        // person_id should match the PN canonical form's id,
+        // NOT the LID's. Result: a future PN inbound from the
+        // same human collapses onto the same Person row.
+        let persons = Arc::new(FakePersonStore::default());
+        let phones = Arc::new(FakePhoneStore::default());
+        let lid_pn = Arc::new(FakeLidPnStore::default());
+        let resolver = fixture_resolver();
+        // Operator-known mapping: LID `123456789` ↔ PN
+        // `573001234567`.
+        lid_pn.put("acme", "123456789", "573001234567")
+            .await
+            .unwrap();
+        let mapping_arc: Arc<dyn LidPnMappingStore> = lid_pn.clone();
+
+        let out = handle_inbound_whatsapp_event(
+            "plugin.inbound.whatsapp.acme-personal",
+            message_payload("123456789@lid"),
+            persons.clone() as Arc<dyn PersonStore>,
+            phones.clone() as Arc<dyn PersonPhoneStore>,
+            Some(mapping_arc),
+            &resolver,
+            None,
+        )
+        .await;
+        let IngestOutcome::Upserted { person_id, .. } = out else {
+            panic!("expected Upserted, got {out:?}");
+        };
+        // Person id collapsed to the PN canonical form.
+        let pn_canonical = "573001234567@s.whatsapp.net";
+        assert_eq!(person_id, deterministic_person_id(pn_canonical));
+    }
+
+    #[tokio::test]
+    async fn lid_inbound_without_mapping_keeps_own_identity() {
+        // No mapping store wired ⇒ pre-F23 behaviour. LID
+        // becomes its own identity.
+        let persons = Arc::new(FakePersonStore::default());
+        let phones = Arc::new(FakePhoneStore::default());
+        let resolver = fixture_resolver();
+        let out = handle_inbound_whatsapp_event(
+            "plugin.inbound.whatsapp.acme-personal",
+            message_payload("123456789@lid"),
+            persons.clone() as Arc<dyn PersonStore>,
+            phones.clone() as Arc<dyn PersonPhoneStore>,
+            None,
+            &resolver,
+            None,
+        )
+        .await;
+        let IngestOutcome::Upserted { person_id, .. } = out else {
+            panic!("expected Upserted");
+        };
+        // Person id derived from the LID's own canonical.
+        assert_eq!(
+            person_id,
+            deterministic_person_id("123456789@lid"),
+        );
+    }
+
+    #[tokio::test]
+    async fn lid_inbound_with_mapping_store_but_no_pair_keeps_own_identity() {
+        // Mapping store wired but no row for THIS LID. The
+        // bridge falls back to the LID's own canonical.
+        let persons = Arc::new(FakePersonStore::default());
+        let phones = Arc::new(FakePhoneStore::default());
+        let lid_pn = Arc::new(FakeLidPnStore::default());
+        let resolver = fixture_resolver();
+        let mapping_arc: Arc<dyn LidPnMappingStore> = lid_pn.clone();
+        let out = handle_inbound_whatsapp_event(
+            "plugin.inbound.whatsapp.acme-personal",
+            message_payload("999999@lid"),
+            persons.clone() as Arc<dyn PersonStore>,
+            phones.clone() as Arc<dyn PersonPhoneStore>,
+            Some(mapping_arc),
+            &resolver,
+            None,
+        )
+        .await;
+        let IngestOutcome::Upserted { person_id, .. } = out else {
+            panic!("expected Upserted");
+        };
+        assert_eq!(
+            person_id,
+            deterministic_person_id("999999@lid"),
+        );
+    }
+
+    #[tokio::test]
+    async fn pn_inbound_does_not_consult_mapping() {
+        // PN inbound is the canonical anchor — no bridge
+        // needed. The store is consulted only on LID
+        // inbounds.
+        let persons = Arc::new(FakePersonStore::default());
+        let phones = Arc::new(FakePhoneStore::default());
+        let lid_pn = Arc::new(FakeLidPnStore::default());
+        let resolver = fixture_resolver();
+        // Even with a mapping recorded, a PN inbound's id
+        // comes from the PN's own canonical.
+        lid_pn.put("acme", "123456789", "573001234567")
+            .await
+            .unwrap();
+        let mapping_arc: Arc<dyn LidPnMappingStore> = lid_pn.clone();
+        let out = handle_inbound_whatsapp_event(
+            "plugin.inbound.whatsapp.acme-personal",
+            message_payload("573001234567@s.whatsapp.net"),
+            persons.clone() as Arc<dyn PersonStore>,
+            phones.clone() as Arc<dyn PersonPhoneStore>,
+            Some(mapping_arc),
+            &resolver,
+            None,
+        )
+        .await;
+        let IngestOutcome::Upserted { person_id, .. } = out else {
+            panic!("expected Upserted");
+        };
+        assert_eq!(
+            person_id,
+            deterministic_person_id("573001234567@s.whatsapp.net"),
+        );
+    }
+
+    #[tokio::test]
+    async fn lid_and_pn_inbounds_collapse_when_mapping_known() {
+        // Integration: same human's LID + PN both land
+        // (in either order) and the mapping is known. Both
+        // upserts must hit the SAME Person row.
+        let persons = Arc::new(FakePersonStore::default());
+        let phones = Arc::new(FakePhoneStore::default());
+        let lid_pn = Arc::new(FakeLidPnStore::default());
+        let resolver = fixture_resolver();
+        lid_pn.put("acme", "123456789", "573001234567")
+            .await
+            .unwrap();
+        let mapping_arc: Arc<dyn LidPnMappingStore> = lid_pn.clone();
+        for jid in &["123456789@lid", "573001234567@s.whatsapp.net"] {
+            let _ = handle_inbound_whatsapp_event(
+                "plugin.inbound.whatsapp.acme-personal",
+                message_payload(jid),
+                persons.clone() as Arc<dyn PersonStore>,
+                phones.clone() as Arc<dyn PersonPhoneStore>,
+                Some(mapping_arc.clone()),
+                &resolver,
+                None,
+            )
+            .await;
+        }
+        // Single Person row — both inbounds collapsed via
+        // the mapping bridge.
+        let count = persons.rows.lock().unwrap().len();
+        assert_eq!(count, 1, "LID + PN should collapse with mapping");
+    }
 }

@@ -16,7 +16,9 @@
 use std::sync::Arc;
 
 use nexo_microapp_sdk::enrichment::FallbackChain;
-use nexo_microapp_sdk::identity::{PersonEmailStore, PersonPhoneStore, PersonStore};
+use nexo_microapp_sdk::identity::{
+    LidPnMappingStore, PersonEmailStore, PersonPhoneStore, PersonStore,
+};
 
 use crate::firehose::LeadEventBus;
 use crate::lead::{LeadStore, RouterHandle};
@@ -41,6 +43,12 @@ pub struct IdentityDeps {
     /// wired WhatsApp / SMS into the marketing extension's
     /// identity pool yet).
     pub person_phones: Option<Arc<dyn PersonPhoneStore>>,
+    /// M15.23.e / F23 — LID ↔ PN mapping store. When set,
+    /// the WA ingest collapses both namespaces into a
+    /// single \`Person\` row whenever the protocol announces
+    /// a migration. \`None\` ⇒ each namespace stays its own
+    /// identity (pre-F23 behaviour).
+    pub lid_pn_mappings: Option<Arc<dyn LidPnMappingStore>>,
     pub chain: Arc<FallbackChain>,
 }
 
@@ -54,6 +62,7 @@ impl IdentityDeps {
             persons,
             person_emails,
             person_phones: None,
+            lid_pn_mappings: None,
             chain,
         }
     }
@@ -65,6 +74,17 @@ impl IdentityDeps {
         phones: Arc<dyn PersonPhoneStore>,
     ) -> Self {
         self.person_phones = Some(phones);
+        self
+    }
+
+    /// Builder-style wiring for the LID ↔ PN mapping store
+    /// (F23). Same Arc the WA ingest + duplicate matcher
+    /// consult to collapse cross-namespace identities.
+    pub fn with_lid_pn_mappings(
+        mut self,
+        mappings: Arc<dyn LidPnMappingStore>,
+    ) -> Self {
+        self.lid_pn_mappings = Some(mappings);
         self
     }
 }
