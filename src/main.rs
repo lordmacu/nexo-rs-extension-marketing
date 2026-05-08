@@ -123,8 +123,12 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("open identity pool at {}", identity_db_path.display()))?;
     // Touch the companies store so its tables migrate (the
     // resolver path doesn't write to it yet, but the schema
-    // must be present for downstream company enrichment).
-    let _ = SqliteCompanyStore::new(identity_pool.clone());
+    // must be present for downstream company enrichment.
+    // M15.21.b — keep the company store live so the lead
+    // drawer's enrichment override endpoint can upsert
+    // operator-confirmed company rows.
+    let companies: Arc<dyn nexo_microapp_sdk::identity::CompanyStore> =
+        Arc::new(SqliteCompanyStore::new(identity_pool.clone()));
     let persons: Arc<dyn PersonStore> =
         Arc::new(SqlitePersonStore::new(identity_pool.clone()));
     let person_emails: Arc<dyn PersonEmailStore> =
@@ -150,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
         vec![Box::new(DisplayNameParser), Box::new(ReplyToReader)],
         0.7,
     ));
-    let identity = IdentityDeps::new(persons, person_emails, chain)
+    let identity = IdentityDeps::new(persons.clone(), person_emails, chain)
         .with_person_phones(person_phones)
         .with_lid_pn_mappings(lid_pn_mappings);
     tracing::info!(tenant = %tenant, "identity stores + resolver chain ready");
@@ -327,7 +331,9 @@ async fn main() -> anyhow::Result<()> {
         .with_guardrails(guardrails.clone())
         .with_outbound(outbound_publisher.clone())
         .with_broker_sender_cell(broker_sender_cell.clone())
-        .with_draft_generator(draft_generator);
+        .with_draft_generator(draft_generator)
+        .with_persons(persons.clone())
+        .with_companies(companies.clone());
     if let Some(deps) = tracking_deps.clone() {
         admin_state_builder = admin_state_builder
             .with_tracking(deps.clone())

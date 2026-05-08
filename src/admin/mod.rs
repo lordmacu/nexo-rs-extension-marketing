@@ -30,6 +30,7 @@ pub mod config;
 pub mod firehose;
 pub mod healthz;
 pub mod leads;
+pub mod persons;
 pub mod tracking;
 
 pub use auth::{require_tenant_id, AuthState, AUTH_HEADER, TENANT_HEADER};
@@ -120,6 +121,20 @@ pub struct AdminState {
     /// haven't wired one yet surface a clear error.
     pub draft_generator:
         Option<Arc<dyn crate::draft::DraftGenerator + Send + Sync>>,
+    /// M15.21.b — person store the lead drawer reads to
+    /// surface `enrichment_status` + `enrichment_confidence`
+    /// per lead. Same Arc the broker hop's identity
+    /// resolver writes to, so operator confirmations are
+    /// visible to the next inbound. `None` ⇒ the
+    /// `/persons` endpoints 503 with `persons_not_loaded`.
+    pub persons: Option<Arc<dyn nexo_microapp_sdk::identity::PersonStore>>,
+    /// M15.21.b — company store backing the operator's
+    /// "Inferred: Acme Corp" prompt. Same Arc the
+    /// enrichment chain populates. `None` ⇒ enrichment
+    /// confirm endpoints accept `primary_name` updates
+    /// only; the company side surfaces 503 when the
+    /// operator tries to set a company.
+    pub companies: Option<Arc<dyn nexo_microapp_sdk::identity::CompanyStore>>,
 }
 
 impl AdminState {
@@ -139,6 +154,8 @@ impl AdminState {
             broker_sender: Arc::new(arc_swap::ArcSwapOption::empty()),
             tracking_for_outbound: None,
             draft_generator: None,
+            persons: None,
+            companies: None,
         }
     }
 
@@ -281,6 +298,32 @@ impl AdminState {
         self
     }
 
+    /// M15.21.b — wire the person store. Same Arc the
+    /// broker hop's identity resolver writes to so the
+    /// lead drawer reads the freshest `enrichment_status`
+    /// + `enrichment_confidence` and operator
+    /// confirmations land where the resolver picks them
+    /// up.
+    pub fn with_persons(
+        mut self,
+        persons: Arc<dyn nexo_microapp_sdk::identity::PersonStore>,
+    ) -> Self {
+        self.persons = Some(persons);
+        self
+    }
+
+    /// M15.21.b — wire the company store. Required when
+    /// operators confirm or edit a company name from the
+    /// lead drawer; without it the confirm endpoint refuses
+    /// company writes (name updates still work).
+    pub fn with_companies(
+        mut self,
+        companies: Arc<dyn nexo_microapp_sdk::identity::CompanyStore>,
+    ) -> Self {
+        self.companies = Some(companies);
+        self
+    }
+
     pub fn lookup_store(&self, tenant_id: &TenantId) -> Option<Arc<LeadStore>> {
         self.stores.get(tenant_id).cloned()
     }
@@ -323,6 +366,12 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route(
             "/leads/:lead_id/drafts/generate",
             axum::routing::post(leads::generate_draft_handler),
+        )
+        // M15.21.b — person + enrichment surface.
+        .route("/persons/:person_id", get(persons::get_handler))
+        .route(
+            "/persons/:person_id/confirm-enrichment",
+            axum::routing::post(persons::confirm_enrichment_handler),
         )
         .route(
             "/config/mailboxes",
