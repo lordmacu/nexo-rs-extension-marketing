@@ -322,16 +322,56 @@ routes through `classify` for them. 4 new tests (one per kind
 - **Effort:** ~2-3h review session, may surface 1-2 lift
   candidates of ~50 LOC each.
 
-### F30 · Frontend granular guardrail compile errors
+### F30 · Frontend granular guardrail compile errors ✅ — done in marketing 0.16.2 / agent-creator 0.0.65
 
-- **Origin:** M15.23.d — `PUT /config/topic_guardrails`
-  returns a typed body on regex / dup-id / empty-pattern
-  failure. Frontend renders the message in the modal banner
-  but doesn't highlight the offending rule row.
-- **Plan:** parse the 400 body's `rule_id` / `index` fields
-  in the modal, scroll to the offending rule + paint a red
-  border + inline tooltip with the `regex` crate error.
-- **Effort:** ~80 LOC frontend.
+Backend + frontend halves.
+
+**Backend (marketing 0.16.2):**
+`PUT /config/topic_guardrails` now returns a structured
+`detail` object on `guardrail_compile` failure with:
+- `kind`: `"invalid_pattern" | "duplicate_id" | "empty_rule"`
+- `rule_id`: operator-authored id (or null when the loader
+  surfaces no rule context)
+- `pattern_index`: 0-based index for `invalid_pattern`,
+  null otherwise
+- `regex_error`: underlying `regex` crate message for
+  `invalid_pattern`, null otherwise
+
+The `Display` `message` field stays for legacy clients;
+new consumers read `detail.*` for typed UX.
+
+**Frontend (agent-creator 0.0.65 / frontend 0.0.78):**
+`parseGuardrailCompileDetail(err)` extracts the structured
+detail from `HttpError.body`, resilient to missing /
+non-string fields (returns `null` cleanly). Modal `onSave`
+captures the detail, optimistically swaps the displayed
+rule list with the operator's staged edit so the offending
+rule (which isn't persisted yet) IS visible in the
+highlighted list while the operator iterates.
+
+UI changes in the rule list:
+- Offending rule row gets a red border + ring + amber
+  badge with the kind label (`invalid_pattern` /
+  `duplicate_id` / `empty_rule`).
+- For `invalid_pattern`, the specific pattern at
+  `pattern_index` gets a red highlight + tooltip showing
+  the regex error.
+- Banner above the list summarises via
+  `summarizeGuardrailCompileDetail` ("Regla \`pricing\`
+  patrón #2 inválido: regex parse error: …").
+- Highlight persists until the next successful save (which
+  clears `compile_error` state).
+
+12 new vitest unit cases covering both helpers: parse
+returns null for non-HttpError / wrong code / missing
+detail / unknown kind, parses all three variants, survives
+partial detail with non-string fields; summarize renders
+each kind with proper labels + falls back when fields
+missing.
+
+98/98 frontend tests green (86 baseline + 12 F30). 360/360
+marketing tests green. Versions: marketing 0.16.1 → 0.16.2 ·
+agent-creator 0.0.64 → 0.0.65 · frontend 0.0.77 → 0.0.78.
 
 ### F11 · `working_hours` + `alt_emails` editable ✅ — done in M15.45
 

@@ -30,7 +30,9 @@ use crate::config::{
     save_mailboxes, save_notification_templates, save_rules, save_sellers,
     save_snippets, save_templates, save_topic_guardrails,
 };
-use nexo_microapp_sdk::guardrails::{GuardrailRule, GuardrailSet};
+use nexo_microapp_sdk::guardrails::{
+    GuardrailLoadError, GuardrailRule, GuardrailSet,
+};
 use nexo_microapp_sdk::templating::{Snippet, Template};
 use crate::error::MarketingError;
 use crate::lead::router::load_rule_set;
@@ -344,6 +346,51 @@ fn marketing_error(e: MarketingError) -> Response {
     )
 }
 
+/// F30 — structured error body for guardrail compile
+/// failures. The frontend's `SettingsGuardrails` form
+/// reads `detail.kind` + `detail.rule_id` +
+/// `detail.pattern_index` (when applicable) to highlight
+/// the offending rule row + paint a red border, instead
+/// of dumping the whole `Display` string into a banner.
+fn guardrail_compile_error(e: GuardrailLoadError) -> Response {
+    let (kind_label, rule_id, pattern_index, regex_error) = match &e {
+        GuardrailLoadError::InvalidPattern {
+            rule_id,
+            index,
+            error: regex_err,
+        } => (
+            "invalid_pattern",
+            Some(rule_id.clone()),
+            Some(*index as i64),
+            Some(regex_err.clone()),
+        ),
+        GuardrailLoadError::DuplicateId(rule_id) => {
+            ("duplicate_id", Some(rule_id.clone()), None, None)
+        }
+        GuardrailLoadError::EmptyRule(rule_id) => {
+            ("empty_rule", Some(rule_id.clone()), None, None)
+        }
+    };
+    let detail = json!({
+        "kind": kind_label,
+        "rule_id": rule_id,
+        "pattern_index": pattern_index,
+        "regex_error": regex_error,
+    });
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "ok": false,
+            "error": {
+                "code": "guardrail_compile",
+                "message": e.to_string(),
+                "detail": detail,
+            },
+        })),
+    )
+        .into_response()
+}
+
 /// `GET /config/notification_templates` — full
 /// `NotificationTemplates` document. Empty (every locale set
 /// `None`) when missing — `render_summary` falls back to the
@@ -590,16 +637,12 @@ pub async fn put_topic_guardrails(
     // Compile FIRST — refuse to persist a YAML the in-memory
     // tagger would reject. The operator sees a 400 with a
     // typed body instead of a green PUT followed by a quiet
-    // "didn't actually swap" runtime hiccup.
+    // "didn't actually swap" runtime hiccup. F30 — body
+    // carries structured fields so the operator UI can
+    // highlight the offending rule + pattern index inline.
     let compiled = match GuardrailSet::build(rows.clone()) {
         Ok(s) => s,
-        Err(e) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "guardrail_compile",
-                &e.to_string(),
-            );
-        }
+        Err(e) => return guardrail_compile_error(e),
     };
     if let Err(e) = save_topic_guardrails(root, &tenant_id, &rows) {
         return marketing_error(e);
