@@ -303,6 +303,18 @@ async fn main() -> anyhow::Result<()> {
     let broker_templates = template_lookup.clone();
     let broker_dedup = dedup.clone();
     let broker_audit = audit_log.clone();
+    // M15.23.e WA half — tenant resolver dedicated to
+    // WhatsApp inbounds. Falls back to the same default
+    // tenant the email side uses so single-tenant operators
+    // don't need extra config; multi-tenant operators map
+    // WA instance labels via the same `MARKETING_TENANT_ID`
+    // env (extended later to a YAML when multi-WA-instance
+    // deployments arrive).
+    let whatsapp_resolver: Arc<nexo_marketing::broker::StaticTenantResolver> = Arc::new(
+        nexo_marketing::broker::StaticTenantResolver::new(std::iter::empty())
+            .with_default(tenant.clone()),
+    );
+    let broker_whatsapp_resolver = whatsapp_resolver.clone();
     PluginAdapter::new(MANIFEST)?
         .with_server_version(version)
         .declare_tools(marketing_tool_defs())
@@ -328,6 +340,7 @@ async fn main() -> anyhow::Result<()> {
                 let dedup = broker_dedup.clone();
                 let audit_log = broker_audit.clone();
                 let guardrails = broker_guardrails.clone();
+                let whatsapp_resolver = broker_whatsapp_resolver.clone();
                 async move {
                     // M15.39 — single broker subscriber, two
                     // dispatchers. Topic prefix routes between:
@@ -342,6 +355,27 @@ async fn main() -> anyhow::Result<()> {
                             &broker,
                         )
                         .await;
+                        return;
+                    }
+                    // M15.23.e WA half — WhatsApp inbound
+                    // ingest. Decoupled from the email
+                    // pipeline: only Person + PersonPhone
+                    // upsert. The agent runtime handles the
+                    // message body.
+                    if topic.starts_with("plugin.inbound.whatsapp") {
+                        if let Some(phone_store) =
+                            identity.person_phones.clone()
+                        {
+                            let _ = nexo_marketing::whatsapp_ingest::handle_inbound_whatsapp_event(
+                                &topic,
+                                event.payload,
+                                identity.persons.clone(),
+                                phone_store,
+                                whatsapp_resolver.as_ref(),
+                                Some(audit_log.as_ref()),
+                            )
+                            .await;
+                        }
                         return;
                     }
                     // `load_full()` is a lock-free atomic Arc

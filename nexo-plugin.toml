@@ -43,6 +43,12 @@ tools = [
 broker_topics = [
     "plugin.inbound.email.*",
     "agent.email.notification.*",
+    # M15.23.e WA half — subscribe to inbound WhatsApp
+    # messages so the duplicate-person matcher can upsert
+    # `PersonPhone` rows whenever a contact lands. We only
+    # consume `from` + `chat` JIDs from the payload; nothing
+    # else (text, media, replies are agent-runtime concerns).
+    "plugin.inbound.whatsapp.*",
 ]
 
 [plugin.sandbox]

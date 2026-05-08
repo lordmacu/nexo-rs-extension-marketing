@@ -41,6 +41,7 @@ pub mod tenant;
 pub mod threading;
 pub mod tools;
 pub mod tracking;
+pub mod whatsapp_ingest;
 
 pub use error::MarketingError;
 pub use tenant::{TenantId, TenantIdError};

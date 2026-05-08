@@ -8,7 +8,10 @@
 pub mod inbound;
 pub mod outbound;
 
-pub use inbound::{decode_inbound_email, ParsedInbound, ParseError, TenantResolver};
+pub use inbound::{
+    decode_inbound_email, ParsedInbound, ParseError, StaticTenantResolver,
+    TenantResolver,
+};
 pub use outbound::{
     DispatchInput, OutboundDispatchResult, OutboundEmail, OutboundPublisher,
 };

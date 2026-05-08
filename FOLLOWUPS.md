@@ -70,25 +70,33 @@ in the confirm modal. Dropdown filters inactive agents.
 
 ## 🟡 Medium · technical debt
 
-### F21 · WhatsApp-side `PersonPhone` ingest (M15.23.e WA half)
+### F21 · WhatsApp-side `PersonPhone` ingest ✅ — done in 0.16.0
 
-- **Origin:** M15.23.e — marketing-side matcher consumes
-  `PersonPhoneStore::find_owner` but no producer populates
-  the table. WA contacts never become candidates.
-- **Plan:** new subscriber in marketing extension's broker
-  loop on `plugin.inbound.whatsapp.*`. Decode
-  `InboundEvent::Message { from, ... }`, parse JID via
-  `nexo_microapp_sdk::identity::parse_jid` (rejects groups
-  / status / bots), resolve tenant via the existing
-  `TenantResolver` chain (mirroring the email subscriber's
-  account_id → tenant lookup), upsert `Person` (deterministic
-  uuid5 from JID) + `PersonPhone` (canonical
-  `<user>@<server>` form).
-- **Effort:** ~150 LOC + 4-6 tests + boot wiring of the
-  whatsapp tenant resolver fallback.
-- **Acceptance:** an inbound WA message from a contact
-  whose JID matches an email-side person triggers a
-  `DuplicatePersonDetected` audit row.
+`crate::whatsapp_ingest::handle_inbound_whatsapp_event`
+subscribes to `plugin.inbound.whatsapp.*` (manifest
+`broker_topics` extended), decodes the WA plugin's
+`InboundEvent::Message` via a private wire-shape
+mirror, parses the sender JID through
+`nexo_microapp_sdk::identity::parse_jid`, rejects
+groups / status / bots via `is_user()`, resolves
+tenant through a dedicated `StaticTenantResolver`
+(default-falls-back to the operator's
+`MARKETING_TENANT_ID`), and upserts `Person`
+(deterministic uuid5 from canonical JID) + `PersonPhone`.
+
+9 unit tests via in-memory fake stores: off-topic
+skipped, happy-path person+phone persists, deterministic
+uuid5 collapses re-ingest, legacy `c.us` canonicalises
+to `s.whatsapp.net` (single row across both inbounds),
+group JID skipped, non-`message` discriminator filtered,
+malformed payload typed-error, LID kept distinct from PN
+(F23 covers the bridge), deterministic id function pure +
+case-insensitive.
+
+356/356 marketing tests green (347 baseline + 9 wa). The
+matcher's phone signal now fires real candidates whenever
+an email-side lead arrives carrying a JID a WA contact
+already used.
 
 ### F22 · Outbound publisher integration of tracking prep helper
 
