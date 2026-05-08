@@ -71,15 +71,20 @@ via `arc_swap` on `PUT /config/notification_templates`.
 Frontend Settings tab "Templates" lets operators edit via
 JSON editor (M15.34 pattern).
 
-### F15 · No integration test for seller lookup live-reload
+### F15 · Integration test for seller / template live-reload ✅ — done in M15.48
 
-- **Origin:** M15.38
-- **Status:** unit tests separate classifier (pure) from publish
-  (IO). No end-to-end test that PUT sellers via admin router
-  → next broker hop sees fresh settings.
-- **Plan:** integration test `tests/notification_live_reload.rs`
-  that boots admin router + broker hop test fixtures.
-- **Effort:** ~150 LOC.
+`tests/notification_live_reload.rs` (4 tests, ~280 LOC):
+- `put_sellers_swaps_lookup_picked_up_by_classifier` — boot
+  empty lookup, PUT through router, classifier sees fresh
+  seller without restart.
+- `put_sellers_then_remove_seller_drops_classifier_match` —
+  reverse direction (PUT empty list evicts seller).
+- `put_notification_templates_swaps_lookup_picked_up_by_renderer`
+  — same pattern for the M15.44 template lookup; verifies
+  `{{from}}` / `{{subject}}` placeholders resolve post-PUT.
+- `put_sellers_persists_yaml_to_disk_for_post_restart_reload`
+  — defense-in-depth: file landed on disk so boot loader
+  picks it up next start.
 
 ### F16 · Summary fallback no longer Debug-formatted ✅ — done in M15.47
 

@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.13.2 — 2026-05-08 (M15.48 — integration test for live-reload pipelines)
+
+Closes F15. End-to-end coverage for the two `arc_swap`-backed
+live-reload pipelines: seller lookup (M15.38) + notification
+template lookup (M15.44). Unit tests cover the classifier
+side-effect free; this file boots the real admin axum router
++ asserts the `PUT` handler swaps the in-memory lookup the
+classifier reads — no process restart, no manual reload.
+
+### Implemented
+
+- New `tests/notification_live_reload.rs` (~280 LOC):
+  - **put_sellers_swaps_lookup_picked_up_by_classifier**:
+    boot empty `SellerLookup` → classifier returns
+    `SellerMissing` → `PUT /config/sellers` via tower
+    `oneshot` → next classifier call returns `Publish`
+    with the baked WhatsApp instance.
+  - **put_sellers_then_remove_seller_drops_classifier_match**:
+    PUT pedro → lookup contains pedro → PUT empty list →
+    lookup empty → classifier `SellerMissing` again.
+  - **put_notification_templates_swaps_lookup_picked_up_by_renderer**:
+    seed pedro, render with framework default, PUT operator
+    template, render again → operator template wins +
+    `{{from}}` / `{{subject}}` resolved.
+  - **put_sellers_persists_yaml_to_disk_for_post_restart_reload**:
+    PUT writes the file → `load_sellers` (boot loader)
+    picks it up identically.
+
+### Test count
+
+138 unit + 8 cross-tenant + 6 microapp proxy + 25 plugin /
+firehose / admin + 7 thread + 26 config + 1 live-reload +
+9 forwarder + 20 notification + **4 integration live-reload**
+= **244 green** (was 240).
+
 ## 0.13.1 — 2026-05-08 (M15.47 — render_summary fallback humanised)
 
 Closes F16. The `render_summary` function used a `(other, _)`
