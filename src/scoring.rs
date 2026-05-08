@@ -1,5 +1,10 @@
 //! Marketing-specific scorer composition (M15.23.f).
 //!
+//! **F29 sweep:** marketing-specific by design. Generic
+//! `Scorer` / `HeuristicScorer` / `Score` types live in
+//! `nexo_microapp_sdk::scoring`; this module composes the
+//! 5 marketing-default rules + the `LeadCtx` projection.
+//!
 //! Wraps the SDK's generic `HeuristicScorer` with the lead-
 //! shaped rules the marketing extension cares about today.
 //! Pure logic + no async — the broker hop runs the scorer

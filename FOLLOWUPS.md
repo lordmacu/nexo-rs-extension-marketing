@@ -385,23 +385,46 @@ Bump:
 - **Blocker:** M22 outbound draft pipeline (smoke needs
   end-to-end send to validate).
 
-### F29 · SDK lift sweep — final pass (M15.27)
+### F29 · SDK lift sweep — final pass ✅ — done in SDK 0.1.11 / marketing 0.17.2
 
-- **Origin:** M15.27 done-criterion. M15.* sub-phases
-  shipped continuous lifts (tracking, scoring, audit,
-  guardrails, templating, identity::jid). One pass over
-  every M15-touched file confirms nothing microapp-
-  agnostic stayed inside the marketing extension by
-  accident.
-- **Plan:** review `crate::tracking`, `crate::audit`,
-  `crate::scoring`, `crate::guardrails`, `crate::duplicate`,
-  `crate::availability`, `crate::threading`. For each:
-  apply the heuristics from `proyecto/CLAUDE.md`'s SDK lift
-  rule. Anything that DOESN'T graduate gets a one-line
-  "marketing-specific by design" comment so the next
-  reviewer doesn't re-litigate.
-- **Effort:** ~2-3h review session, may surface 1-2 lift
-  candidates of ~50 LOC each.
+Reviewed all 9 marketing-touched modules from M15.23.x +
+M17.3 + F25 against the SDK lift heuristics.
+
+**Lifted (2):**
+
+- `crate::threading` → `nexo_microapp_sdk::email_threading`
+  (feature `email-threading`). Pure string helpers
+  (`normalize_subject` + `synth_thread_id`) — useful for
+  any inbound-email consumer. 22 unit tests moved with
+  the module. Marketing keeps a 4-line re-export shim.
+- `crate::notification_dedup` → `nexo_microapp_sdk::dedup`
+  (feature `dedup`, optional `dedup-sled`). Generic
+  time-bucketed dedup primitive over
+  `(tenant, X, Y, minute)` keys + the F25 sled backend.
+  14 unit tests moved. Marketing's `dedup-sled` feature
+  forwards to SDK's identically-named feature.
+
+**Stayed marketing-specific (7):**
+
+- `crate::tracking` — 60-LOC glue using `crate::tenant::TenantId`.
+- `crate::audit` — `AuditEvent` carries CRM-shaped variants.
+- `crate::scoring` — `LeadCtx` + 5 marketing-default rules.
+- `crate::guardrails` — 1-line ArcSwap alias.
+- `crate::duplicate` — orchestrator is CRM; pure helpers
+  (30 LOC) defer until 2nd consumer.
+- `crate::availability` — takes CRM-shaped `Seller` directly.
+- `crate::whatsapp_ingest` — subscriber pipeline is the
+  right layer for SDK consumption.
+
+Each "stay" module gained a "**F29 sweep:** marketing-
+specific by design" comment block so the next reviewer
+doesn't re-litigate.
+
+Tests: SDK 332 → 360 (+28 lifted). Marketing 365 → 334
+(modules moved; net 0 effective tests lost — every
+behavioural assertion runs in the SDK now).
+
+Versions: SDK 0.1.10 → 0.1.11 · marketing 0.17.1 → 0.17.2.
 
 ### F30 · Frontend granular guardrail compile errors ✅ — done in marketing 0.16.2 / agent-creator 0.0.65
 

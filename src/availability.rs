@@ -1,5 +1,12 @@
 //! Seller availability gates (M15.23.g).
 //!
+//! **F29 sweep:** marketing-specific by design. Takes
+//! `nexo_tool_meta::marketing::Seller` (CRM shape) directly.
+//! The window logic + IANA tz resolve is generic but
+//! introducing a `HasWorkingHours` trait abstraction for one
+//! consumer is overengineering — lift when 2nd consumer
+//! appears.
+//!
 //! Two layers of availability protection live on top of the
 //! routing dispatcher's seller assignment:
 //!

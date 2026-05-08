@@ -1,5 +1,11 @@
 //! Engagement tracking glue (M15.23.a.3).
 //!
+//! **F29 sweep:** marketing-specific by design. 60-LOC
+//! glue that uses `crate::tenant::TenantId` (marketing's
+//! own newtype). Generic primitives (token signer + HTML
+//! helpers + store trait) already in
+//! `nexo_microapp_sdk::tracking`.
+//!
 //! Wraps the SDK's `tracking` module (token signer + HTML
 //! helpers + sqlite store) into the per-tenant deps the
 //! marketing extension carries on its admin server, and

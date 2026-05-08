@@ -1,5 +1,11 @@
 //! WhatsApp inbound ingest (M15.23.e WA half).
 //!
+//! **F29 sweep:** marketing-specific by design. The
+//! subscriber pipeline is the consumer of SDK primitives
+//! (JID parser, identity stores, LID-PN mapping) — that's
+//! the right layering. `deterministic_person_id` is 6 LOC
+//! of uuid5; not worth a feature flag.
+//!
 //! Subscribes to `plugin.inbound.whatsapp.*` events
 //! published by `nexo-plugin-whatsapp`. We DON'T process
 //! the message body — that's the agent runtime's job —

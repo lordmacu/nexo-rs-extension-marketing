@@ -1,5 +1,11 @@
 //! Per-tenant topic guardrail handle (M15.23.d).
 //!
+//! **F29 sweep:** marketing-specific by design. Generic
+//! `GuardrailSet` / `GuardrailRule` / `GuardrailMatch` in
+//! `nexo_microapp_sdk::guardrails`. This module is a 1-line
+//! `Arc<ArcSwap<GuardrailSet>>` alias + 3 builders — lifting
+//! the alias adds abstraction without value.
+//!
 //! Wraps the SDK's `GuardrailSet` in an `arc_swap`-backed
 //! handle so `PUT /config/topic_guardrails` can hot-swap the
 //! compiled set under the broker hop without a process

@@ -1,6 +1,6 @@
 [package]
 name        = "nexo-rs-extension-marketing"
-version     = "0.17.1"
+version     = "0.17.2"
 edition     = "2021"
 rust-version = "1.80"
 license     = "MIT OR Apache-2.0"
@@ -21,12 +21,11 @@ path = "src/lib.rs"
 
 [features]
 default = []
-# F25 — cross-restart notification dedup via sled. Opt-in
-# because sled bloats the binary with an embedded KV store
-# even when the operator doesn't need persistence; in-memory
-# Mutex<HashMap> covers ~95% of the at-least-once threat
-# already.
-dedup-sled = ["dep:sled"]
+# F25 / F29 — cross-restart notification dedup via sled.
+# Forwards to the SDK's `dedup-sled` feature now that the
+# primitive lives in `nexo_microapp_sdk::dedup`. Opt-in
+# because sled bloats the binary; in-memory covers ~95 %.
+dedup-sled = ["nexo-microapp-sdk/dedup-sled"]
 
 [dependencies]
 # Async runtime + IO
@@ -50,9 +49,6 @@ uuid   = { version = "1", features = ["v4", "v5", "serde"] }
 # Error handling + observability
 anyhow    = "1"
 thiserror = "1"
-# F25 — cross-restart notification dedup. Opt-in via the
-# `dedup-sled` feature; default builds skip the dep.
-sled = { version = "0.34", optional = true }
 # M15.23.a.3 — short-hash helper for IP / UA fingerprints in the
 # tracking ingest routes (so we record dedupable identifiers
 # without retaining raw client IP/UA).
@@ -92,7 +88,7 @@ tower-http = { version = "0.5", features = ["cors", "trace"] }
 # Framework deps — path during dev, crates.io after publish.
 # The extension is sibling to nexo-rs-plugin-browser; same
 # pattern there points at ../proyecto for local hacking.
-nexo-microapp-sdk          = { path = "../proyecto/crates/microapp-sdk", features = ["identity", "routing", "enrichment", "plugin", "tracking-store", "scoring", "events", "guardrails", "templating"] }
+nexo-microapp-sdk          = { path = "../proyecto/crates/microapp-sdk", features = ["identity", "routing", "enrichment", "plugin", "tracking-store", "scoring", "events", "guardrails", "templating", "email-threading", "dedup"] }
 nexo-microapp-http         = { path = "../proyecto/crates/microapp-http" }
 nexo-tool-meta             = { path = "../proyecto/crates/tool-meta" }
 nexo-compliance-primitives = { path = "../proyecto/crates/compliance-primitives" }

@@ -1,5 +1,13 @@
 //! AI-decision audit log (M15.23.c).
 //!
+//! **F29 sweep:** marketing-specific by design.
+//! `AuditEvent` carries 5 CRM-shaped variants
+//! (`RoutingDecided` / `LeadTransitioned` /
+//! `NotificationPublished` / `TopicGuardrailFired` /
+//! `DuplicatePersonDetected`). The wrapper around the
+//! generic `EventStore<T>` (already in SDK) is 60 LOC of
+//! glue that doesn't justify a generic lift.
+//!
 //! Persists every routing decision, every state transition,
 //! every operator-notification publish to a tenant-scoped
 //! sqlite log. Compliance officer reads it through

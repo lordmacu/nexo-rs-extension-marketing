@@ -1,5 +1,12 @@
 //! Cross-channel duplicate person detector (M15.23.e).
 //!
+//! **F29 sweep:** marketing-specific by design. Orchestrator
+//! is CRM-flavoured (email_match / phone_match /
+//! name_company_fuzzy signals). Pure helpers
+//! (`normalize_name`, `name_jaccard`, `email_domain`) are
+//! 30 LOC and stay private — lift candidate when a 2nd
+//! consumer surfaces a use case for fuzzy text matching.
+//!
 //! Given a candidate [`Person`] (just resolved from an
 //! inbound email or WhatsApp contact), surfaces other
 //! `Person` records on the same tenant that may refer to
