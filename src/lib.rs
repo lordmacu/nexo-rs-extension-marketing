@@ -25,6 +25,7 @@ pub mod availability;
 pub mod broker;
 pub mod compliance;
 pub mod config;
+pub mod duplicate;
 pub mod enrichment;
 pub mod error;
 pub mod firehose;
