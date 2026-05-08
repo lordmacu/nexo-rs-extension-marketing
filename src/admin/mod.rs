@@ -111,6 +111,15 @@ pub struct AdminState {
     /// `None` ⇒ outbound publishes WITHOUT tracking signals
     /// (operator hasn't wired the secret yet).
     pub tracking_for_outbound: Option<Arc<crate::tracking::TrackingDeps>>,
+    /// M15.21 slice 4 — pluggable draft generator. The
+    /// `POST /leads/:id/drafts/generate` endpoint resolves
+    /// lead + seller + last inbound, hands the context to
+    /// this generator, and persists the response as a
+    /// pending draft row. `None` ⇒ the endpoint refuses
+    /// with `draft_generator_disabled` so deployments that
+    /// haven't wired one yet surface a clear error.
+    pub draft_generator:
+        Option<Arc<dyn crate::draft::DraftGenerator + Send + Sync>>,
 }
 
 impl AdminState {
@@ -129,6 +138,7 @@ impl AdminState {
             outbound: None,
             broker_sender: Arc::new(arc_swap::ArcSwapOption::empty()),
             tracking_for_outbound: None,
+            draft_generator: None,
         }
     }
 
@@ -258,6 +268,19 @@ impl AdminState {
         self
     }
 
+    /// M15.21 slice 4 — wire the draft generator. Boot
+    /// constructs a [`crate::draft::TemplateDraftGenerator`]
+    /// with the bundled default template; future wiring can
+    /// swap in `AgentDraftGenerator` (NATS-RPC to the bound
+    /// agent's LLM) without touching the admin surface.
+    pub fn with_draft_generator(
+        mut self,
+        gen: Arc<dyn crate::draft::DraftGenerator + Send + Sync>,
+    ) -> Self {
+        self.draft_generator = Some(gen);
+        self
+    }
+
     pub fn lookup_store(&self, tenant_id: &TenantId) -> Option<Arc<LeadStore>> {
         self.stores.get(tenant_id).cloned()
     }
@@ -292,6 +315,14 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route(
             "/leads/:lead_id/drafts/:message_id/approve",
             axum::routing::post(leads::approve_draft_handler),
+        )
+        // M15.21 slice 4 — operator-pull draft generation.
+        // Path is a sibling of the slice-1 collection so
+        // the static segment doesn't collide with the
+        // `:message_id` param.
+        .route(
+            "/leads/:lead_id/drafts/generate",
+            axum::routing::post(leads::generate_draft_handler),
         )
         .route(
             "/config/mailboxes",

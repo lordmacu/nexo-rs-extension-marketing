@@ -672,6 +672,195 @@ pub async fn delete_draft_handler(
     }
 }
 
+/// `POST /leads/:lead_id/drafts/generate` — operator-pull
+/// draft generation (M15.21 slice 4). Resolves the lead +
+/// seller + last inbound message, hands the structured
+/// context to the wired [`crate::draft::DraftGenerator`],
+/// and persists the response as a `direction = draft /
+/// status = pending` row. Returns the new draft so the
+/// frontend can render it without a follow-up GET.
+///
+/// Optional request body:
+/// ```json
+/// { "operator_hint": "focus on pricing", "from_label": "AI" }
+/// ```
+///
+/// Both fields are optional — `operator_hint` flows into
+/// the generator's `DraftContext` so the template / LLM
+/// can react; `from_label` defaults to `"AI"` so the lead
+/// drawer reads consistently.
+#[derive(Debug, Default, Deserialize)]
+pub struct GenerateDraftBody {
+    #[serde(default)]
+    pub operator_hint: Option<String>,
+    #[serde(default)]
+    pub from_label: Option<String>,
+}
+
+pub async fn generate_draft_handler(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path(lead_id): Path<String>,
+    payload: Option<Json<GenerateDraftBody>>,
+) -> Response {
+    use crate::lead::MessageDirection;
+
+    // ── Validate wiring ──────────────────────────────────────
+    let store = match state.lookup_store(&tenant_id) {
+        Some(s) => s,
+        None => return server_error("store_missing", "tenant store not mounted"),
+    };
+    let generator = match state.draft_generator.as_ref() {
+        Some(g) => g.clone(),
+        None => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "draft_generator_disabled",
+                "no DraftGenerator wired in AdminState — operator boot config missing `with_draft_generator`",
+            );
+        }
+    };
+    let sellers_lookup = match state.seller_lookup.as_ref() {
+        Some(l) => l.load_full(),
+        None => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "sellers_not_loaded",
+                "seller index not mounted on AdminState — operator hasn't saved sellers.yaml yet",
+            );
+        }
+    };
+
+    // ── Resolve lead ─────────────────────────────────────────
+    let lead_obj_id = LeadId(lead_id.clone());
+    let lead = match store.get(&lead_obj_id).await {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            return error(
+                StatusCode::NOT_FOUND,
+                "lead_not_found",
+                &format!("no lead with id {lead_id:?} for the active tenant"),
+            );
+        }
+        Err(e) => return marketing_error(e),
+    };
+    let seller = match sellers_lookup.get(&lead.seller_id) {
+        Some(s) => s.clone(),
+        None => {
+            return error(
+                StatusCode::NOT_FOUND,
+                "seller_not_found",
+                &format!(
+                    "seller {:?} bound to lead but missing from sellers.yaml",
+                    lead.seller_id.0,
+                ),
+            );
+        }
+    };
+
+    // ── Last inbound (best-effort, non-fatal) ───────────────
+    let last_inbound = match store.list_thread(&lead_obj_id).await {
+        Ok(messages) => messages
+            .into_iter()
+            .rev()
+            .find(|m| m.direction == MessageDirection::Inbound),
+        Err(e) => {
+            tracing::warn!(
+                target: "extension.marketing.draft_generate",
+                error = %e,
+                lead_id = %lead_id,
+                "thread fetch failed during draft generation; proceeding without inbound context"
+            );
+            None
+        }
+    };
+
+    let body_in = payload.map(|Json(b)| b).unwrap_or_default();
+
+    // ── Generate ────────────────────────────────────────────
+    let ctx = crate::draft::DraftContext {
+        lead,
+        seller,
+        last_inbound,
+        operator_hint: body_in
+            .operator_hint
+            .filter(|s| !s.trim().is_empty()),
+    };
+    let body = match generator.generate(&ctx).await {
+        Ok(b) => b,
+        Err(crate::draft::DraftGenError::TemplateParse(m)) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "template_invalid",
+                &format!("draft template parse error: {m}"),
+            );
+        }
+        Err(crate::draft::DraftGenError::TemplateRender(m)) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "template_render_error",
+                &format!("draft template render error: {m}"),
+            );
+        }
+        Err(crate::draft::DraftGenError::Backend(m)) => {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "generator_unavailable",
+                &format!("draft generator backend refused: {m}"),
+            );
+        }
+        Err(crate::draft::DraftGenError::Empty) => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "generator_empty_body",
+                "draft generator returned an empty body",
+            );
+        }
+    };
+
+    // ── Persist as pending draft ────────────────────────────
+    let message_id = format!("draft-{}", uuid::Uuid::new_v4());
+    let from_label = body_in
+        .from_label
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "AI".into());
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let new_msg = crate::lead::NewThreadMessage {
+        message_id: message_id.clone(),
+        direction: MessageDirection::Draft,
+        from_label,
+        body,
+        at_ms: now_ms,
+        draft_status: Some(crate::lead::DraftStatus::Pending),
+    };
+    if let Err(e) = store.append_thread_message(&lead_obj_id, new_msg).await {
+        return marketing_error(e);
+    }
+
+    // Read back the canonical row so the response shape
+    // matches `create_draft_handler` — the frontend can
+    // render the new draft without a follow-up GET.
+    let drafts = match store
+        .list_drafts(&lead_obj_id, Some(crate::lead::DraftStatus::Pending))
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => return marketing_error(e),
+    };
+    let row = drafts.into_iter().find(|d| d.id == message_id);
+    match row {
+        Some(d) => (
+            StatusCode::CREATED,
+            Json(json!({ "ok": true, "result": { "draft": d } })),
+        )
+            .into_response(),
+        None => server_error(
+            "draft_persist_inconsistency",
+            "draft inserted but read-back failed to find it",
+        ),
+    }
+}
+
 fn parse_draft_status(s: &str) -> Option<crate::lead::DraftStatus> {
     match s {
         "pending" => Some(crate::lead::DraftStatus::Pending),
@@ -876,5 +1065,246 @@ mod tests {
         let app = router(state);
         let resp = app.oneshot(req("/leads/ghost/thread")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── M15.21 slice 4 — `POST /leads/:id/drafts/generate` ────
+
+    /// Build an `AdminState` with the lead seeded (seller `v`)
+    /// + a seller_lookup carrying `v` + a wired draft generator.
+    /// Returns the inner store so tests can seed inbound rows.
+    async fn build_state_with_generator() -> (Arc<AdminState>, Arc<LeadStore>) {
+        use crate::notification::seller_lookup_from_list;
+        use nexo_tool_meta::marketing::{Seller, TenantIdRef};
+
+        let store = LeadStore::open(
+            PathBuf::from(":memory:"),
+            TenantId::new("acme").unwrap(),
+        )
+        .await
+        .unwrap();
+        store
+            .create(NewLead {
+                id: LeadId("l-1".into()),
+                thread_id: "th-1".into(),
+                subject: "Cot pricing".into(),
+                person_id: PersonId("juan@acme.com".into()),
+                seller_id: SellerId("v".into()),
+                last_activity_ms: 1,
+                score: 0,
+                topic_tags: vec![],
+                why_routed: vec!["fixture".into()],
+            })
+            .await
+            .unwrap();
+        let store = Arc::new(store);
+        let sellers = seller_lookup_from_list(vec![Seller {
+            id: SellerId("v".into()),
+            tenant_id: TenantIdRef("acme".into()),
+            name: "Pedro García".into(),
+            primary_email: "pedro@acme.com".into(),
+            alt_emails: vec![],
+            signature_text: "—\nPedro · Acme".into(),
+            working_hours: None,
+            on_vacation: false,
+            vacation_until: None,
+            preferred_language: Some("es".into()),
+            agent_id: None,
+            model_override: None,
+            notification_settings: None,
+            smtp_credential: None,
+        }]);
+        let gen: Arc<dyn crate::draft::DraftGenerator + Send + Sync> = Arc::new(
+            crate::draft::TemplateDraftGenerator::with_default_template(),
+        );
+        let state = Arc::new(
+            AdminState::new("secret".into())
+                .with_store(store.clone())
+                .with_seller_lookup(sellers)
+                .with_draft_generator(gen),
+        );
+        (state, store)
+    }
+
+    fn post(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .header("X-Tenant-Id", "acme")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn generate_creates_pending_draft_with_default_template() {
+        let (state, _store) = build_state_with_generator().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(post("/leads/l-1/drafts/generate", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["ok"], true);
+        let draft = &v["result"]["draft"];
+        assert_eq!(draft["direction"], "draft");
+        assert_eq!(draft["draft_status"], "pending");
+        assert_eq!(draft["from_label"], "AI");
+        let body = draft["body"].as_str().unwrap();
+        assert!(body.contains("Cot pricing"));
+        assert!(body.contains("Pedro García"));
+    }
+
+    #[tokio::test]
+    async fn generate_uses_inbound_when_thread_has_one() {
+        use crate::lead::{MessageDirection, NewThreadMessage};
+        let (state, store) = build_state_with_generator().await;
+        store
+            .append_thread_message(
+                &LeadId("l-1".into()),
+                NewThreadMessage {
+                    message_id: "m1".into(),
+                    direction: MessageDirection::Inbound,
+                    from_label: "Juan".into(),
+                    body: "¿Cuánto cuesta?".into(),
+                    at_ms: 100,
+                    draft_status: None,
+                },
+            )
+            .await
+            .unwrap();
+        let app = router(state);
+        let resp = app
+            .oneshot(post("/leads/l-1/drafts/generate", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let v = body_to_json(resp).await;
+        let body = v["result"]["draft"]["body"].as_str().unwrap();
+        // Default template references the inbound author.
+        assert!(body.contains("Hola Juan,"));
+        assert!(body.contains("¿Cuánto cuesta?"));
+    }
+
+    #[tokio::test]
+    async fn generate_passes_operator_hint_through_to_template() {
+        let (state, _store) = build_state_with_generator().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(post(
+                "/leads/l-1/drafts/generate",
+                serde_json::json!({ "operator_hint": "Mencionar promo de mayo" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let v = body_to_json(resp).await;
+        let body = v["result"]["draft"]["body"].as_str().unwrap();
+        assert!(body.contains("Mencionar promo de mayo"));
+    }
+
+    #[tokio::test]
+    async fn generate_respects_custom_from_label() {
+        let (state, _store) = build_state_with_generator().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(post(
+                "/leads/l-1/drafts/generate",
+                serde_json::json!({ "from_label": "Pedro auto" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["result"]["draft"]["from_label"], "Pedro auto");
+    }
+
+    #[tokio::test]
+    async fn generate_returns_503_when_generator_not_wired() {
+        let state = build_state_with_lead().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(post("/leads/l-1/drafts/generate", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["error"]["code"], "draft_generator_disabled");
+    }
+
+    #[tokio::test]
+    async fn generate_returns_404_for_missing_lead() {
+        let (state, _store) = build_state_with_generator().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(post("/leads/ghost/drafts/generate", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["error"]["code"], "lead_not_found");
+    }
+
+    #[tokio::test]
+    async fn generate_returns_500_when_template_renders_empty() {
+        // Wire a generator with a whitespace-only template
+        // so the renderer trips the `Empty` guard.
+        use crate::notification::seller_lookup_from_list;
+        use nexo_tool_meta::marketing::{Seller, TenantIdRef};
+        let store = LeadStore::open(
+            PathBuf::from(":memory:"),
+            TenantId::new("acme").unwrap(),
+        )
+        .await
+        .unwrap();
+        store
+            .create(NewLead {
+                id: LeadId("l-1".into()),
+                thread_id: "th-1".into(),
+                subject: "S".into(),
+                person_id: PersonId("p".into()),
+                seller_id: SellerId("v".into()),
+                last_activity_ms: 1,
+                score: 0,
+                topic_tags: vec![],
+                why_routed: vec![],
+            })
+            .await
+            .unwrap();
+        let sellers = seller_lookup_from_list(vec![Seller {
+            id: SellerId("v".into()),
+            tenant_id: TenantIdRef("acme".into()),
+            name: "Pedro".into(),
+            primary_email: "p@x.com".into(),
+            alt_emails: vec![],
+            signature_text: String::new(),
+            working_hours: None,
+            on_vacation: false,
+            vacation_until: None,
+            preferred_language: None,
+            agent_id: None,
+            model_override: None,
+            notification_settings: None,
+            smtp_credential: None,
+        }]);
+        let gen: Arc<dyn crate::draft::DraftGenerator + Send + Sync> =
+            Arc::new(crate::draft::TemplateDraftGenerator::new(
+                "   \n   ".into(),
+            ));
+        let state = Arc::new(
+            AdminState::new("secret".into())
+                .with_store(Arc::new(store))
+                .with_seller_lookup(sellers)
+                .with_draft_generator(gen),
+        );
+        let app = router(state);
+        let resp = app
+            .oneshot(post("/leads/l-1/drafts/generate", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["error"]["code"], "generator_empty_body");
     }
 }

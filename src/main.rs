@@ -303,6 +303,18 @@ async fn main() -> anyhow::Result<()> {
         arc_swap::ArcSwapOption<nexo_microapp_sdk::plugin::BrokerSender>,
     > = Arc::new(arc_swap::ArcSwapOption::empty());
 
+    // ─── Draft generator (M15.21 slice 4) ─────────────────────
+    // Default impl: sandboxed-Handlebars rendering of the
+    // bundled template. Future deployments swap in
+    // `AgentDraftGenerator` (NATS-RPC to the bound agent's
+    // LLM) by replacing this Arc — admin surface stays the
+    // same since both impls satisfy `DraftGenerator`.
+    let draft_generator: Arc<
+        dyn nexo_marketing::draft::DraftGenerator + Send + Sync,
+    > = Arc::new(
+        nexo_marketing::draft::TemplateDraftGenerator::with_default_template(),
+    );
+
     // ─── Surface 1: HTTP admin ────────────────────────────────
     let mut admin_state_builder = AdminState::new(bearer)
         .with_store(lead_store.clone())
@@ -314,7 +326,8 @@ async fn main() -> anyhow::Result<()> {
         .with_audit(audit_log.clone())
         .with_guardrails(guardrails.clone())
         .with_outbound(outbound_publisher.clone())
-        .with_broker_sender_cell(broker_sender_cell.clone());
+        .with_broker_sender_cell(broker_sender_cell.clone())
+        .with_draft_generator(draft_generator);
     if let Some(deps) = tracking_deps.clone() {
         admin_state_builder = admin_state_builder
             .with_tracking(deps.clone())
