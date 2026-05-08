@@ -227,6 +227,8 @@ async fn resolve_person(
 fn route_inbound(
     parsed: &ParsedInbound,
     router: &LeadRouter,
+    sellers: Option<&SellerLookup>,
+    now_utc: chrono::DateTime<chrono::Utc>,
 ) -> Result<(Option<SellerId>, Vec<String>), crate::error::MarketingError> {
     let inputs = RouteInputs {
         sender_email: Some(parsed.from_email.clone()),
@@ -248,6 +250,23 @@ fn route_inbound(
             if let Some(r) = matched_rule_id {
                 audit.push(format!("rule:{r}"));
             }
+            // M15.23.g — availability gate. When the matched
+            // seller is on vacation or outside their working
+            // hours, fall through to `unassigned` with an
+            // audit reason so the operator UI can surface
+            // why the lead landed in the no-owner queue.
+            if let Some(lookup) = sellers {
+                if let Some(seller) = resolve_seller(lookup, &seller_id) {
+                    let outcome = crate::availability::check(&seller, now_utc);
+                    if !outcome.is_available() {
+                        if let Some(reason) = outcome.audit_reason() {
+                            audit.push(format!("seller:{}:{}", seller_id.0, reason));
+                        }
+                        audit.push("availability_fallback_unassigned".into());
+                        return Ok((Some(SellerId("unassigned".into())), audit));
+                    }
+                }
+            }
             (Some(seller_id), audit)
         }
         RouteOutcome::Drop {
@@ -267,6 +286,20 @@ fn route_inbound(
             (Some(SellerId("unassigned".into())), audit)
         }
     })
+}
+
+/// Snapshot the seller record for the matched id off the
+/// arc_swap-backed lookup. Returns `None` when the operator
+/// removed the seller after the rule was authored — gate
+/// then defaults to "available" because we have no record to
+/// evaluate against (matches the existing
+/// `lookup-misses-fall-through-to-route` posture).
+fn resolve_seller(
+    lookup: &SellerLookup,
+    seller_id: &SellerId,
+) -> Option<nexo_tool_meta::marketing::Seller> {
+    let snapshot = lookup.load_full();
+    snapshot.get(seller_id).cloned()
 }
 
 /// Build a `NewThreadMessage` from a parsed inbound. Uses the
@@ -502,7 +535,7 @@ pub async fn handle_inbound_event(
 
     // ─── Router pass ──────────────────────────────────────────
     let (seller_id, mut why_routed) = match router {
-        Some(r) => match route_inbound(&parsed, r) {
+        Some(r) => match route_inbound(&parsed, r, sellers, Utc::now()) {
             Ok((Some(v), why)) => (v, why),
             Ok((None, why)) => {
                 tracing::info!(
@@ -729,6 +762,136 @@ mod tests {
                 },
             },
         )
+    }
+
+    fn seller_lookup_with(seller: nexo_tool_meta::marketing::Seller) -> SellerLookup {
+        let mut map = std::collections::HashMap::new();
+        map.insert(seller.id.clone(), seller);
+        std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(map))
+    }
+
+    fn pedro_seller(on_vacation: bool) -> nexo_tool_meta::marketing::Seller {
+        use nexo_tool_meta::marketing::{
+            Seller, SellerId, SellerNotificationSettings, TenantIdRef,
+        };
+        Seller {
+            id: SellerId("pedro".into()),
+            tenant_id: TenantIdRef("acme".into()),
+            name: "pedro".into(),
+            primary_email: "pedro@acme.com".into(),
+            alt_emails: vec![],
+            signature_text: String::new(),
+            working_hours: None,
+            on_vacation,
+            vacation_until: None,
+            preferred_language: None,
+            agent_id: None,
+            notification_settings: Some(SellerNotificationSettings::default()),
+            model_override: None,
+        }
+    }
+
+    fn pedro_router(t: &TenantId) -> LeadRouter {
+        LeadRouter::new(
+            t.clone(),
+            RuleSet {
+                tenant_id: TenantIdRef(t.as_str().into()),
+                version: 0,
+                rules: Vec::new(),
+                default_target: AssignTarget::Seller {
+                    id: SellerId("pedro".into()),
+                },
+            },
+        )
+    }
+
+    fn parsed_minimal() -> ParsedInbound {
+        ParsedInbound {
+            instance: "default".into(),
+            account_id: "ventas".into(),
+            uid: 1,
+            from_email: "cliente@empresa.com".into(),
+            from_display_name: None,
+            to_emails: vec![],
+            reply_to: None,
+            subject: "Cotización".into(),
+            message_id: Some("m1@e".into()),
+            in_reply_to: None,
+            references: vec![],
+            body_excerpt: "hola".into(),
+            thread_id: "m1@e".into(),
+            from_domain_kind:
+                nexo_microapp_sdk::enrichment::DomainKind::Corporate,
+        }
+    }
+
+    #[test]
+    fn vacation_seller_falls_through_to_unassigned() {
+        let tenant = TenantId::new("acme").unwrap();
+        let router = pedro_router(&tenant);
+        let lookup = seller_lookup_with(pedro_seller(true));
+        let parsed = parsed_minimal();
+        let now = chrono::Utc::now();
+        let (sid, why) =
+            route_inbound(&parsed, &router, Some(&lookup), now).unwrap();
+        assert_eq!(sid.as_ref().map(|s| s.0.as_str()), Some("unassigned"));
+        assert!(
+            why.iter().any(|w| w.starts_with("seller:pedro:on_vacation")),
+            "missing vacation reason in audit: {why:?}",
+        );
+        assert!(
+            why.iter()
+                .any(|w| w == "availability_fallback_unassigned"),
+            "missing fallback marker: {why:?}",
+        );
+    }
+
+    #[test]
+    fn available_seller_keeps_assignment() {
+        let tenant = TenantId::new("acme").unwrap();
+        let router = pedro_router(&tenant);
+        // No working_hours + not on vacation ⇒ always available.
+        let lookup = seller_lookup_with(pedro_seller(false));
+        let parsed = parsed_minimal();
+        let now = chrono::Utc::now();
+        let (sid, why) =
+            route_inbound(&parsed, &router, Some(&lookup), now).unwrap();
+        assert_eq!(sid.as_ref().map(|s| s.0.as_str()), Some("pedro"));
+        assert!(
+            !why.iter()
+                .any(|w| w.starts_with("availability_fallback")),
+            "should not have triggered fallback: {why:?}",
+        );
+    }
+
+    #[test]
+    fn unknown_seller_lookup_miss_keeps_assignment() {
+        // Operator removed `pedro` after authoring the rule —
+        // gate has no record to evaluate, defaults to "available"
+        // so the lead still threads through.
+        let tenant = TenantId::new("acme").unwrap();
+        let router = pedro_router(&tenant);
+        let empty: SellerLookup = std::sync::Arc::new(
+            arc_swap::ArcSwap::from_pointee(std::collections::HashMap::new()),
+        );
+        let parsed = parsed_minimal();
+        let now = chrono::Utc::now();
+        let (sid, _) =
+            route_inbound(&parsed, &router, Some(&empty), now).unwrap();
+        assert_eq!(sid.as_ref().map(|s| s.0.as_str()), Some("pedro"));
+    }
+
+    #[test]
+    fn no_seller_lookup_keeps_assignment() {
+        // Backwards-compat: tests + minimal setups skip the
+        // lookup; gate is not enforced.
+        let tenant = TenantId::new("acme").unwrap();
+        let router = pedro_router(&tenant);
+        let parsed = parsed_minimal();
+        let now = chrono::Utc::now();
+        let (sid, _) =
+            route_inbound(&parsed, &router, None, now).unwrap();
+        assert_eq!(sid.as_ref().map(|s| s.0.as_str()), Some("pedro"));
     }
 
     fn raw_email() -> Vec<u8> {

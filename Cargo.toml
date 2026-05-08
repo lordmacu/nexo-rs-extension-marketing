@@ -1,6 +1,6 @@
 [package]
 name        = "nexo-rs-extension-marketing"
-version     = "0.14.2"
+version     = "0.14.3"
 edition     = "2021"
 rust-version = "1.80"
 license     = "MIT OR Apache-2.0"
@@ -32,6 +32,10 @@ serde_bytes = "0.11"
 
 # Time + IDs
 chrono = { version = "0.4", features = ["serde"] }
+# M15.23.g — IANA timezone database for the seller working-
+# hours gate. `default-features` keeps the bundled tzdata so
+# the crate works without /usr/share/zoneinfo present.
+chrono-tz = { version = "0.10", features = ["serde"] }
 uuid   = { version = "1", features = ["v4", "v5", "serde"] }
 
 # Error handling + observability
