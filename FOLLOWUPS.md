@@ -139,15 +139,14 @@ filtro" button that strips the URL param.
   topic) or 30s polling.
 - **Effort:** depends on approach.
 
-### F17 · Agent UI doesn't surface `marketing` binding distinctly
+### F17 · Marketing binding distinctly surfaced ✅ — done in M15.49
 
-- **Origin:** M15.37
-- **Status:** the auto-bound `{plugin: "marketing", instance: pedro}`
-  renders as a generic binding row in the agent UI — no link
-  back to the seller.
-- **Plan:** detect `plugin === "marketing"` + render "Email
-  channel via seller X" with deeplink.
-- **Effort:** ~50 LOC.
+`Agents.tsx` edit modal's "Bindings" section now branches on
+`plugin === "marketing"` and renders a violet `📧 Email · vía
+seller pedro` row instead of the generic mono `marketing ·
+pedro`. Click the seller id → deeplinks to
+`/m/marketing/settings/sellers?agent_id=<id>` (reuses M15.46
+filter). Other plugins keep the original mono row.
 
 ## ⚪ Resolved during M15.39
 
