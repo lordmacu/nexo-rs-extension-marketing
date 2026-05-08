@@ -239,20 +239,57 @@ Tests: 365/365 default features · 373/373 with
 
 Bump 0.17.0 → 0.17.1.
 
-### F26 · Sandboxed Handlebars feature
+### F26 · Sandboxed Handlebars feature ✅ — done in SDK 0.1.12
 
-- **Origin:** M15.23.b — current renderer is mustache-lite
-  (`{{path.to.field}}` only). Spec called for "sandboxed
-  Handlebars" with full conditionals + loops; the slim
-  slice covers ~80% of operator templates without the
-  helper machinery.
-- **Plan:** new `templating-handlebars` feature on the SDK
-  pulling `handlebars` crate. `Template::render_with_helpers`
-  variant. Custom `compile` step rejects helpers with IO
-  side-effects.
-- **Effort:** ~200 LOC + new dep + 10-15 tests.
-- **Priority:** low — operator templates haven't outgrown
-  mustache-lite yet.
+`nexo_microapp_sdk::templating::handlebars` (gated by
+`templating-handlebars`, additive on top of `templating`).
+Pulls `handlebars = "5"` with `default-features = false`
+so the dep tree stays narrow.
+
+`render_handlebars(template, ctx) -> Result<String,
+HandlebarsRenderError>`. Each call builds a fresh
+`Handlebars` instance — stateless, thread-safe, no
+cross-call leakage.
+
+Sandbox guards (3):
+1. **No custom helpers.** Only built-ins (`if` / `else` /
+   `unless` / `each` / `with` / `lookup` / `log`); none
+   touch fs/network/process state.
+2. **No partial loading.** `{{> partial}}` fails as
+   `HandlebarsRenderError::Render` because nothing is
+   registered. `dev_mode` explicitly OFF.
+3. **Lenient missing keys.** `strict_mode` OFF so a typo
+   renders an empty string instead of crashing the
+   pipeline.
+
+`HandlebarsRenderError` typed enum (`Parse` vs `Render`)
+for operator UX — parse errors mean bad syntax, render
+errors mean missing helpers / partials.
+
+Convenience wrappers:
+- `render_template(&Template, ctx)`
+- `render_snippet(&Snippet, ctx)`
+
+17 unit tests cover: simple substitution, `{{#if}}` /
+`{{#unless}}` branches, `{{#each}}` with `@index`,
+`{{#with}}` scoping, default HTML escape + `{{{raw}}}`
+opt-out, missing-key lenient rendering, unregistered
+partial rejection, malformed template parse error,
+dotted-path resolution, nested if+each composition,
+typed `Template`/`Snippet` helpers, empty body, array
+`lookup` helper.
+
+Total templating suite: 27/27 (10 mustache-lite +
+17 handlebars). SDK 360 → 377.
+
+Caveat: marketing extension does NOT consume yet — the
+draft pipeline (M22) is the natural first consumer. The
+`Template`/`Snippet` storage already shipped in M15.23.b
+will keep both renderers — operators pick which to use
+when they author the template. Storage stays format-
+agnostic.
+
+Bump SDK 0.1.11 → 0.1.12.
 
 ### F6 · Reconciler walk affected agents only ✅ — done in M15.51-2
 
