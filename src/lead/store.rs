@@ -83,11 +83,20 @@ CREATE TABLE IF NOT EXISTS thread_messages (
     body         TEXT NOT NULL,
     at_ms        INTEGER NOT NULL,
     draft_status TEXT,
+    subject      TEXT,
     PRIMARY KEY (tenant_id, lead_id, message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_thread_messages_lead
     ON thread_messages(tenant_id, lead_id, at_ms);
 "#;
+
+/// Idempotent ALTER for existing DBs that pre-date the
+/// `subject` column. SQLite returns "duplicate column
+/// name" when re-running on a fresh schema (column already
+/// present from MIGRATION_SQL above) — we swallow that
+/// case and propagate any other error.
+const MIGRATION_SQL_ADD_SUBJECT: &str =
+    "ALTER TABLE thread_messages ADD COLUMN subject TEXT";
 
 /// Per-tenant lead store. The struct holds its tenant id +
 /// pool; `Clone` is cheap (Arc-shared pool) so callers spawn
@@ -111,6 +120,18 @@ impl LeadStore {
     ) -> Result<Self, MarketingError> {
         let pool = open_pool(state_root.as_ref(), &tenant_id).await?;
         sqlx::query(MIGRATION_SQL).execute(&pool).await?;
+        // Idempotent column-add for existing DBs created
+        // before `subject` landed. New DBs already have it
+        // from MIGRATION_SQL — the duplicate-column error
+        // is the success signal there.
+        if let Err(e) =
+            sqlx::query(MIGRATION_SQL_ADD_SUBJECT).execute(&pool).await
+        {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(MarketingError::Sqlite(e));
+            }
+        }
         Ok(Self { pool, tenant_id })
     }
 
@@ -383,8 +404,8 @@ impl LeadStore {
     ) -> Result<(), MarketingError> {
         sqlx::query(
             "INSERT INTO thread_messages \
-             (tenant_id, lead_id, message_id, direction, from_label, body, at_ms, draft_status) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             (tenant_id, lead_id, message_id, direction, from_label, body, at_ms, draft_status, subject) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(tenant_id, lead_id, message_id) DO NOTHING",
         )
         .bind(self.tenant_id.as_str())
@@ -395,6 +416,7 @@ impl LeadStore {
         .bind(&msg.body)
         .bind(msg.at_ms)
         .bind(msg.draft_status.map(draft_status_str))
+        .bind(msg.subject.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -418,6 +440,31 @@ impl LeadStore {
                AND direction = 'draft' AND draft_status = 'pending'",
         )
         .bind(body)
+        .bind(self.tenant_id.as_str())
+        .bind(&lead_id.0)
+        .bind(message_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// Set / clear a draft's subject override. Same lock
+    /// semantics as `update_draft_body` — only `pending`
+    /// drafts mutate. Pass `None` to clear and inherit
+    /// the lead subject at approve time.
+    pub async fn update_draft_subject(
+        &self,
+        lead_id: &LeadId,
+        message_id: &str,
+        subject: Option<&str>,
+    ) -> Result<u64, MarketingError> {
+        let r = sqlx::query(
+            "UPDATE thread_messages \
+             SET subject = ? \
+             WHERE tenant_id = ? AND lead_id = ? AND message_id = ? \
+               AND direction = 'draft' AND draft_status = 'pending'",
+        )
+        .bind(subject)
         .bind(self.tenant_id.as_str())
         .bind(&lead_id.0)
         .bind(message_id)
@@ -483,7 +530,7 @@ impl LeadStore {
         let rows: Vec<ThreadMessageRow> = match status_filter {
             Some(status) => {
                 sqlx::query_as(
-                    "SELECT message_id, direction, from_label, body, at_ms, draft_status \
+                    "SELECT message_id, direction, from_label, body, at_ms, draft_status, subject \
                      FROM thread_messages \
                      WHERE tenant_id = ? AND lead_id = ? \
                        AND direction = 'draft' AND draft_status = ? \
@@ -497,7 +544,7 @@ impl LeadStore {
             }
             None => {
                 sqlx::query_as(
-                    "SELECT message_id, direction, from_label, body, at_ms, draft_status \
+                    "SELECT message_id, direction, from_label, body, at_ms, draft_status, subject \
                      FROM thread_messages \
                      WHERE tenant_id = ? AND lead_id = ? AND direction = 'draft' \
                      ORDER BY at_ms ASC, message_id ASC",
@@ -520,7 +567,7 @@ impl LeadStore {
         lead_id: &LeadId,
     ) -> Result<Vec<ThreadMessage>, MarketingError> {
         let rows: Vec<ThreadMessageRow> = sqlx::query_as(
-            "SELECT message_id, direction, from_label, body, at_ms, draft_status \
+            "SELECT message_id, direction, from_label, body, at_ms, draft_status, subject \
              FROM thread_messages \
              WHERE tenant_id = ? AND lead_id = ? \
              ORDER BY at_ms ASC, message_id ASC",
@@ -544,6 +591,10 @@ pub struct NewThreadMessage {
     pub body: String,
     pub at_ms: i64,
     pub draft_status: Option<DraftStatus>,
+    /// Operator-supplied subject override. Drafts only.
+    /// `None` ⇒ approve handler inherits the lead's
+    /// subject (with `Re:` prefix when missing).
+    pub subject: Option<String>,
 }
 
 /// Wire-equivalent thread message exposed via `/leads/:id/thread`.
@@ -559,6 +610,10 @@ pub struct ThreadMessage {
     pub at_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub draft_status: Option<DraftStatus>,
+    /// Operator-supplied subject override (drafts). `None`
+    /// ⇒ inherit lead subject at approve time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
 }
 
 #[derive(
@@ -651,6 +706,7 @@ struct ThreadMessageRow {
     body: String,
     at_ms: i64,
     draft_status: Option<String>,
+    subject: Option<String>,
 }
 
 impl From<ThreadMessageRow> for ThreadMessage {
@@ -671,6 +727,7 @@ impl From<ThreadMessageRow> for ThreadMessage {
                 "rejected" => Some(DraftStatus::Rejected),
                 _ => None,
             }),
+            subject: r.subject,
         }
     }
 }
@@ -967,7 +1024,7 @@ mod tests {
             from_label: "Cliente".into(),
             body: body.into(),
             at_ms: at,
-            draft_status: None,
+            draft_status: None, subject: None,
         }
     }
 
@@ -1021,7 +1078,7 @@ mod tests {
                 from_label: "AI".into(),
                 body: "draft body".into(),
                 at_ms: 5,
-                draft_status: Some(DraftStatus::Pending),
+                draft_status: Some(DraftStatus::Pending), subject: None,
             },
         )
         .await
@@ -1048,7 +1105,7 @@ mod tests {
                 from_label: "AI".into(),
                 body: body.into(),
                 at_ms: 1,
-                draft_status: Some(status),
+                draft_status: Some(status), subject: None,
             },
         )
         .await
@@ -1150,7 +1207,7 @@ mod tests {
                 from_label: "Pedro".into(),
                 body: "real reply".into(),
                 at_ms: 1,
-                draft_status: None,
+                draft_status: None, subject: None,
             },
         )
         .await
@@ -1177,6 +1234,7 @@ mod tests {
                     body: format!("body {i}"),
                     at_ms: *i as i64,
                     draft_status: Some(*status),
+                    subject: None,
                 },
             )
             .await
@@ -1211,7 +1269,7 @@ mod tests {
                     from_label: "x".into(),
                     body: "x".into(),
                     at_ms: 1,
-                    draft_status: status,
+                    draft_status: status, subject: None,
                 },
             )
             .await
@@ -1237,7 +1295,7 @@ mod tests {
                 from_label: "AI".into(),
                 body: "acme body".into(),
                 at_ms: 1,
-                draft_status: Some(DraftStatus::Pending),
+                draft_status: Some(DraftStatus::Pending), subject: None,
             },
         )
         .await
@@ -1254,7 +1312,7 @@ mod tests {
                     from_label: "AI".into(),
                     body: "globex body".into(),
                     at_ms: 1,
-                    draft_status: Some(DraftStatus::Pending),
+                    draft_status: Some(DraftStatus::Pending), subject: None,
                 },
             )
             .await
@@ -1283,7 +1341,7 @@ mod tests {
                 from_label: "AI".into(),
                 body: "p1".into(),
                 at_ms: 1,
-                draft_status: Some(DraftStatus::Pending),
+                draft_status: Some(DraftStatus::Pending), subject: None,
             },
         )
         .await
@@ -1296,7 +1354,7 @@ mod tests {
                 from_label: "AI".into(),
                 body: "p2".into(),
                 at_ms: 2,
-                draft_status: Some(DraftStatus::Pending),
+                draft_status: Some(DraftStatus::Pending), subject: None,
             },
         )
         .await
@@ -1310,7 +1368,7 @@ mod tests {
                 from_label: "AI".into(),
                 body: "p3".into(),
                 at_ms: 3,
-                draft_status: Some(DraftStatus::Approved),
+                draft_status: Some(DraftStatus::Approved), subject: None,
             },
         )
         .await
@@ -1324,7 +1382,7 @@ mod tests {
                 from_label: "Cliente".into(),
                 body: "hi".into(),
                 at_ms: 4,
-                draft_status: None,
+                draft_status: None, subject: None,
             },
         )
         .await
@@ -1354,7 +1412,7 @@ mod tests {
                         from_label: "AI".into(),
                         body: "x".into(),
                         at_ms: 1,
-                        draft_status: Some(DraftStatus::Pending),
+                        draft_status: Some(DraftStatus::Pending), subject: None,
                     },
                 )
                 .await
@@ -1378,7 +1436,7 @@ mod tests {
                 from_label: "AI".into(),
                 body: "older".into(),
                 at_ms: 100,
-                draft_status: Some(DraftStatus::Pending),
+                draft_status: Some(DraftStatus::Pending), subject: None,
             },
         )
         .await
@@ -1391,7 +1449,7 @@ mod tests {
                 from_label: "AI".into(),
                 body: "newer".into(),
                 at_ms: 300,
-                draft_status: Some(DraftStatus::Pending),
+                draft_status: Some(DraftStatus::Pending), subject: None,
             },
         )
         .await
@@ -1404,7 +1462,7 @@ mod tests {
                 from_label: "AI".into(),
                 body: "approved".into(),
                 at_ms: 200,
-                draft_status: Some(DraftStatus::Approved),
+                draft_status: Some(DraftStatus::Approved), subject: None,
             },
         )
         .await
@@ -1433,6 +1491,7 @@ mod tests {
                     body: format!("body-{i}"),
                     at_ms: i as i64 + 1,
                     draft_status: Some(DraftStatus::Pending),
+                    subject: None,
                 },
             )
             .await
@@ -1460,7 +1519,7 @@ mod tests {
                     from_label: "AI".into(),
                     body: body.into(),
                     at_ms: 1,
-                    draft_status: Some(DraftStatus::Pending),
+                    draft_status: Some(DraftStatus::Pending), subject: None,
                 },
             )
             .await
@@ -1494,7 +1553,7 @@ mod tests {
                     from_label: "x".into(),
                     body: "x".into(),
                     at_ms,
-                    draft_status: None,
+                    draft_status: None, subject: None,
                 },
             )
             .await

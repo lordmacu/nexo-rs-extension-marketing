@@ -320,6 +320,7 @@ fn inbound_message_from_parsed(parsed: &ParsedInbound, fallback_at_ms: i64) -> N
         body: parsed.body_excerpt.clone(),
         at_ms: fallback_at_ms,
         draft_status: None,
+        subject: None,
     }
 }
 

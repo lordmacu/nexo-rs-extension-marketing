@@ -193,8 +193,8 @@ pub async fn list_drafts_handler(
 #[derive(Debug, Deserialize)]
 pub struct CreateDraftBody {
     /// Required — body of the proposed reply. Subject is
-    /// inherited from the lead row at send time (M15.21
-    /// slice 2); operator can override later via PUT.
+    /// inherited from the lead row at send time when no
+    /// override is supplied here.
     pub body: String,
     /// Optional operator-facing label. Defaults to "AI" so
     /// the lead drawer reads consistently regardless of
@@ -202,6 +202,11 @@ pub struct CreateDraftBody {
     /// auto-template).
     #[serde(default)]
     pub from_label: Option<String>,
+    /// Optional subject override. When `Some`, the approve
+    /// handler honors this verbatim instead of inheriting
+    /// the lead's subject + the `Re:` prefix.
+    #[serde(default)]
+    pub subject: Option<String>,
 }
 
 /// `POST /leads/:lead_id/drafts` — body `{ body, from_label? }`.
@@ -240,6 +245,11 @@ pub async fn create_draft_handler(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "AI".into());
     let now_ms = chrono::Utc::now().timestamp_millis();
+    let subject = payload
+        .subject
+        .clone()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let new_msg = crate::lead::NewThreadMessage {
         message_id: message_id.clone(),
         direction: crate::lead::MessageDirection::Draft,
@@ -247,6 +257,7 @@ pub async fn create_draft_handler(
         body: payload.body,
         at_ms: now_ms,
         draft_status: Some(crate::lead::DraftStatus::Pending),
+        subject,
     };
     if let Err(e) = store.append_thread_message(&id, new_msg).await {
         return marketing_error(e);
@@ -275,12 +286,26 @@ pub async fn create_draft_handler(
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateDraftBody {
+    /// Draft body. Required + non-empty when present;
+    /// caller still always sends body even if only changing
+    /// subject (avoids two endpoints).
     pub body: String,
+    /// Optional subject mutation. Three cases:
+    /// - field absent ⇒ leave subject untouched.
+    /// - empty / whitespace ⇒ clear the subject (revert to
+    ///   inheriting the lead's at approve time).
+    /// - non-empty ⇒ persist verbatim.
+    #[serde(default)]
+    pub subject: Option<String>,
 }
 
-/// `PUT /leads/:lead_id/drafts/:message_id` — body `{ body }`.
-/// Only succeeds when the draft is `pending`; approved or
-/// rejected drafts return 409.
+/// `PUT /leads/:lead_id/drafts/:message_id` — body
+/// `{ body, subject? }`. Only succeeds when the draft is
+/// `pending`; approved or rejected drafts return 409.
+/// Subject + body land in two separate UPDATE statements
+/// (each lock-checks `pending` independently); a body
+/// update success without a subject success is treated as
+/// success — the subject column is best-effort.
 pub async fn update_draft_handler(
     State(state): State<Arc<AdminState>>,
     Extension(tenant_id): Extension<TenantId>,
@@ -308,7 +333,20 @@ pub async fn update_draft_handler(
             "draft_locked",
             "draft is approved/rejected or doesn't exist for this lead",
         ),
-        Ok(_) => ok(json!({ "draft_id": message_id })),
+        Ok(_) => {
+            if let Some(subject) = payload.subject.as_ref() {
+                let trimmed = subject.trim();
+                let new_subject =
+                    if trimmed.is_empty() { None } else { Some(trimmed) };
+                if let Err(e) = store
+                    .update_draft_subject(&id, &message_id, new_subject)
+                    .await
+                {
+                    return marketing_error(e);
+                }
+            }
+            ok(json!({ "draft_id": message_id }))
+        }
         Err(e) => marketing_error(e),
     }
 }
@@ -465,14 +503,25 @@ pub async fn approve_draft_handler(
         seller.signature_text.replace('\n', "<br/>"),
     );
 
-    // Subject — operator UI doesn't expose draft subject
-    // editing yet (slice 3 follow-up). Inherit lead subject
-    // with `Re: ` prefix when the lead already has a
-    // thread + `Re:` isn't already present.
-    let subject = if lead.subject.to_ascii_lowercase().starts_with("re:") {
-        lead.subject.clone()
-    } else {
-        format!("Re: {}", lead.subject)
+    // Subject — honour the operator's per-draft override
+    // when set, else inherit the lead's subject with a
+    // `Re:` prefix when missing. Empty / whitespace-only
+    // overrides fall back to the inherited path so the
+    // outbound never goes out with a blank subject line.
+    let subject = match draft
+        .subject
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(custom) => custom.to_string(),
+        None => {
+            if lead.subject.to_ascii_lowercase().starts_with("re:") {
+                lead.subject.clone()
+            } else {
+                format!("Re: {}", lead.subject)
+            }
+        }
     };
 
     // ── Tracking pre-send (open pixel + link rewrite) ───────
@@ -581,7 +630,7 @@ pub async fn approve_draft_handler(
         from_label: seller.name.clone(),
         body: command.body.clone(),
         at_ms: now_ms,
-        draft_status: None,
+        draft_status: None, subject: None,
     };
     if let Err(e) = store.append_thread_message(&lead_obj_id, outbound_msg).await {
         tracing::warn!(
@@ -868,7 +917,7 @@ pub async fn generate_draft_handler(
         from_label,
         body,
         at_ms: now_ms,
-        draft_status: Some(crate::lead::DraftStatus::Pending),
+        draft_status: Some(crate::lead::DraftStatus::Pending), subject: None,
     };
     if let Err(e) = store.append_thread_message(&lead_obj_id, new_msg).await {
         return marketing_error(e);
@@ -1055,7 +1104,7 @@ mod tests {
                     from_label: "Cliente".into(),
                     body: "Hola".into(),
                     at_ms: 100,
-                    draft_status: None,
+                    draft_status: None, subject: None,
                 },
             )
             .await
@@ -1069,7 +1118,7 @@ mod tests {
                     from_label: "Pedro".into(),
                     body: "Saludos".into(),
                     at_ms: 200,
-                    draft_status: None,
+                    draft_status: None, subject: None,
                 },
             )
             .await
@@ -1206,7 +1255,7 @@ mod tests {
                     from_label: "Juan".into(),
                     body: "¿Cuánto cuesta?".into(),
                     at_ms: 100,
-                    draft_status: None,
+                    draft_status: None, subject: None,
                 },
             )
             .await
@@ -1363,7 +1412,7 @@ mod tests {
                     from_label: "AI".into(),
                     body: "pending body".into(),
                     at_ms: 100,
-                    draft_status: Some(DraftStatus::Pending),
+                    draft_status: Some(DraftStatus::Pending), subject: None,
                 },
             )
             .await
@@ -1377,7 +1426,7 @@ mod tests {
                     from_label: "AI".into(),
                     body: "approved body".into(),
                     at_ms: 200,
-                    draft_status: Some(DraftStatus::Approved),
+                    draft_status: Some(DraftStatus::Approved), subject: None,
                 },
             )
             .await
@@ -1401,5 +1450,180 @@ mod tests {
         let resp = app.oneshot(req("/drafts?limit=999")).await.unwrap();
         let v = body_to_json(resp).await;
         assert_eq!(v["result"]["limit"], 200);
+    }
+
+    // ── Per-draft subject override ───────────────────────────
+
+    #[tokio::test]
+    async fn create_draft_persists_subject_override() {
+        let state = build_state_with_lead().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(post(
+                "/leads/l-1/drafts",
+                serde_json::json!({
+                    "body": "Hola Juan",
+                    "subject": "Promo de mayo",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["result"]["draft"]["subject"], "Promo de mayo");
+    }
+
+    #[tokio::test]
+    async fn create_draft_filters_blank_subject() {
+        let state = build_state_with_lead().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(post(
+                "/leads/l-1/drafts",
+                serde_json::json!({ "body": "Hola", "subject": "   " }),
+            ))
+            .await
+            .unwrap();
+        let v = body_to_json(resp).await;
+        // Whitespace-only ⇒ no subject persisted (field
+        // omitted from response via `skip_serializing_if`).
+        assert!(v["result"]["draft"]["subject"].is_null());
+    }
+
+    #[tokio::test]
+    async fn update_draft_sets_subject_when_provided() {
+        use crate::lead::{DraftStatus, MessageDirection, NewThreadMessage};
+        let state = build_state_with_lead().await;
+        let store = state
+            .lookup_store(&TenantId::new("acme").unwrap())
+            .unwrap();
+        store
+            .append_thread_message(
+                &LeadId("l-1".into()),
+                NewThreadMessage {
+                    message_id: "d-1".into(),
+                    direction: MessageDirection::Draft,
+                    from_label: "AI".into(),
+                    body: "old".into(),
+                    at_ms: 1,
+                    draft_status: Some(DraftStatus::Pending),
+                    subject: None,
+                },
+            )
+            .await
+            .unwrap();
+        // Re-fetch via PUT.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/leads/l-1/drafts/d-1")
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .header("X-Tenant-Id", "acme")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "body": "new",
+                    "subject": "Promo mayo",
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let app = router(state.clone());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Verify directly via store.
+        let drafts = store
+            .list_drafts(&LeadId("l-1".into()), None)
+            .await
+            .unwrap();
+        assert_eq!(drafts[0].subject.as_deref(), Some("Promo mayo"));
+    }
+
+    #[tokio::test]
+    async fn update_draft_clears_subject_with_empty_string() {
+        use crate::lead::{DraftStatus, MessageDirection, NewThreadMessage};
+        let state = build_state_with_lead().await;
+        let store = state
+            .lookup_store(&TenantId::new("acme").unwrap())
+            .unwrap();
+        store
+            .append_thread_message(
+                &LeadId("l-1".into()),
+                NewThreadMessage {
+                    message_id: "d-1".into(),
+                    direction: MessageDirection::Draft,
+                    from_label: "AI".into(),
+                    body: "x".into(),
+                    at_ms: 1,
+                    draft_status: Some(DraftStatus::Pending),
+                    subject: Some("Old subject".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/leads/l-1/drafts/d-1")
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .header("X-Tenant-Id", "acme")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "body": "x",
+                    "subject": "",
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let app = router(state.clone());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let drafts = store
+            .list_drafts(&LeadId("l-1".into()), None)
+            .await
+            .unwrap();
+        assert!(drafts[0].subject.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_draft_leaves_subject_when_field_absent() {
+        use crate::lead::{DraftStatus, MessageDirection, NewThreadMessage};
+        let state = build_state_with_lead().await;
+        let store = state
+            .lookup_store(&TenantId::new("acme").unwrap())
+            .unwrap();
+        store
+            .append_thread_message(
+                &LeadId("l-1".into()),
+                NewThreadMessage {
+                    message_id: "d-1".into(),
+                    direction: MessageDirection::Draft,
+                    from_label: "AI".into(),
+                    body: "x".into(),
+                    at_ms: 1,
+                    draft_status: Some(DraftStatus::Pending),
+                    subject: Some("Keep me".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/leads/l-1/drafts/d-1")
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .header("X-Tenant-Id", "acme")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({ "body": "edited" }))
+                    .unwrap(),
+            ))
+            .unwrap();
+        let app = router(state.clone());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let drafts = store
+            .list_drafts(&LeadId("l-1".into()), None)
+            .await
+            .unwrap();
+        assert_eq!(drafts[0].subject.as_deref(), Some("Keep me"));
     }
 }

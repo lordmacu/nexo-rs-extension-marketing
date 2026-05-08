@@ -197,7 +197,7 @@ mod tests {
                         from_label: "AI".into(),
                         body: "b".into(),
                         at_ms: 1,
-                        draft_status: Some(status),
+                        draft_status: Some(status), subject: None,
                     },
                 )
                 .await
@@ -216,7 +216,7 @@ mod tests {
                     from_label: "Cliente".into(),
                     body: "hi".into(),
                     at_ms: now - 1000,
-                    draft_status: None,
+                    draft_status: None, subject: None,
                 },
             )
             .await
@@ -230,7 +230,7 @@ mod tests {
                     from_label: "Pedro".into(),
                     body: "ok".into(),
                     at_ms: now - 500,
-                    draft_status: None,
+                    draft_status: None, subject: None,
                 },
             )
             .await
@@ -248,7 +248,7 @@ mod tests {
                     from_label: "Cliente".into(),
                     body: "old".into(),
                     at_ms: now - 25 * 24 * 3_600_000,
-                    draft_status: None,
+                    draft_status: None, subject: None,
                 },
             )
             .await

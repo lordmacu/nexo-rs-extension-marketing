@@ -253,6 +253,7 @@ pub fn validation_fixture_context() -> serde_json::Value {
         body: "Preview body".into(),
         at_ms: Utc::now().timestamp_millis(),
         draft_status: None,
+        subject: None,
     };
     let ctx = DraftContext {
         lead,
@@ -339,6 +340,7 @@ mod tests {
             body: body.into(),
             at_ms: Utc::now().timestamp_millis(),
             draft_status: None,
+            subject: None,
         }
     }
 
