@@ -105,6 +105,60 @@ pub fn load_topic_guardrails(
     load_yaml_list(state_root, tenant, "topic_guardrails.yaml")
 }
 
+/// Read `draft_template.hbs`. Missing file → `Ok(None)`
+/// (operator hasn't customised the per-tenant template;
+/// boot wiring's bundled `DEFAULT_TEMPLATE` applies).
+/// File contents returned verbatim — Handlebars templates
+/// are plain strings, no YAML envelope.
+pub fn load_draft_template(
+    state_root: impl AsRef<Path>,
+    tenant: &TenantId,
+) -> Result<Option<String>, MarketingError> {
+    let path = config_path(state_root.as_ref(), tenant, "draft_template.hbs");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let body = std::fs::read_to_string(&path)
+        .map_err(|e| MarketingError::Config(format!("read {}: {e}", path.display())))?;
+    Ok(Some(body))
+}
+
+/// Write `draft_template.hbs`. Same atomic-rename posture
+/// the YAML writers use. Caller's responsibility to
+/// validate the template by sandbox-rendering against a
+/// fixture context BEFORE calling — broken Handlebars
+/// would crash the per-tenant draft generator on the
+/// next pull.
+pub fn save_draft_template(
+    state_root: impl AsRef<Path>,
+    tenant: &TenantId,
+    body: &str,
+) -> Result<(), MarketingError> {
+    let path = config_path(state_root.as_ref(), tenant, "draft_template.hbs");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            MarketingError::Config(format!("create {}: {e}", parent.display()))
+        })?;
+    }
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = dir.join(".draft_template.hbs.tmp");
+    let mut f = std::fs::File::create(&tmp)
+        .map_err(|e| MarketingError::Config(format!("create {}: {e}", tmp.display())))?;
+    f.write_all(body.as_bytes())
+        .map_err(|e| MarketingError::Config(format!("write {}: {e}", tmp.display())))?;
+    f.sync_all()
+        .map_err(|e| MarketingError::Config(format!("fsync {}: {e}", tmp.display())))?;
+    drop(f);
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        MarketingError::Config(format!(
+            "rename {} -> {}: {e}",
+            tmp.display(),
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
 /// Read `followup_profiles.yaml`. Missing file → empty list.
 pub fn load_followup_profiles(
     state_root: impl AsRef<Path>,

@@ -122,6 +122,13 @@ pub struct AdminState {
     /// haven't wired one yet surface a clear error.
     pub draft_generator:
         Option<Arc<dyn crate::draft::DraftGenerator + Send + Sync>>,
+    /// Hot-swappable draft template handle. Same Arc the
+    /// `TemplateDraftGenerator` reads from, so
+    /// `PUT /config/draft_template` lands the new template
+    /// in-memory and the next draft generation picks it up
+    /// without a restart. `None` ⇒ template config endpoints
+    /// 503.
+    pub draft_template: Option<crate::draft::DraftTemplateHandle>,
     /// M15.21.b — person store the lead drawer reads to
     /// surface `enrichment_status` + `enrichment_confidence`
     /// per lead. Same Arc the broker hop's identity
@@ -157,6 +164,7 @@ impl AdminState {
             draft_generator: None,
             persons: None,
             companies: None,
+            draft_template: None,
         }
     }
 
@@ -325,6 +333,19 @@ impl AdminState {
         self
     }
 
+    /// Wire the shared draft template handle. Boot
+    /// constructs the handle, seeds it from disk (or the
+    /// bundled default), threads it both into the
+    /// `TemplateDraftGenerator` and into AdminState so PUT
+    /// hot-swaps land where the generator reads.
+    pub fn with_draft_template(
+        mut self,
+        handle: crate::draft::DraftTemplateHandle,
+    ) -> Self {
+        self.draft_template = Some(handle);
+        self
+    }
+
     pub fn lookup_store(&self, tenant_id: &TenantId) -> Option<Arc<LeadStore>> {
         self.stores.get(tenant_id).cloned()
     }
@@ -407,6 +428,14 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route(
             "/config/templates",
             get(config::list_templates).put(config::put_templates),
+        )
+        // Draft template hot-swap. GET returns the active
+        // template body + source ("default" / "tenant"); PUT
+        // validates by sandbox-rendering against a fixture
+        // context first, then writes + swaps in-memory.
+        .route(
+            "/config/draft_template",
+            get(config::get_draft_template).put(config::put_draft_template),
         )
         .route(
             "/config/snippets",

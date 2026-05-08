@@ -135,20 +135,49 @@ Saludos,
 {{seller.signature_text}}{{/if}}
 "#;
 
-/// Sandboxed-Handlebars draft generator. Stateless — safe to
-/// share via `Arc<dyn DraftGenerator + Send + Sync>` across
-/// tenants (template body is the only state and it's owned).
+/// Hot-swappable handle for the active draft template.
+/// Same `Arc` lives in the [`TemplateDraftGenerator`] and
+/// the admin endpoint that serves
+/// `PUT /config/draft_template`; the endpoint stores a
+/// freshly-validated template and the next generator call
+/// picks it up without a process restart.
+pub type DraftTemplateHandle = std::sync::Arc<arc_swap::ArcSwap<String>>;
+
+/// Construct a fresh template handle pre-loaded with the
+/// bundled [`DEFAULT_TEMPLATE`]. Boot wires this once and
+/// shares the Arc.
+pub fn default_template_handle() -> DraftTemplateHandle {
+    std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+        DEFAULT_TEMPLATE.to_string(),
+    ))
+}
+
+/// Sandboxed-Handlebars draft generator. Reads the active
+/// template through an [`DraftTemplateHandle`] so the
+/// admin endpoint can hot-swap the per-tenant template
+/// without restarting the extension.
 #[derive(Debug, Clone)]
 pub struct TemplateDraftGenerator {
-    template: String,
+    template: DraftTemplateHandle,
 }
 
 impl TemplateDraftGenerator {
-    /// Construct with an explicit template. Operators wire
-    /// this from `<state_root>/marketing/<tenant>/draft_template.hbs`
-    /// once the per-tenant template config endpoint lands.
-    pub fn new(template: String) -> Self {
+    /// Construct against a shared handle. Caller wires the
+    /// same Arc into AdminState so PUT updates flow
+    /// straight into the generator's read path.
+    pub fn from_handle(template: DraftTemplateHandle) -> Self {
         Self { template }
+    }
+
+    /// Construct with an explicit template body. Useful
+    /// for tests + one-off setups; mutations won't reach
+    /// any other component because the handle is local.
+    pub fn new(template: String) -> Self {
+        Self {
+            template: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+                template,
+            )),
+        }
     }
 
     /// Construct with the bundled [`DEFAULT_TEMPLATE`].
@@ -158,12 +187,80 @@ impl TemplateDraftGenerator {
         Self::new(DEFAULT_TEMPLATE.into())
     }
 
-    /// The template body this generator renders. Public so
-    /// admin endpoints / debug pages can echo it back to
-    /// operators for visual inspection.
-    pub fn template(&self) -> &str {
-        &self.template
+    /// Snapshot of the currently active template body.
+    /// Loads through `arc-swap` so concurrent writers
+    /// don't see torn reads.
+    pub fn template(&self) -> std::sync::Arc<String> {
+        self.template.load_full()
     }
+
+    /// The shared handle, for callers that need to wire it
+    /// into AdminState alongside the generator itself.
+    pub fn handle(&self) -> DraftTemplateHandle {
+        self.template.clone()
+    }
+}
+
+/// Fixture `DraftContext` used by the
+/// `PUT /config/draft_template` validator to sandbox-
+/// render an operator-typed template before persisting.
+/// Carries every field a real draft generation hits so
+/// operator-typed paths fail validation if they reference
+/// non-existent fields.
+pub fn validation_fixture_context() -> serde_json::Value {
+    use chrono::Utc;
+    use nexo_tool_meta::marketing::{
+        IntentClass, LeadId, LeadState, PersonId, Seller, SellerId,
+        SentimentBand, TenantIdRef,
+    };
+    let lead = nexo_tool_meta::marketing::Lead {
+        id: LeadId("validation".into()),
+        tenant_id: TenantIdRef("validation".into()),
+        thread_id: "<validation@local>".into(),
+        subject: "Subject preview".into(),
+        person_id: PersonId("preview@example.com".into()),
+        seller_id: SellerId("seller-preview".into()),
+        state: LeadState::Engaged,
+        score: 50,
+        sentiment: SentimentBand::Neutral,
+        intent: IntentClass::Comparing,
+        topic_tags: vec!["preview".into()],
+        last_activity_ms: Utc::now().timestamp_millis(),
+        next_check_at_ms: None,
+        followup_attempts: 0,
+        why_routed: vec!["validation".into()],
+    };
+    let seller = Seller {
+        id: SellerId("seller-preview".into()),
+        tenant_id: TenantIdRef("validation".into()),
+        name: "Seller Preview".into(),
+        primary_email: "seller@example.com".into(),
+        alt_emails: vec![],
+        signature_text: "—\nSeller Preview".into(),
+        working_hours: None,
+        on_vacation: false,
+        vacation_until: None,
+        preferred_language: Some("es".into()),
+        agent_id: None,
+        model_override: None,
+        notification_settings: None,
+        smtp_credential: None,
+    };
+    let inbound = crate::lead::ThreadMessage {
+        id: "preview-msg".into(),
+        direction: crate::lead::MessageDirection::Inbound,
+        from_label: "Preview".into(),
+        body: "Preview body".into(),
+        at_ms: Utc::now().timestamp_millis(),
+        draft_status: None,
+    };
+    let ctx = DraftContext {
+        lead,
+        seller,
+        last_inbound: Some(inbound),
+        operator_hint: Some("Preview hint".into()),
+    };
+    serde_json::to_value(&ctx).unwrap_or_else(|_| serde_json::json!({}))
 }
 
 #[async_trait]
@@ -176,7 +273,8 @@ impl DraftGenerator for TemplateDraftGenerator {
         // reference the same paths the API returns.
         let context = serde_json::to_value(ctx)
             .map_err(|e| DraftGenError::TemplateRender(e.to_string()))?;
-        let rendered = render_handlebars(&self.template, &context)?;
+        let body = self.template.load_full();
+        let rendered = render_handlebars(&body, &context)?;
         let trimmed = rendered.trim();
         if trimmed.is_empty() {
             return Err(DraftGenError::Empty);

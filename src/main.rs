@@ -313,11 +313,30 @@ async fn main() -> anyhow::Result<()> {
     // `AgentDraftGenerator` (NATS-RPC to the bound agent's
     // LLM) by replacing this Arc — admin surface stays the
     // same since both impls satisfy `DraftGenerator`.
+    //
+    // Hot-swappable template: boot seeds the handle from
+    // disk (when the operator has dropped a per-tenant
+    // `draft_template.hbs`) and otherwise from the bundled
+    // default. AdminState shares the same Arc so
+    // `PUT /config/draft_template` lands the new template
+    // straight into the generator's read path.
+    let draft_template_handle = nexo_marketing::draft::default_template_handle();
+    if let Ok(Some(body)) =
+        nexo_marketing::config::load_draft_template(&state_root, &tenant)
+    {
+        draft_template_handle.store(Arc::new(body));
+        tracing::info!(
+            tenant = %tenant,
+            "loaded per-tenant draft template from disk"
+        );
+    }
+    let template_gen =
+        nexo_marketing::draft::TemplateDraftGenerator::from_handle(
+            draft_template_handle.clone(),
+        );
     let draft_generator: Arc<
         dyn nexo_marketing::draft::DraftGenerator + Send + Sync,
-    > = Arc::new(
-        nexo_marketing::draft::TemplateDraftGenerator::with_default_template(),
-    );
+    > = Arc::new(template_gen);
 
     // ─── Surface 1: HTTP admin ────────────────────────────────
     let mut admin_state_builder = AdminState::new(bearer)
@@ -332,6 +351,7 @@ async fn main() -> anyhow::Result<()> {
         .with_outbound(outbound_publisher.clone())
         .with_broker_sender_cell(broker_sender_cell.clone())
         .with_draft_generator(draft_generator)
+        .with_draft_template(draft_template_handle.clone())
         .with_persons(persons.clone())
         .with_companies(companies.clone());
     if let Some(deps) = tracking_deps.clone() {

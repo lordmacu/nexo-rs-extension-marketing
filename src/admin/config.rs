@@ -25,8 +25,9 @@ use serde_json::{json, Value};
 
 use super::AdminState;
 use crate::config::{
-    load_followup_profiles, load_mailboxes, load_notification_templates, load_sellers,
-    load_snippets, load_templates, load_topic_guardrails, save_followup_profiles,
+    load_draft_template, load_followup_profiles, load_mailboxes,
+    load_notification_templates, load_sellers, load_snippets, load_templates,
+    load_topic_guardrails, save_draft_template, save_followup_profiles,
     save_mailboxes, save_notification_templates, save_rules, save_sellers,
     save_snippets, save_templates, save_topic_guardrails,
 };
@@ -668,6 +669,118 @@ pub async fn put_topic_guardrails(
     }))
 }
 
+/// `GET /config/draft_template` — current per-tenant
+/// Handlebars template + source. The lead drawer's "edit
+/// template" form pre-fills its textarea from this.
+///
+/// Source semantics:
+/// - `"tenant"` ⇒ operator-customised body loaded from
+///   `<state_root>/marketing/<tenant>/draft_template.hbs`
+///   AND the same body is the live one in the in-memory
+///   handle.
+/// - `"default"` ⇒ no per-tenant file on disk; the
+///   bundled `DEFAULT_TEMPLATE` (or whatever was wired
+///   via `with_draft_template`) is what generators
+///   render.
+pub async fn get_draft_template(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+) -> Response {
+    let Some(handle) = state.draft_template.as_ref() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "draft_template_disabled",
+            "draft template handle not wired on AdminState",
+        );
+    };
+    let live = handle.load_full();
+    let tenant_body = match &state.state_root {
+        Some(root) => match load_draft_template(root, &tenant_id) {
+            Ok(b) => b,
+            Err(e) => return marketing_error(e),
+        },
+        None => None,
+    };
+    let source = if tenant_body.is_some() { "tenant" } else { "default" };
+    ok(json!({
+        "template": &*live,
+        "source": source,
+        "default_template": crate::draft::DEFAULT_TEMPLATE,
+    }))
+}
+
+/// `PUT /config/draft_template`. Body: `{ template: "..." }`.
+///
+/// Validates by sandbox-rendering against a fixture
+/// context BEFORE writing — broken Handlebars surfaces as
+/// `400 invalid_template` instead of crashing the next
+/// draft generation. On success persists to
+/// `draft_template.hbs` AND swaps the in-memory handle so
+/// the next call to `TemplateDraftGenerator::generate`
+/// picks up the new body without a restart.
+pub async fn put_draft_template(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(handle) = state.draft_template.as_ref() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "draft_template_disabled",
+            "draft template handle not wired on AdminState",
+        );
+    };
+    let root = match &state.state_root {
+        Some(r) => r,
+        None => return state_root_missing(),
+    };
+    let template_str = match body.get("template").and_then(Value::as_str) {
+        Some(s) => s.to_string(),
+        None => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "missing_field",
+                "body must carry a 'template' string",
+            );
+        }
+    };
+    if template_str.trim().is_empty() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "empty_template",
+            "template body must be non-empty",
+        );
+    }
+    // Sandbox-render against the fixture context to surface
+    // syntax errors + forbidden helpers before the file
+    // hits disk. Fixture ships the same shape DraftContext
+    // serialises so operator-typed paths resolve like at
+    // runtime.
+    let fixture = crate::draft::validation_fixture_context();
+    if let Err(e) = nexo_microapp_sdk::templating::handlebars::render_handlebars(
+        &template_str,
+        &fixture,
+    ) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_template",
+            &format!("template failed sandbox validation: {e}"),
+        );
+    }
+    if let Err(e) = save_draft_template(root, &tenant_id, &template_str) {
+        return marketing_error(e);
+    }
+    // Swap the live handle AFTER the disk write succeeds
+    // so a failed write doesn't leave the in-memory state
+    // ahead of the on-disk truth.
+    handle.store(std::sync::Arc::new(template_str.clone()));
+    ok(json!({
+        "template": template_str,
+        "source": "tenant",
+        "reloaded": true,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1011,5 +1124,160 @@ mod tests {
         let v = body_to_json(resp).await;
         assert_eq!(v["result"]["count"], 1);
         assert_eq!(v["result"]["profiles"][0]["id"], "default");
+    }
+
+    // ── Per-tenant draft template hot-swap ──────────────────
+
+    async fn build_state_with_template(
+        handle: bool,
+    ) -> (Arc<AdminState>, tempfile::TempDir) {
+        let tmp = tempdir().unwrap();
+        let store = LeadStore::open(
+            PathBuf::from(":memory:"),
+            TenantId::new("acme").unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut s = AdminState::new("secret".into())
+            .with_store(Arc::new(store))
+            .with_state_root(tmp.path().to_path_buf());
+        if handle {
+            s = s.with_draft_template(crate::draft::default_template_handle());
+        }
+        (Arc::new(s), tmp)
+    }
+
+    #[tokio::test]
+    async fn get_draft_template_returns_default_when_no_tenant_file() {
+        let (state, _tmp) = build_state_with_template(true).await;
+        let app = router(state);
+        let resp = app
+            .oneshot(req("/config/draft_template"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["result"]["source"], "default");
+        // The bundled DEFAULT_TEMPLATE bytes flow through.
+        let body = v["result"]["template"].as_str().unwrap();
+        assert!(body.contains("{{lead.subject}}"));
+    }
+
+    #[tokio::test]
+    async fn get_draft_template_returns_503_when_handle_not_wired() {
+        let (state, _tmp) = build_state_with_template(false).await;
+        let app = router(state);
+        let resp = app
+            .oneshot(req("/config/draft_template"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["error"]["code"], "draft_template_disabled");
+    }
+
+    #[tokio::test]
+    async fn put_draft_template_persists_and_swaps_handle() {
+        let (state, tmp) = build_state_with_template(true).await;
+        let handle = state.draft_template.as_ref().unwrap().clone();
+        let app = router(state);
+        let payload = serde_json::json!({
+            "template": "Hola {{seller.name}} — {{lead.subject}}",
+        });
+        let resp = app
+            .oneshot(put_req("/config/draft_template", payload))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["result"]["source"], "tenant");
+        assert_eq!(v["result"]["reloaded"], true);
+        // Handle live-swapped.
+        let live = handle.load_full();
+        assert!(live.contains("{{seller.name}}"));
+        // File on disk.
+        let path = tmp
+            .path()
+            .join("marketing")
+            .join("acme")
+            .join("draft_template.hbs");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("{{seller.name}}"));
+    }
+
+    #[tokio::test]
+    async fn put_draft_template_rejects_malformed_handlebars() {
+        let (state, _tmp) = build_state_with_template(true).await;
+        let handle = state.draft_template.as_ref().unwrap().clone();
+        let before = handle.load_full().to_string();
+        let app = router(state);
+        let payload = serde_json::json!({
+            "template": "Hola {{#if seller.name}}{{seller.name}}",
+        });
+        let resp = app
+            .oneshot(put_req("/config/draft_template", payload))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["error"]["code"], "invalid_template");
+        // Handle untouched on validation failure.
+        assert_eq!(*handle.load_full(), before);
+    }
+
+    #[tokio::test]
+    async fn put_draft_template_rejects_empty_body() {
+        let (state, _tmp) = build_state_with_template(true).await;
+        let app = router(state);
+        let resp = app
+            .oneshot(put_req(
+                "/config/draft_template",
+                serde_json::json!({ "template": "  \n  " }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["error"]["code"], "empty_template");
+    }
+
+    #[tokio::test]
+    async fn put_draft_template_requires_template_field() {
+        let (state, _tmp) = build_state_with_template(true).await;
+        let app = router(state);
+        let resp = app
+            .oneshot(put_req("/config/draft_template", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["error"]["code"], "missing_field");
+    }
+
+    #[tokio::test]
+    async fn get_after_put_reflects_tenant_source() {
+        let (state, _tmp) = build_state_with_template(true).await;
+        let app = router(state);
+        // First PUT.
+        let resp = app
+            .clone()
+            .oneshot(put_req(
+                "/config/draft_template",
+                serde_json::json!({ "template": "Hola {{lead.subject}}" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Now GET.
+        let resp = app
+            .oneshot(req("/config/draft_template"))
+            .await
+            .unwrap();
+        let v = body_to_json(resp).await;
+        assert_eq!(v["result"]["source"], "tenant");
+        assert!(v["result"]["template"]
+            .as_str()
+            .unwrap()
+            .contains("{{lead.subject}}"));
     }
 }
