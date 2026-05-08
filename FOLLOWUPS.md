@@ -201,19 +201,43 @@ floor drops, no-company candidate falls back to email pool.
 SDK tests green (318 baseline + 6 list_by_company).
 SDK 0.1.8 → 0.1.9 · marketing 0.16.0 → 0.16.1.
 
-### F25 · Cross-restart notification dedup via sled
+### F25 · Cross-restart notification dedup via sled ✅ — done in marketing 0.17.1
 
-- **Origin:** F9 (M15.53) shipped in-memory `DedupCache`
-  with `Mutex<HashMap>`. NATS at-least-once redelivery
-  across a process restart bypasses the cache.
-- **Plan:** swap the inner `HashMap` for a `sled` keyspace.
-  Public surface kept narrow on purpose so the swap is a
-  1-file change.
-- **Effort:** ~120 LOC + 1 new dep (`sled = "0.34"`).
-- **Priority:** low — extension restarts are operator-
-  triggered + NATS doesn't retain `plugin.inbound.*` events
-  across consumer restarts in our config (covers ~95% of
-  the threat).
+`DedupCache` keeps its narrow public surface
+(`new` / `with_ttl` / `is_duplicate` / `len`) — internal
+`Backend` enum dispatches between the in-memory
+`Mutex<HashMap>` (default) and an opt-in sled keyspace.
+
+`DedupCache::with_sled(path, ttl)` opens an embedded
+sled DB. Each `is_duplicate` call reads the existing
+8-byte LE u64 timestamp; within TTL ⇒ duplicate (don't
+refresh — first-seen window stays consistent); past TTL
+⇒ overwrite + treated as fresh; missing ⇒ insert + return
+false. Sled errors fail open (log warn, return `false`)
+so a transient I/O hiccup never blocks the publish.
+
+Boot wiring (`main.rs::build_dedup_cache`):
+- Default build / no env: in-memory.
+- `--features dedup-sled` AND `MARKETING_DEDUP_SLED=1`
+  (or `true`/`yes`/`on`): persistent sled at
+  `<state_root>/<tenant>/notification_dedup.sled`.
+- Feature compiled but env unset: in-memory (operator
+  opts in explicitly).
+
+8 sled-backed tests (all in-memory tests still green via
+the same module): first-call records / second-call
+duplicates / distinct keys independent / TTL eviction
+on stale row / **cross-restart survives reopen** / TTL
+eviction across restart / len reports rows / cross-tenant
+keys independent. The cross-restart test is the headline
+F25 invariant — open → write → drop → reopen → second
+call is deduped.
+
+Tests: 365/365 default features · 373/373 with
+`dedup-sled` feature (+8 sled). New dep
+`sled = "0.34"` is optional.
+
+Bump 0.17.0 → 0.17.1.
 
 ### F26 · Sandboxed Handlebars feature
 

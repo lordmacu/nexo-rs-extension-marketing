@@ -160,7 +160,14 @@ async fn main() -> anyhow::Result<()> {
     // post-success publish (LeadTransitioned, MeetingIntent).
     // Same `Arc`, same TTL window, so a redelivery in either
     // surface is suppressed by the other.
-    let dedup = Arc::new(nexo_marketing::notification_dedup::DedupCache::new());
+    //
+    // F25 — when the operator builds with `--features dedup-sled`
+    // AND sets `MARKETING_DEDUP_SLED=1`, the cache opens a
+    // sled keyspace under the tenant state dir so a NATS
+    // redelivery after a process restart still suppresses
+    // the duplicate publish. Default builds + unset env stay
+    // in-memory (covers ~95 % of the threat).
+    let dedup = Arc::new(build_dedup_cache(&state_root, &tenant)?);
 
     // M15.23.d — operator-supplied topic guardrails. Same
     // arc_swap pattern as the router + seller lookup so the
@@ -419,4 +426,53 @@ async fn main() -> anyhow::Result<()> {
         .context("plugin stdio loop crashed")?;
 
     Ok(())
+}
+
+/// F25 — build the notification dedup cache with the right
+/// backend for the operator's deployment posture.
+///
+/// Build matrix:
+/// - Default build (no `dedup-sled` feature): in-memory
+///   only.
+/// - `dedup-sled` feature compiled AND `MARKETING_DEDUP_SLED=1`
+///   env set ⇒ persistent sled keyspace at
+///   `<state_root>/<tenant>/notification_dedup.sled`.
+/// - `dedup-sled` feature compiled but env unset ⇒ stays
+///   in-memory. Operator opts in explicitly.
+fn build_dedup_cache(
+    state_root: &std::path::Path,
+    tenant: &nexo_marketing::tenant::TenantId,
+) -> anyhow::Result<nexo_marketing::notification_dedup::DedupCache> {
+    #[cfg(feature = "dedup-sled")]
+    {
+        let opt_in = env::var("MARKETING_DEDUP_SLED")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        if opt_in {
+            let path = tenant
+                .state_dir(state_root)
+                .join("notification_dedup.sled");
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            tracing::info!(
+                tenant = %tenant,
+                path = %path.display(),
+                "notification dedup using sled (cross-restart) backend"
+            );
+            return nexo_marketing::notification_dedup::DedupCache::with_sled(
+                &path,
+                nexo_marketing::notification_dedup::DEFAULT_TTL,
+            )
+            .with_context(|| {
+                format!(
+                    "open notification_dedup sled at {}",
+                    path.display()
+                )
+            });
+        }
+    }
+    let _ = state_root;
+    let _ = tenant;
+    Ok(nexo_marketing::notification_dedup::DedupCache::new())
 }

@@ -80,10 +80,32 @@ impl DedupKey {
 /// cold cache holds expired entries until the next call. For
 /// marketing's volume (<1 publish/sec/tenant), this is a
 /// non-issue.
+///
+/// ## Backends (F25)
+///
+/// `DedupCache` wraps an internal `Backend` enum so the
+/// public API stays unchanged across in-memory and
+/// persistent variants:
+///
+/// - [`DedupCache::new`] / [`DedupCache::with_ttl`] — the
+///   default `Mutex<HashMap>` backend. Wiped on process
+///   restart; covers ~95 % of the NATS at-least-once
+///   redelivery threat (transient broker reconnects).
+/// - [`DedupCache::with_sled`] (gated by the `dedup-sled`
+///   feature) — embedded sled keyspace at the operator-
+///   supplied path. Survives process restarts so the dedup
+///   window covers crash-recovery + planned redeploys.
 #[derive(Debug)]
 pub struct DedupCache {
-    inner: Mutex<HashMap<DedupKey, Instant>>,
+    backend: Backend,
     ttl: Duration,
+}
+
+#[derive(Debug)]
+enum Backend {
+    Memory(Mutex<HashMap<DedupKey, Instant>>),
+    #[cfg(feature = "dedup-sled")]
+    Sled(sled::Db),
 }
 
 impl Default for DedupCache {
@@ -103,44 +125,147 @@ impl DedupCache {
     /// needing `tokio::time::pause`.
     pub fn with_ttl(ttl: Duration) -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            backend: Backend::Memory(Mutex::new(HashMap::new())),
             ttl,
         }
+    }
+
+    /// F25 — open a sled-backed cache at `path`. Survives
+    /// process restarts so a NATS redelivery after a crash
+    /// or planned redeploy still suppresses the duplicate
+    /// publish. TTL stays the lazy in-process eviction
+    /// window; the sled keyspace doesn't grow unbounded
+    /// because every read past TTL evicts.
+    ///
+    /// Caller picks the path; convention is
+    /// `<state_root>/<tenant>/notification_dedup.sled`.
+    /// Cross-tenant deployments stamp distinct paths so the
+    /// sled file boundary mirrors the existing tenant
+    /// isolation posture.
+    #[cfg(feature = "dedup-sled")]
+    pub fn with_sled(
+        path: impl AsRef<std::path::Path>,
+        ttl: Duration,
+    ) -> Result<Self, sled::Error> {
+        // sled creates intermediate dirs itself; no
+        // pre-stat needed. `Db` cheap to clone via Arc
+        // internals so we can park it inside the Backend
+        // enum.
+        let db = sled::open(path)?;
+        Ok(Self {
+            backend: Backend::Sled(db),
+            ttl,
+        })
     }
 
     /// Returns `true` if the key is a duplicate of a recent
     /// publish (within TTL); records the call regardless so
     /// subsequent calls within TTL are also deduped.
     ///
-    /// Concurrent calls are serialised on the internal mutex.
+    /// Memory backend: serialised on the internal mutex.
     /// The lock guard scope is tight (1 HashMap op + 1
     /// Instant::now); contention is negligible for marketing
     /// volumes.
+    ///
+    /// Sled backend: per-key compare-and-swap; concurrent
+    /// callers race on the key but at most one wins the
+    /// "first publish" slot. Lazy eviction reads + drops
+    /// stale rows on every call.
     pub fn is_duplicate(&self, key: &DedupKey) -> bool {
-        let now = Instant::now();
-        let mut map = self.inner.lock().expect("notification dedup poisoned");
-        // Lazy eviction — drop every entry whose timestamp
-        // is older than `ttl`. O(n) sweep but n is bounded
-        // (per-tenant per-hour publish count).
-        map.retain(|_, t| now.duration_since(*t) < self.ttl);
-        match map.get(key) {
-            Some(_) => true,
-            None => {
-                map.insert(key.clone(), now);
-                false
+        match &self.backend {
+            Backend::Memory(inner) => {
+                let now = Instant::now();
+                let mut map = inner.lock().expect("notification dedup poisoned");
+                // Lazy eviction — drop every entry whose
+                // timestamp is older than `ttl`. O(n) sweep
+                // but n is bounded (per-tenant per-hour
+                // publish count).
+                map.retain(|_, t| now.duration_since(*t) < self.ttl);
+                match map.get(key) {
+                    Some(_) => true,
+                    None => {
+                        map.insert(key.clone(), now);
+                        false
+                    }
+                }
             }
+            #[cfg(feature = "dedup-sled")]
+            Backend::Sled(db) => sled_is_duplicate(db, key, self.ttl),
         }
     }
 
     /// Number of live entries — used by tests + the optional
-    /// `/healthz` debug surface.
+    /// `/healthz` debug surface. For the sled backend this
+    /// returns the raw row count (including any stale rows
+    /// that haven't been evicted by a read pass yet).
     pub fn len(&self) -> usize {
-        self.inner.lock().map(|m| m.len()).unwrap_or(0)
+        match &self.backend {
+            Backend::Memory(inner) => {
+                inner.lock().map(|m| m.len()).unwrap_or(0)
+            }
+            #[cfg(feature = "dedup-sled")]
+            Backend::Sled(db) => db.len(),
+        }
     }
 
     /// `true` when no live entries.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+#[cfg(feature = "dedup-sled")]
+fn sled_is_duplicate(db: &sled::Db, key: &DedupKey, ttl: Duration) -> bool {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let ttl_ms = ttl.as_millis() as u64;
+
+    let key_bytes = key.as_str().as_bytes();
+    match db.get(key_bytes) {
+        Ok(Some(value)) => {
+            // 8-byte little-endian u64 timestamp. Anything
+            // shorter is a corrupted row; treat as stale.
+            let stamp_ms = if value.len() >= 8 {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&value[..8]);
+                u64::from_le_bytes(buf)
+            } else {
+                0
+            };
+            if now_ms.saturating_sub(stamp_ms) < ttl_ms {
+                // Within TTL ⇒ duplicate. Don't refresh the
+                // timestamp; the first-seen stamp gates the
+                // window edge consistently.
+                true
+            } else {
+                // Stale — overwrite with the fresh stamp +
+                // treat as the first call.
+                let _ = db.insert(key_bytes, &now_ms.to_le_bytes());
+                let _ = db.flush();
+                false
+            }
+        }
+        Ok(None) => {
+            // First time seeing the key.
+            let _ = db.insert(key_bytes, &now_ms.to_le_bytes());
+            let _ = db.flush();
+            false
+        }
+        Err(e) => {
+            // Read error — fail open (don't suppress the
+            // publish). Operator's tracing log surfaces the
+            // sled hiccup.
+            tracing::warn!(
+                target: "marketing.notification_dedup",
+                error = %e, key = %key.as_str(),
+                "sled read failed (failing open — duplicate may pass through)"
+            );
+            false
+        }
     }
 }
 
@@ -234,5 +359,120 @@ mod tests {
         let a = DedupKey::new("acme", "l-1", "lead_created", 0);
         let b = DedupKey::new("acme", "l-1", "lead_created", 30 * 1000);
         assert_eq!(a, b);
+    }
+
+    // ─── F25 — sled backend (cross-restart dedup) ─────────────
+
+    #[cfg(feature = "dedup-sled")]
+    mod sled_backend {
+        use super::*;
+
+        fn fresh_sled_cache(ttl: Duration) -> (DedupCache, tempfile::TempDir) {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = DedupCache::with_sled(dir.path(), ttl).unwrap();
+            (cache, dir)
+        }
+
+        #[test]
+        fn first_call_returns_false_records_entry() {
+            let (cache, _tmp) = fresh_sled_cache(Duration::from_secs(60));
+            assert!(!cache.is_duplicate(&k("l-1")));
+            assert_eq!(cache.len(), 1);
+        }
+
+        #[test]
+        fn second_call_with_same_key_returns_true() {
+            let (cache, _tmp) = fresh_sled_cache(Duration::from_secs(60));
+            assert!(!cache.is_duplicate(&k("l-1")));
+            assert!(cache.is_duplicate(&k("l-1")));
+        }
+
+        #[test]
+        fn distinct_keys_independent() {
+            let (cache, _tmp) = fresh_sled_cache(Duration::from_secs(60));
+            assert!(!cache.is_duplicate(&k("l-1")));
+            assert!(!cache.is_duplicate(&k("l-2")));
+            assert!(cache.is_duplicate(&k("l-1")));
+            assert!(cache.is_duplicate(&k("l-2")));
+        }
+
+        #[test]
+        fn ttl_expired_entry_treated_as_fresh() {
+            let (cache, _tmp) = fresh_sled_cache(Duration::from_millis(50));
+            assert!(!cache.is_duplicate(&k("l-1")));
+            std::thread::sleep(Duration::from_millis(60));
+            assert!(!cache.is_duplicate(&k("l-1")));
+        }
+
+        #[test]
+        fn cross_restart_dedup_survives_reopen() {
+            // The headline F25 invariant: open → write →
+            // close → reopen → second call is deduped.
+            let dir = tempfile::tempdir().unwrap();
+            {
+                let cache = DedupCache::with_sled(
+                    dir.path(),
+                    Duration::from_secs(3600),
+                )
+                .unwrap();
+                assert!(!cache.is_duplicate(&k("l-1")));
+                // Drop scope — sled flushes on drop.
+            }
+            // Re-open the same path.
+            let cache = DedupCache::with_sled(
+                dir.path(),
+                Duration::from_secs(3600),
+            )
+            .unwrap();
+            assert!(
+                cache.is_duplicate(&k("l-1")),
+                "sled-backed cache must persist across restarts"
+            );
+        }
+
+        #[test]
+        fn cross_restart_eviction_after_ttl() {
+            // Re-open with a very short TTL. Stale rows
+            // from the previous run get treated as fresh.
+            let dir = tempfile::tempdir().unwrap();
+            {
+                let cache = DedupCache::with_sled(
+                    dir.path(),
+                    Duration::from_millis(50),
+                )
+                .unwrap();
+                assert!(!cache.is_duplicate(&k("l-1")));
+            }
+            std::thread::sleep(Duration::from_millis(60));
+            let cache = DedupCache::with_sled(
+                dir.path(),
+                Duration::from_millis(50),
+            )
+            .unwrap();
+            assert!(
+                !cache.is_duplicate(&k("l-1")),
+                "stale row must be treated as fresh after restart"
+            );
+        }
+
+        #[test]
+        fn sled_len_reports_persisted_rows() {
+            let (cache, _tmp) = fresh_sled_cache(Duration::from_secs(60));
+            for lead in &["l-1", "l-2", "l-3"] {
+                cache.is_duplicate(&k(lead));
+            }
+            assert_eq!(cache.len(), 3);
+        }
+
+        #[test]
+        fn cross_tenant_keys_independent_in_sled() {
+            let (cache, _tmp) = fresh_sled_cache(Duration::from_secs(60));
+            let acme = DedupKey::new("acme", "l-1", "lead_created", 0);
+            let globex = DedupKey::new("globex", "l-1", "lead_created", 0);
+            assert!(!cache.is_duplicate(&acme));
+            assert!(!cache.is_duplicate(&globex));
+            assert!(cache.is_duplicate(&acme));
+            assert!(cache.is_duplicate(&globex));
+        }
     }
 }

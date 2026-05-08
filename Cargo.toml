@@ -1,6 +1,6 @@
 [package]
 name        = "nexo-rs-extension-marketing"
-version     = "0.17.0"
+version     = "0.17.1"
 edition     = "2021"
 rust-version = "1.80"
 license     = "MIT OR Apache-2.0"
@@ -18,6 +18,15 @@ path = "src/main.rs"
 [lib]
 name = "nexo_marketing"
 path = "src/lib.rs"
+
+[features]
+default = []
+# F25 — cross-restart notification dedup via sled. Opt-in
+# because sled bloats the binary with an embedded KV store
+# even when the operator doesn't need persistence; in-memory
+# Mutex<HashMap> covers ~95% of the at-least-once threat
+# already.
+dedup-sled = ["dep:sled"]
 
 [dependencies]
 # Async runtime + IO
@@ -41,6 +50,9 @@ uuid   = { version = "1", features = ["v4", "v5", "serde"] }
 # Error handling + observability
 anyhow    = "1"
 thiserror = "1"
+# F25 — cross-restart notification dedup. Opt-in via the
+# `dedup-sled` feature; default builds skip the dep.
+sled = { version = "0.34", optional = true }
 # M15.23.a.3 — short-hash helper for IP / UA fingerprints in the
 # tracking ingest routes (so we record dedupable identifiers
 # without retaining raw client IP/UA).
