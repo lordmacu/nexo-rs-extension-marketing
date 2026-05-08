@@ -196,6 +196,10 @@ pub fn router(state: Arc<AdminState>) -> Router {
                 .put(config::put_notification_templates),
         )
         .route("/firehose", get(firehose::handler))
+        .route(
+            "/tracking/msg/:msg_id/engagement",
+            get(tracking::engagement_handler),
+        )
         .layer(auth_layer);
 
     // M15.23.a.3 — public ingest routes for the open pixel +

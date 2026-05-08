@@ -155,16 +155,71 @@ async fn main() -> anyhow::Result<()> {
     // otherwise events vanish into a parallel universe.
     let firehose_bus = Arc::new(LeadEventBus::new());
 
+    // ─── Tracking (M15.23.a) ──────────────────────────────────
+    // Optional. Operator opts in by setting both
+    // `MARKETING_TRACKING_SECRET` (≥ 16 random bytes) +
+    // `MARKETING_TRACKING_BASE_URL` (public URL the recipients'
+    // pixel + click hits resolve to). Both empty → tracking
+    // stays off and the ingest routes self-404. Either set
+    // without the other is a misconfiguration we surface at
+    // boot.
+    let tracking_deps = match (
+        env::var("MARKETING_TRACKING_SECRET").ok(),
+        env::var("MARKETING_TRACKING_BASE_URL").ok(),
+    ) {
+        (Some(secret), Some(base_url)) if !secret.is_empty() && !base_url.is_empty() => {
+            let signer =
+                nexo_microapp_sdk::tracking::TrackingTokenSigner::new(
+                    secret.into_bytes(),
+                )
+                .context("MARKETING_TRACKING_SECRET must be ≥ 16 bytes")?;
+            let pool_path = tenant.state_dir(&state_root).join("tracking.db");
+            if let Some(parent) = pool_path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .with_context(|| format!("create {}", parent.display()))?;
+            }
+            let pool = nexo_microapp_sdk::tracking::open_pool(&pool_path)
+                .await
+                .with_context(|| {
+                    format!("open tracking pool at {}", pool_path.display())
+                })?;
+            let store: Arc<dyn nexo_microapp_sdk::tracking::TrackingStore> =
+                Arc::new(
+                    nexo_microapp_sdk::tracking::SqliteTrackingStore::new(pool),
+                );
+            tracing::info!(
+                tenant = %tenant,
+                base_url = %base_url,
+                "tracking enabled — pixel + click ingest mounted"
+            );
+            Some(Arc::new(nexo_marketing::tracking::TrackingDeps::new(
+                signer, store, base_url,
+            )))
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!(
+                "MARKETING_TRACKING_SECRET and MARKETING_TRACKING_BASE_URL must both be set or both unset"
+            );
+        }
+        _ => {
+            tracing::info!("tracking disabled — set MARKETING_TRACKING_SECRET + MARKETING_TRACKING_BASE_URL to enable");
+            None
+        }
+    };
+
     // ─── Surface 1: HTTP admin ────────────────────────────────
-    let admin_state = Arc::new(
-        AdminState::new(bearer)
-            .with_store(lead_store.clone())
-            .with_firehose(firehose_bus.clone())
-            .with_state_root(state_root.clone())
-            .with_router(router.clone())
-            .with_seller_lookup(seller_lookup.clone())
-            .with_template_lookup(template_lookup.clone()),
-    );
+    let mut admin_state_builder = AdminState::new(bearer)
+        .with_store(lead_store.clone())
+        .with_firehose(firehose_bus.clone())
+        .with_state_root(state_root.clone())
+        .with_router(router.clone())
+        .with_seller_lookup(seller_lookup.clone())
+        .with_template_lookup(template_lookup.clone());
+    if let Some(deps) = tracking_deps.clone() {
+        admin_state_builder = admin_state_builder.with_tracking(deps);
+    }
+    let admin_state = Arc::new(admin_state_builder);
     let app = admin::router(admin_state);
     let bind = format!("{DEFAULT_BIND}:{port}");
     let addr: SocketAddr = bind.parse().context("parse bind addr")?;
