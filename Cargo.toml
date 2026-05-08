@@ -1,6 +1,6 @@
 [package]
 name        = "nexo-rs-extension-marketing"
-version     = "0.13.3"
+version     = "0.14.0"
 edition     = "2021"
 rust-version = "1.80"
 license     = "MIT OR Apache-2.0"
@@ -37,6 +37,10 @@ uuid   = { version = "1", features = ["v4", "v5", "serde"] }
 # Error handling + observability
 anyhow    = "1"
 thiserror = "1"
+# M15.23.a.3 — short-hash helper for IP / UA fingerprints in the
+# tracking ingest routes (so we record dedupable identifiers
+# without retaining raw client IP/UA).
+sha2 = "0.10"
 tracing   = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -72,7 +76,7 @@ tower-http = { version = "0.5", features = ["cors", "trace"] }
 # Framework deps — path during dev, crates.io after publish.
 # The extension is sibling to nexo-rs-plugin-browser; same
 # pattern there points at ../proyecto for local hacking.
-nexo-microapp-sdk          = { path = "../proyecto/crates/microapp-sdk", features = ["identity", "routing", "enrichment", "plugin"] }
+nexo-microapp-sdk          = { path = "../proyecto/crates/microapp-sdk", features = ["identity", "routing", "enrichment", "plugin", "tracking-store"] }
 nexo-microapp-http         = { path = "../proyecto/crates/microapp-http" }
 nexo-tool-meta             = { path = "../proyecto/crates/tool-meta" }
 nexo-compliance-primitives = { path = "../proyecto/crates/compliance-primitives" }

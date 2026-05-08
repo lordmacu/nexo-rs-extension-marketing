@@ -34,6 +34,7 @@ pub mod notification_dedup;
 pub mod plugin;
 pub mod tenant;
 pub mod tools;
+pub mod tracking;
 
 pub use error::MarketingError;
 pub use tenant::{TenantId, TenantIdError};

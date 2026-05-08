@@ -29,6 +29,7 @@ pub mod config;
 pub mod firehose;
 pub mod healthz;
 pub mod leads;
+pub mod tracking;
 
 pub use auth::{require_tenant_id, AuthState, AUTH_HEADER, TENANT_HEADER};
 
@@ -67,6 +68,13 @@ pub struct AdminState {
     /// inner Arc so the broker hop's next render picks up
     /// the override without a process restart.
     pub template_lookup: Option<TemplateLookup>,
+    /// M15.23.a — engagement tracking deps (HMAC signer +
+    /// SQLite store + public base URL). When `Some`, the
+    /// public ingest routes `/t/o/...` + `/t/c/...` mount on
+    /// the admin router (auth-bypassed, since they're hit by
+    /// recipients' email clients). `None` ⇒ tracking
+    /// disabled and the ingest routes 404.
+    pub tracking: Option<Arc<crate::tracking::TrackingDeps>>,
 }
 
 impl AdminState {
@@ -79,6 +87,7 @@ impl AdminState {
             router: None,
             seller_lookup: None,
             template_lookup: None,
+            tracking: None,
         }
     }
 
@@ -134,6 +143,19 @@ impl AdminState {
         self
     }
 
+    /// Inject the engagement-tracking deps. When `Some`, the
+    /// public `/t/o/...` + `/t/c/...` routes mount on the
+    /// router. The same `Arc` should be threaded through the
+    /// outbound publisher so URL signing + ingest verification
+    /// share one signer instance.
+    pub fn with_tracking(
+        mut self,
+        deps: Arc<crate::tracking::TrackingDeps>,
+    ) -> Self {
+        self.tracking = Some(deps);
+        self
+    }
+
     pub fn lookup_store(&self, tenant_id: &TenantId) -> Option<Arc<LeadStore>> {
         self.stores.get(tenant_id).cloned()
     }
@@ -147,7 +169,7 @@ pub fn router(state: Arc<AdminState>) -> Router {
         Arc::clone(&state),
         auth::bearer_and_tenant_middleware,
     );
-    Router::new()
+    let protected = Router::new()
         .route("/healthz", get(healthz::handler))
         .route("/leads", get(leads::list_handler))
         .route("/leads/:lead_id", get(leads::get_handler))
@@ -174,8 +196,19 @@ pub fn router(state: Arc<AdminState>) -> Router {
                 .put(config::put_notification_templates),
         )
         .route("/firehose", get(firehose::handler))
-        .layer(auth_layer)
-        .with_state(state)
+        .layer(auth_layer);
+
+    // M15.23.a.3 — public ingest routes for the open pixel +
+    // click redirector. The bearer-auth middleware can't apply
+    // here (recipients' email clients don't carry our token);
+    // forgery is blocked by the HMAC tag in the URL. Mounted
+    // unconditionally — when `state.tracking == None` the
+    // handlers self-404.
+    let public = Router::new()
+        .route("/t/o/:tenant/:msg", get(tracking::open_handler))
+        .route("/t/c/:tenant/:msg/:link", get(tracking::click_handler));
+
+    protected.merge(public).with_state(state)
 }
 
 #[cfg(test)]
