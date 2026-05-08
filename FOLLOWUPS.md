@@ -39,15 +39,17 @@ in the confirm modal. Dropdown filters inactive agents.
 
 ## 🟡 Medium · technical debt
 
-### F6 · Reconciler walk O(N agents) per save
+### F6 · Reconciler walk affected agents only ✅ — done in M15.51-2
 
-- **Origin:** M15.37
-- **Status:** every seller save → `agents/list` + per-agent
-  `agents/get` + diff. ~200ms with 5 agents; 2-3s with 50.
-- **Plan:** compute the diff client-side comparing previous vs
-  new sellers list — only touch agents that appear in old
-  OR new `agent_id` set.
-- **Effort:** ~60 LOC + reconciler signature change.
+`reconcileAgentMarketingBindings(sellers, previousSellers?)`
+gains an optional second arg. When passed, the reconciler
+walks only agents in `(previous.agent_id ∪ next.agent_id)`
+instead of every agent in the deployment. Common case:
+operator edits one seller → 1 or 2 agents touched regardless
+of total agent count. `marketingConfig.ts::saveSellers`
+snapshots `slice.data` pre-save and threads it through. 3 new
+unit tests cover the fast path + the both-sides binding move
++ backwards-compat omit case.
 
 ### F9 · Notification deduplication missing
 
@@ -129,14 +131,14 @@ filtro" button that strips the URL param.
   add/remove inline.
 - **Effort:** ~150 LOC.
 
-### F14 · Stale data in `/agents` count badge
+### F14 · `/agents` badge stays fresh ✅ — done in M15.51
 
-- **Origin:** M15.36
-- **Status:** badge fetches sellers once on mount; no refresh
-  on cross-tab edit.
-- **Plan:** subscribe to firehose (extend with `seller.changed`
-  topic) or 30s polling.
-- **Effort:** depends on approach.
+`Agents.tsx` polls `getSellers` every 30 s while the tab is
+visible (skips the poll on `document.visibilityState !==
+"visible"` to avoid waking idle laptops). `visibilitychange`
+listener triggers a bonus refresh on tab focus so operators
+tabbing back from `/m/marketing/settings/sellers` see the
+badge update immediately instead of waiting up to 30 s.
 
 ### F17 · Marketing binding distinctly surfaced ✅ — done in M15.49
 
