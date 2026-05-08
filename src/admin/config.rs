@@ -26,10 +26,12 @@ use serde_json::{json, Value};
 use super::AdminState;
 use crate::config::{
     load_followup_profiles, load_mailboxes, load_notification_templates, load_sellers,
-    load_topic_guardrails, save_followup_profiles, save_mailboxes,
-    save_notification_templates, save_rules, save_sellers, save_topic_guardrails,
+    load_snippets, load_templates, load_topic_guardrails, save_followup_profiles,
+    save_mailboxes, save_notification_templates, save_rules, save_sellers,
+    save_snippets, save_templates, save_topic_guardrails,
 };
 use nexo_microapp_sdk::guardrails::{GuardrailRule, GuardrailSet};
+use nexo_microapp_sdk::templating::{Snippet, Template};
 use crate::error::MarketingError;
 use crate::lead::router::load_rule_set;
 use crate::lead::LeadRouter;
@@ -418,6 +420,118 @@ pub async fn put_notification_templates(
         "reloaded": reloaded,
         "restart_required": !reloaded,
     }))
+}
+
+/// `GET /config/templates` — operator-authored draft templates.
+pub async fn list_templates(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+) -> Response {
+    let root = match &state.state_root {
+        Some(r) => r,
+        None => return state_root_missing(),
+    };
+    match load_templates(root, &tenant_id) {
+        Ok(rows) => {
+            let count = rows.len();
+            ok(json!({ "templates": rows, "count": count }))
+        }
+        Err(e) => marketing_error(e),
+    }
+}
+
+/// `PUT /config/templates`. Body: `{ templates: [...Template...] }`.
+/// Atomic replace; the renderer is sandbox-by-construction so
+/// no compile pass is needed.
+pub async fn put_templates(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+    Json(body): Json<Value>,
+) -> Response {
+    let root = match &state.state_root {
+        Some(r) => r,
+        None => return state_root_missing(),
+    };
+    let value = match body.get("templates") {
+        Some(v) => v.clone(),
+        None => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "missing_field",
+                "body must carry a 'templates' array",
+            );
+        }
+    };
+    let rows: Vec<Template> = match serde_json::from_value(value) {
+        Ok(v) => v,
+        Err(e) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_payload",
+                &format!("templates failed validation: {e}"),
+            );
+        }
+    };
+    if let Err(e) = save_templates(root, &tenant_id, &rows) {
+        return marketing_error(e);
+    }
+    let count = rows.len();
+    ok(json!({ "templates": rows, "count": count }))
+}
+
+/// `GET /config/snippets` — operator-authored inline snippets.
+pub async fn list_snippets(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+) -> Response {
+    let root = match &state.state_root {
+        Some(r) => r,
+        None => return state_root_missing(),
+    };
+    match load_snippets(root, &tenant_id) {
+        Ok(rows) => {
+            let count = rows.len();
+            ok(json!({ "snippets": rows, "count": count }))
+        }
+        Err(e) => marketing_error(e),
+    }
+}
+
+/// `PUT /config/snippets`. Body: `{ snippets: [...Snippet...] }`.
+pub async fn put_snippets(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+    Json(body): Json<Value>,
+) -> Response {
+    let root = match &state.state_root {
+        Some(r) => r,
+        None => return state_root_missing(),
+    };
+    let value = match body.get("snippets") {
+        Some(v) => v.clone(),
+        None => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "missing_field",
+                "body must carry a 'snippets' array",
+            );
+        }
+    };
+    let rows: Vec<Snippet> = match serde_json::from_value(value) {
+        Ok(v) => v,
+        Err(e) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_payload",
+                &format!("snippets failed validation: {e}"),
+            );
+        }
+    };
+    if let Err(e) = save_snippets(root, &tenant_id, &rows) {
+        return marketing_error(e);
+    }
+    let count = rows.len();
+    ok(json!({ "snippets": rows, "count": count }))
 }
 
 /// `GET /config/topic_guardrails` — list of guardrail rules

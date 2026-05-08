@@ -24,6 +24,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use nexo_microapp_sdk::guardrails::GuardrailRule;
+use nexo_microapp_sdk::templating::{Snippet, Template};
 use nexo_tool_meta::marketing::{
     FollowupProfile, MailboxConfig, NotificationTemplates, Seller,
 };
@@ -75,6 +76,23 @@ pub fn load_sellers(
     tenant: &TenantId,
 ) -> Result<Vec<Seller>, MarketingError> {
     load_yaml_list(state_root, tenant, "sellers.yaml")
+}
+
+/// Read `templates.yaml`. Missing file → empty list (operator
+/// hasn't authored any draft templates yet).
+pub fn load_templates(
+    state_root: impl AsRef<Path>,
+    tenant: &TenantId,
+) -> Result<Vec<Template>, MarketingError> {
+    load_yaml_list(state_root, tenant, "templates.yaml")
+}
+
+/// Read `snippets.yaml`. Missing file → empty list.
+pub fn load_snippets(
+    state_root: impl AsRef<Path>,
+    tenant: &TenantId,
+) -> Result<Vec<Snippet>, MarketingError> {
+    load_yaml_list(state_root, tenant, "snippets.yaml")
 }
 
 /// Read `topic_guardrails.yaml`. Missing file → empty list
@@ -172,6 +190,24 @@ pub fn save_sellers(
     rows: &Vec<Seller>,
 ) -> Result<(), MarketingError> {
     save_yaml_list(state_root, tenant, "sellers.yaml", rows)
+}
+
+/// Write `templates.yaml`. Same full-replace contract.
+pub fn save_templates(
+    state_root: impl AsRef<Path>,
+    tenant: &TenantId,
+    rows: &Vec<Template>,
+) -> Result<(), MarketingError> {
+    save_yaml_list(state_root, tenant, "templates.yaml", rows)
+}
+
+/// Write `snippets.yaml`. Same full-replace contract.
+pub fn save_snippets(
+    state_root: impl AsRef<Path>,
+    tenant: &TenantId,
+    rows: &Vec<Snippet>,
+) -> Result<(), MarketingError> {
+    save_yaml_list(state_root, tenant, "snippets.yaml", rows)
 }
 
 /// Write `topic_guardrails.yaml`. Same full-replace contract.

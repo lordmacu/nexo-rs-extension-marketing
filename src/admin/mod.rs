@@ -236,6 +236,14 @@ pub fn router(state: Arc<AdminState>) -> Router {
             get(config::list_topic_guardrails)
                 .put(config::put_topic_guardrails),
         )
+        .route(
+            "/config/templates",
+            get(config::list_templates).put(config::put_templates),
+        )
+        .route(
+            "/config/snippets",
+            get(config::list_snippets).put(config::put_snippets),
+        )
         .route("/firehose", get(firehose::handler))
         .route(
             "/tracking/msg/:msg_id/engagement",
