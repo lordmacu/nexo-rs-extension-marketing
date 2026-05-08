@@ -5,22 +5,39 @@ Each entry: origin milestone · estimated effort · acceptance criteria.
 
 ## 🟠 High · UX visible
 
-### F19 · Lead drawer: duplicate-person merge prompt (M15.23.e)
+### F19 · Lead drawer: duplicate-person merge prompt ✅ — done in agent-creator 0.0.64
 
-- **Origin:** M15.23.e.5 — broker hop now records
-  `AuditEvent::DuplicatePersonDetected` whenever a new
-  lead's resolved person collides with an existing one
-  (email / phone / name+company signals). The audit row is
-  queryable via `GET /audit?kind=duplicate_person_detected&lead_id=<id>`
-  but no UI consumes it.
-- **Plan:** lead drawer reads the audit endpoint on mount,
-  renders a violet "🔀 Posible duplicado" banner when 1+
-  candidates exist; banner shows the candidate's
-  `primary_name` + `primary_email` + signal label +
-  confidence; "Confirmar merge" / "Descartar" buttons.
-- **Effort:** ~250 LOC frontend (banner component + API
-  integration + zustand state for the candidate list).
-- **Blocker:** none — backend ready.
+`DuplicateMergePrompt` component sits under the lead-
+drawer header. Mounts on `lead_id` change, fetches
+`/audit?lead_id=<id>&kind=duplicate_person_detected&limit=50`
+via the new `getAudit()` API client + `/api/marketing/audit`
+backend proxy.
+
+`collapseAudit(rows)` (pure helper, exposed for unit
+testing) merges multiple audit rows for the same
+candidate into one prompt entry — best confidence + union
+of signals + earliest `at_ms`. Sorts desc by confidence
+so the operator's top suggestion lands first.
+
+UI per candidate: violet banner with `Users` icon +
+candidate `person_id` (mono) + confidence chip
+(percentage) + signal badges (email_match / phone_match /
+name_company_fuzzy) + detail prose row + two buttons:
+- **Confirmar merge** disabled with tooltip
+  ("Merge endpoint pendiente — operador resuelve
+  manualmente"). Real merge mutation lands when the
+  endpoint ships (deferred follow-up).
+- **Descartar** local-only state (resets on lead change),
+  hides the candidate from the prompt without backend
+  mutation.
+
+7 vitest unit cases on `collapseAudit`: empty input,
+non-duplicate kinds filtered, multi-signal collapse,
+detail tracks highest confidence, identical signal
+deduped, sort order, earliest at_ms preserved.
+
+86/86 frontend tests green (79 baseline + 7 new). Frontend
+0.0.76 → 0.0.77 · agent-creator 0.0.63 → 0.0.64.
 
 ### F20 · Lead drawer: engagement badge (M15.23.a.4)
 
