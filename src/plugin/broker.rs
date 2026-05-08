@@ -721,6 +721,76 @@ pub async fn handle_inbound_event(
                     );
                 }
             }
+            // M15.23.e — cross-channel duplicate-person scan.
+            // Runs only when both identity stores are wired
+            // (boot path always wires them; tests skip).
+            // Phone slice is empty for an email-resolved lead
+            // — the WA side populates `PersonPhone` separately
+            // when a matching contact lands.
+            if let (Some(log), Some(deps)) = (audit, identity) {
+                if let Some(phone_store) = deps.person_phones.as_ref() {
+                    if let Ok(Some(resolved_person)) = deps
+                        .persons
+                        .get(tenant_id.as_str(), &lead.person_id)
+                        .await
+                    {
+                        let phones: Vec<String> = Vec::new();
+                        let inputs = crate::duplicate::MatchInputs {
+                            candidate: &resolved_person,
+                            phones: &phones,
+                        };
+                        match crate::duplicate::find_duplicate_candidates(
+                            tenant_id.as_str(),
+                            &inputs,
+                            deps.person_emails.as_ref(),
+                            Some(phone_store.as_ref()),
+                            deps.persons.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(candidates) => {
+                                for c in candidates {
+                                    let event =
+                                        crate::audit::AuditEvent::DuplicatePersonDetected {
+                                            tenant_id: tenant_id
+                                                .as_str()
+                                                .to_string(),
+                                            lead_id: lead.id.0.clone(),
+                                            candidate_person_id: c
+                                                .person_id
+                                                .0
+                                                .clone(),
+                                            resolved_person_id: lead
+                                                .person_id
+                                                .0
+                                                .clone(),
+                                            signal: c.signal,
+                                            confidence: c.confidence,
+                                            detail: c.detail,
+                                            at_ms: now_ms.max(0) as u64,
+                                        };
+                                    if let Err(e) = log.record(event).await {
+                                        tracing::warn!(
+                                            target: "plugin.marketing.broker",
+                                            error = %e,
+                                            lead_id = %lead.id.0,
+                                            "duplicate audit record failed (non-fatal)"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "plugin.marketing.broker",
+                                    error = %e,
+                                    lead_id = %lead.id.0,
+                                    "duplicate-person scan failed (non-fatal)"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             // Seed the thread with the inbound that triggered
             // creation — the operator opens the lead detail and
             // sees the original email immediately.

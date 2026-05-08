@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use nexo_microapp_sdk::enrichment::FallbackChain;
-use nexo_microapp_sdk::identity::{PersonEmailStore, PersonStore};
+use nexo_microapp_sdk::identity::{PersonEmailStore, PersonPhoneStore, PersonStore};
 
 use crate::firehose::LeadEventBus;
 use crate::lead::{LeadStore, RouterHandle};
@@ -36,6 +36,11 @@ pub mod tool_defs;
 pub struct IdentityDeps {
     pub persons: Arc<dyn PersonStore>,
     pub person_emails: Arc<dyn PersonEmailStore>,
+    /// M15.23.e — phone identifier store. `None` ⇒ phone-
+    /// based duplicate detection skipped (operator hasn't
+    /// wired WhatsApp / SMS into the marketing extension's
+    /// identity pool yet).
+    pub person_phones: Option<Arc<dyn PersonPhoneStore>>,
     pub chain: Arc<FallbackChain>,
 }
 
@@ -48,8 +53,19 @@ impl IdentityDeps {
         Self {
             persons,
             person_emails,
+            person_phones: None,
             chain,
         }
+    }
+
+    /// Builder-style wiring for the phone store. Boot path
+    /// passes the same Arc the duplicate matcher consumes.
+    pub fn with_person_phones(
+        mut self,
+        phones: Arc<dyn PersonPhoneStore>,
+    ) -> Self {
+        self.person_phones = Some(phones);
+        self
     }
 }
 

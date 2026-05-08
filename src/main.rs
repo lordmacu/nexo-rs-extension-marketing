@@ -128,12 +128,20 @@ async fn main() -> anyhow::Result<()> {
     let persons: Arc<dyn PersonStore> =
         Arc::new(SqlitePersonStore::new(identity_pool.clone()));
     let person_emails: Arc<dyn PersonEmailStore> =
-        Arc::new(SqlitePersonEmailStore::new(identity_pool));
+        Arc::new(SqlitePersonEmailStore::new(identity_pool.clone()));
+    // M15.23.e — phone store rides on the same identity pool
+    // so the duplicate matcher's email + phone signals share
+    // one transactional surface.
+    let person_phones: Arc<dyn nexo_microapp_sdk::identity::PersonPhoneStore> =
+        Arc::new(nexo_microapp_sdk::identity::SqlitePersonPhoneStore::new(
+            identity_pool,
+        ));
     let chain = Arc::new(FallbackChain::new(
         vec![Box::new(DisplayNameParser), Box::new(ReplyToReader)],
         0.7,
     ));
-    let identity = IdentityDeps::new(persons, person_emails, chain);
+    let identity = IdentityDeps::new(persons, person_emails, chain)
+        .with_person_phones(person_phones);
     tracing::info!(tenant = %tenant, "identity stores + resolver chain ready");
 
     // M15.53 / F9 — single dedup cache shared between the broker
