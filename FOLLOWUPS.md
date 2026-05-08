@@ -281,16 +281,50 @@ routes through `classify` for them. 4 new tests (one per kind
 
 ## 🔵 Low · nice-to-have
 
-### F27 · `/marketing/audit` UI tab
+### F27 · `/marketing/audit` UI tab ✅ — done in agent-creator 0.0.66
 
-- **Origin:** M15.23.c — `/audit` query endpoint shipped
-  with all 4 producers wiring rows. No UI consumes it.
-- **Plan:** new tab in `/marketing/settings/audit` (or as a
-  dedicated module rail entry) — table with filter chips
-  for kind / lead_id / since_ms; row click expands the
-  `detail` field. Pagination via `limit` + `since_ms`
-  cursor.
-- **Effort:** ~250 LOC frontend + 4-6 vitest cases.
+`SettingsAudit` component shipped as a new tab in
+`/m/marketing/settings/audit`. Reads
+`/api/marketing/audit?kind=&lead_id=&limit=` via the
+existing `getAudit()` API client.
+
+UI layout:
+- Filter strip (Kind dropdown · Lead id input · Límite
+  numeric · Aplicar / Limpiar buttons). Draft state until
+  Aplicar fires, so typing a lead id doesn't fire a GET
+  per keystroke.
+- Empty / loading / error states (each with concrete copy
+  surfacing tenant scoping).
+- Row format: timestamp + kind badge (color-keyed by
+  variant) + optional lead_id mono + summary + expand
+  caret. Click expands an indented JSON pre block for the
+  full row.
+
+`summarizeAuditEvent(e)` distills each variant into a
+one-line summary:
+- `routing_decided` → `→ <seller> · <email> (rule:<id>) · score N`
+  (or `dropped · …` on null seller)
+- `lead_transitioned` → `<from> → <to> · <reason>`
+- `notification_published` → `<kind> · <channel> · seller <id>`
+- `topic_guardrail_fired` → `<rule_name> (<action>) · "<excerpt>"`
+- `duplicate_person_detected` → `<conf%> · <signal> · <detail>`
+
+Exhaustive `switch` on the discriminator forces a TS
+compile error if a future audit kind lands without a
+renderer.
+
+10 vitest unit cases cover every variant + edge cases:
+seller-arrow vs dropped, rule-id suffix when present,
+empty reason on lead_transitioned, deduped channel on
+notification_published, percent rounding on
+duplicate_person_detected.
+
+108/108 frontend tests green (98 baseline + 10 F27). Build
+clean (579 kB main bundle).
+
+Bump:
+- agent-creator-frontend 0.0.78 → 0.0.79
+- agent-creator 0.0.65 → 0.0.66
 
 ### F28 · Smoke test E2E vs real mailbox (M15.26)
 
