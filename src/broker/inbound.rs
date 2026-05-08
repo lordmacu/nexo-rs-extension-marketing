@@ -137,7 +137,13 @@ pub fn decode_inbound_email(
         .unwrap_or_default();
     let body_excerpt = body_excerpt.chars().take(2_000).collect::<String>();
 
-    let thread_id = derive_thread_id(message_id.as_deref(), in_reply_to.as_deref(), &references);
+    let thread_id = derive_thread_id(
+        message_id.as_deref(),
+        in_reply_to.as_deref(),
+        &references,
+        &from_email,
+        &subject,
+    );
 
     Ok(ParsedInbound {
         instance: instance.to_string(),
@@ -226,6 +232,8 @@ fn derive_thread_id(
     message_id: Option<&str>,
     in_reply_to: Option<&str>,
     references: &[String],
+    from_email: &str,
+    subject: &str,
 ) -> String {
     // Standard email threading: the first message in a thread
     // is its own root. Replies inherit the root from
@@ -239,10 +247,14 @@ fn derive_thread_id(
     if let Some(mid) = message_id {
         return mid.trim_matches(|c| c == '<' || c == '>').to_string();
     }
-    // No identifiers at all → synthesize from sender + subject
-    // hash so the same conversation lands in the same thread
-    // even on broken clients. Last-resort.
-    "thread-orphan".to_string()
+    // M17.3 — no identifiers at all → synthesize from sender +
+    // normalized subject hash so the same conversation lands
+    // in the same thread even when the mailer strips headers.
+    // Two header-less inbounds from the same sender on the
+    // same subject thread together; two unrelated cold leads
+    // get distinct synthetic ids (the previous fallback
+    // collapsed every orphan into `"thread-orphan"`).
+    crate::threading::synth_thread_id(from_email, subject)
 }
 
 fn strip_html(html: &str) -> String {
@@ -401,6 +413,68 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert!(p.body_excerpt.contains("there"));
         assert!(!p.body_excerpt.contains('<'));
         assert!(!p.body_excerpt.contains('>'));
+    }
+
+    fn fixture_headerless(from: &str, subject: &str) -> Vec<u8> {
+        // Mailer that strips Message-Id / In-Reply-To /
+        // References — purely artificial fixture used to
+        // exercise the M17.3 synth fallback.
+        format!(
+            "From: {from}\r\n\
+             To: ventas@miempresa.com\r\n\
+             Subject: {subject}\r\n\
+             Date: Mon, 12 May 2026 14:32:00 +0000\r\n\
+             \r\n\
+             body\r\n",
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn headerless_inbound_uses_synth_thread_id() {
+        let p = decode_inbound_email(
+            "acme",
+            "ventas",
+            1,
+            &fixture_headerless("juan@acme.com", "Cotización"),
+        )
+        .unwrap();
+        // Synth fallback fires (no Message-Id / In-Reply-To /
+        // References on the wire).
+        assert!(p.thread_id.starts_with("synth:"));
+        // Same sender + same subject → same synth id (so a
+        // follow-up "Re: Cotización" from the same address
+        // re-attaches to the same lead).
+        let q = decode_inbound_email(
+            "acme",
+            "ventas",
+            2,
+            &fixture_headerless("juan@acme.com", "Re: Cotización"),
+        )
+        .unwrap();
+        assert_eq!(p.thread_id, q.thread_id);
+    }
+
+    #[test]
+    fn headerless_distinct_senders_get_distinct_synth_ids() {
+        let a = decode_inbound_email(
+            "acme",
+            "ventas",
+            1,
+            &fixture_headerless("juan@acme.com", "Hola"),
+        )
+        .unwrap();
+        let b = decode_inbound_email(
+            "acme",
+            "ventas",
+            2,
+            &fixture_headerless("ana@globex.io", "Hola"),
+        )
+        .unwrap();
+        assert_ne!(
+            a.thread_id, b.thread_id,
+            "two header-less leads from different senders must NOT collapse into one thread"
+        );
     }
 
     #[test]

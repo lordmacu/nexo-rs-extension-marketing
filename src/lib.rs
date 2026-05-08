@@ -33,6 +33,7 @@ pub mod notification;
 pub mod notification_dedup;
 pub mod plugin;
 pub mod tenant;
+pub mod threading;
 pub mod tools;
 pub mod tracking;
 
