@@ -26,6 +26,7 @@ use crate::tenant::TenantId;
 
 pub mod audit;
 pub mod auth;
+pub mod compose;
 pub mod config;
 pub mod firehose;
 pub mod healthz;
@@ -568,6 +569,13 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route(
             "/spam-filter/test",
             axum::routing::post(spam_filter::test_handler),
+        )
+        // Operator-initiated outbound (cold outreach) — same
+        // OutboundPublisher path the approve flow uses, with
+        // the tracking signer applied when configured.
+        .route(
+            "/compose/send",
+            axum::routing::post(compose::send_handler),
         )
         // Marketing on/off toggle. Pause halts automated
         // effects (notifications, draft generation, follow-up
