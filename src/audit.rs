@@ -228,6 +228,30 @@ pub enum AuditEvent {
         /// Wall-clock at_ms.
         at_ms: u64,
     },
+    /// Inbound matched the unsubscribe / opt-out detector
+    /// (audit fix #5). The lead is auto-transitioned to `lost`,
+    /// the sender is auto-added to the per-tenant
+    /// spam_filter_rules sender_block list, and any pending
+    /// followups clear. Operator queries
+    /// `kind=unsubscribe_detected` to review every auto-block
+    /// the system applied + confirm none are false positives.
+    UnsubscribeDetected {
+        /// Tenant scope.
+        tenant_id: String,
+        /// Lead the opt-out fired against. `None` only when
+        /// the inbound came on a thread the system hadn't
+        /// tracked (rare — usually opt-outs land on existing
+        /// engagement threads).
+        lead_id: Option<String>,
+        /// Sender email auto-added to `sender_block`.
+        from_email: String,
+        /// The exact substring that triggered the detector.
+        /// Surface in the audit UI so an operator can sanity-
+        /// check the match.
+        matched_keyword: String,
+        /// Wall-clock at_ms.
+        at_ms: u64,
+    },
     /// Spam / promo classifier dropped an inbound. Recorded
     /// pre-resolver so no lead row exists yet — the operator's
     /// compliance view filters by `kind = promo_filtered` to
@@ -270,6 +294,7 @@ impl EventMetadata for AuditEvent {
             Self::DuplicatePersonDetected { .. } => "duplicate_person_detected",
             Self::DraftDeduped { .. } => "draft_deduped",
             Self::PromoFiltered { .. } => "promo_filtered",
+            Self::UnsubscribeDetected { .. } => "unsubscribe_detected",
         }
     }
 
@@ -291,6 +316,9 @@ impl EventMetadata for AuditEvent {
             // by sender email so the operator can pull "every
             // promo we dropped from this sender".
             Self::PromoFiltered { from_email, .. } => from_email.as_str(),
+            Self::UnsubscribeDetected { lead_id, from_email, .. } => {
+                lead_id.as_deref().unwrap_or(from_email.as_str())
+            }
         }
     }
 
@@ -304,6 +332,7 @@ impl EventMetadata for AuditEvent {
             Self::DuplicatePersonDetected { tenant_id, .. } => tenant_id.as_str(),
             Self::DraftDeduped { tenant_id, .. } => tenant_id.as_str(),
             Self::PromoFiltered { tenant_id, .. } => tenant_id.as_str(),
+            Self::UnsubscribeDetected { tenant_id, .. } => tenant_id.as_str(),
         })
     }
 
@@ -317,6 +346,7 @@ impl EventMetadata for AuditEvent {
             Self::DuplicatePersonDetected { at_ms, .. } => *at_ms,
             Self::DraftDeduped { at_ms, .. } => *at_ms,
             Self::PromoFiltered { at_ms, .. } => *at_ms,
+            Self::UnsubscribeDetected { at_ms, .. } => *at_ms,
         }
     }
 }

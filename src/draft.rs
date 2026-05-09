@@ -476,8 +476,26 @@ impl DraftGenerator for AgentDraftGenerator {
             temperature: Some(0.7),
             system_prompt,
         };
-        match broker.complete_llm(params).await {
-            Ok(r) => {
+        // 30s ceiling on the LLM RPC. Without this, a slow
+        // provider (rate-limit queue, cold model) leaves the
+        // request hanging until axum's HTTP server timeout kicks
+        // (60s default), but the broker call keeps running
+        // detached and may eventually persist a draft after the
+        // operator already navigated away — ghost row with a
+        // signature collision against future generates.
+        const LLM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        let raced = tokio::time::timeout(LLM_TIMEOUT, broker.complete_llm(params)).await;
+        match raced {
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "extension.marketing.draft_generate",
+                    seller_id = %ctx.seller.id.0,
+                    timeout_secs = LLM_TIMEOUT.as_secs(),
+                    "LLM call timed out; falling back to template"
+                );
+                self.fallback.generate(ctx).await
+            }
+            Ok(Ok(r)) => {
                 let body = r.content.trim();
                 if body.is_empty() {
                     tracing::warn!(
@@ -489,7 +507,7 @@ impl DraftGenerator for AgentDraftGenerator {
                 }
                 Ok(body.to_string())
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(
                     target: "extension.marketing.draft_generate",
                     seller_id = %ctx.seller.id.0,

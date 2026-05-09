@@ -654,6 +654,91 @@ pub async fn handle_inbound_event(
         }
     };
 
+    // Audit fix #5 — unsubscribe detector. Runs BEFORE the
+    // existing-thread short-circuit so a customer replying
+    // "darse de baja" on an active thread also halts cron
+    // followups + auto-blocks the sender. We persist the
+    // sender block synchronously so subsequent inbounds from
+    // the same address drop pre-pipeline. Compliance signal —
+    // CAN-SPAM § 7704(a)(4) + GDPR Art. 21 require honouring
+    // unsubscribe requests promptly.
+    if let Some(matched_kw) =
+        crate::unsubscribe::detect_unsubscribe(&parsed.subject, &parsed.body_excerpt)
+    {
+        let now_ms = Utc::now().timestamp_millis();
+        let lead_id_for_audit = match store.find_by_thread(&parsed.thread_id).await {
+            Ok(Some(lead)) => {
+                // Transition existing lead to Lost. transition()
+                // also auto-rejects pending drafts and clears
+                // next_check_at_ms (audit fix #3).
+                let _ = store
+                    .transition(&lead.id, nexo_tool_meta::marketing::LeadState::Lost)
+                    .await;
+                Some(lead.id.0.clone())
+            }
+            _ => None,
+        };
+        // Auto-add the sender to the per-tenant
+        // sender_block list. The same RulesCache the broker
+        // hop's spam_filter uses, so the next inbound from
+        // this address gets dropped pre-pipeline.
+        if let Some(cache) = spam_filter {
+            let store = cache.store();
+            if let Err(e) = store
+                .add_rule(
+                    tenant_id.as_str(),
+                    crate::spam_filter::RuleKind::SenderBlock,
+                    &parsed.from_email,
+                    Some("auto-added by unsubscribe detector"),
+                    now_ms,
+                )
+                .await
+            {
+                tracing::warn!(
+                    target: "plugin.marketing.broker",
+                    error = %e,
+                    "auto-block on unsubscribe failed",
+                );
+            } else {
+                cache.invalidate(tenant_id.as_str()).await;
+            }
+        }
+        if let Some(audit_log) = audit {
+            let event = crate::audit::AuditEvent::UnsubscribeDetected {
+                tenant_id: tenant_id.as_str().to_string(),
+                lead_id: lead_id_for_audit.clone(),
+                from_email: parsed.from_email.clone(),
+                matched_keyword: matched_kw.to_string(),
+                at_ms: now_ms as u64,
+            };
+            if let Err(e) = audit_log.record(event).await {
+                tracing::warn!(
+                    target: "plugin.marketing.broker",
+                    error = %e,
+                    "audit record unsubscribe_detected failed",
+                );
+            }
+        }
+        tracing::info!(
+            target: "plugin.marketing.broker",
+            from = %parsed.from_email,
+            subject = %parsed.subject,
+            matched_keyword = %matched_kw,
+            lead_id = ?lead_id_for_audit,
+            "unsubscribe detected — lead closed, sender auto-blocked",
+        );
+        // Outcome: existing-lead path returns LeadUpdated
+        // (consistent with thread-bump semantics); cold path
+        // returns Skipped because no lead was created.
+        return match lead_id_for_audit {
+            Some(lid) => HandledOutcome::LeadUpdated {
+                lead_id: LeadId(lid),
+                thread_id: parsed.thread_id,
+            },
+            None => HandledOutcome::Skipped,
+        };
+    }
+
     // Existing thread short-circuits everything below — fastest
     // path. Resolver + router are skipped because the lead is
     // already attributed.

@@ -318,9 +318,57 @@ impl LeadStore {
         .bind(&lead_id.0)
         .execute(&self.pool)
         .await?;
+        // Audit fix #3 — terminal transitions auto-reject any
+        // pending drafts so an operator can't accidentally
+        // approve and send a draft to a lead that's already
+        // closed (`qualified` = converted, `lost` = no-go).
+        // Also clear `next_check_at_ms` so the cron stops
+        // evaluating the lead.
+        if matches!(to, LeadState::Qualified | LeadState::Lost) {
+            let auto_rejected = self.reject_pending_drafts(lead_id).await?;
+            sqlx::query(
+                "UPDATE leads SET next_check_at_ms = NULL \
+                 WHERE tenant_id = ? AND id = ?",
+            )
+            .bind(self.tenant_id.as_str())
+            .bind(&lead_id.0)
+            .execute(&self.pool)
+            .await?;
+            if auto_rejected > 0 {
+                tracing::info!(
+                    target: "marketing.lead.transition",
+                    lead_id = %lead_id.0,
+                    target_state = state_str(to),
+                    auto_rejected_drafts = auto_rejected,
+                    "terminal transition rejected pending drafts",
+                );
+            }
+        }
         self.get(lead_id)
             .await?
             .ok_or_else(|| MarketingError::Sqlite(sqlx::Error::RowNotFound))
+    }
+
+    /// Mass-reject every `pending` draft for a lead. Used by
+    /// `transition` on terminal states (qualified / lost) so an
+    /// operator can't accidentally send a draft to an already-
+    /// closed lead. Returns the count of rows affected so the
+    /// caller can log / audit.
+    pub async fn reject_pending_drafts(
+        &self,
+        lead_id: &LeadId,
+    ) -> Result<u64, MarketingError> {
+        let r = sqlx::query(
+            "UPDATE thread_messages \
+             SET draft_status = 'rejected' \
+             WHERE tenant_id = ? AND lead_id = ? \
+               AND direction = 'draft' AND draft_status = 'pending'",
+        )
+        .bind(self.tenant_id.as_str())
+        .bind(&lead_id.0)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
     }
 
     /// Apply uniform jitter inside `[-window/2, +window/2]` to a
@@ -1289,6 +1337,116 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, MarketingError::InvalidTransition { .. }));
+    }
+
+    /// Audit fix #3 — moving a lead to a terminal state
+    /// (`lost` reachable directly from `cold`/`engaged`/
+    /// `meeting_scheduled`/`qualified`) auto-rejects pending
+    /// drafts and clears `next_check_at_ms` so the cron stops
+    /// evaluating the closed lead.
+    #[tokio::test]
+    async fn terminal_transition_auto_rejects_pending_drafts() {
+        let s = fresh_store("acme").await;
+        s.create(input("l1", "juan", "pedro")).await.unwrap();
+        s.set_next_check(&LeadId("l1".into()), Some(1_700_000_000_000), false)
+            .await
+            .unwrap();
+        // Engaged so the lead has both pending drafts and an
+        // active followup schedule when the terminal transition
+        // fires.
+        s.transition(&LeadId("l1".into()), LeadState::Engaged)
+            .await
+            .unwrap();
+        // Seed two pending drafts on the lead.
+        s.append_thread_message(
+            &LeadId("l1".into()),
+            NewThreadMessage {
+                message_id: "d1".into(),
+                direction: MessageDirection::Draft,
+                from_label: "AI".into(),
+                body: "draft 1".into(),
+                at_ms: 100,
+                draft_status: Some(DraftStatus::Pending),
+                subject: None,
+                signature: Some("sig-1".into()),
+            },
+        )
+        .await
+        .unwrap();
+        s.append_thread_message(
+            &LeadId("l1".into()),
+            NewThreadMessage {
+                message_id: "d2".into(),
+                direction: MessageDirection::Draft,
+                from_label: "AI".into(),
+                body: "draft 2".into(),
+                at_ms: 200,
+                draft_status: Some(DraftStatus::Pending),
+                subject: None,
+                signature: Some("sig-2".into()),
+            },
+        )
+        .await
+        .unwrap();
+        // Move to lost — terminal transition reachable from
+        // engaged. Same auto-reject + clear-next-check logic as
+        // qualified (which would require walking through
+        // meeting_scheduled first).
+        let after = s
+            .transition(&LeadId("l1".into()), LeadState::Lost)
+            .await
+            .unwrap();
+        assert_eq!(after.state, LeadState::Lost);
+        assert!(
+            after.next_check_at_ms.is_none(),
+            "terminal transition must clear next_check_at_ms",
+        );
+        // Pending drafts were rejected en bloc.
+        let pending = s
+            .list_drafts(&LeadId("l1".into()), Some(DraftStatus::Pending))
+            .await
+            .unwrap();
+        assert!(
+            pending.is_empty(),
+            "pending drafts must be auto-rejected on terminal transition",
+        );
+        let rejected = s
+            .list_drafts(&LeadId("l1".into()), Some(DraftStatus::Rejected))
+            .await
+            .unwrap();
+        assert_eq!(rejected.len(), 2);
+    }
+
+    /// Audit fix #3 — non-terminal transition (cold→engaged)
+    /// must NOT touch the pending drafts; the operator may still
+    /// want to approve them.
+    #[tokio::test]
+    async fn nonterminal_transition_keeps_pending_drafts() {
+        let s = fresh_store("acme").await;
+        s.create(input("l1", "juan", "pedro")).await.unwrap();
+        s.append_thread_message(
+            &LeadId("l1".into()),
+            NewThreadMessage {
+                message_id: "d1".into(),
+                direction: MessageDirection::Draft,
+                from_label: "AI".into(),
+                body: "draft".into(),
+                at_ms: 100,
+                draft_status: Some(DraftStatus::Pending),
+                subject: None,
+                signature: Some("sig".into()),
+            },
+        )
+        .await
+        .unwrap();
+        s.transition(&LeadId("l1".into()), LeadState::Engaged)
+            .await
+            .unwrap();
+        let pending = s
+            .list_drafts(&LeadId("l1".into()), Some(DraftStatus::Pending))
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "engaged transition must not auto-reject drafts");
     }
 
     #[tokio::test]
