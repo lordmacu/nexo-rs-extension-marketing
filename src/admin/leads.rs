@@ -1144,6 +1144,22 @@ pub async fn generate_draft_handler(
 ) -> Response {
     use crate::lead::MessageDirection;
 
+    // Marketing pause gate: refuse the LLM-spending automation
+    // when the tenant is disabled. Operator can still EDIT,
+    // APPROVE, SEND existing pending drafts (those endpoints
+    // are intentionally separate so the operator stays in
+    // control of inflight work during a pause).
+    if let Some(state_cache) = state.marketing_state.as_ref() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if !state_cache.is_enabled(tenant_id.as_str(), now_ms).await {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "marketing_paused",
+                "marketing extension is paused for this tenant — re-enable to generate drafts",
+            );
+        }
+    }
+
     // ── Validate wiring ──────────────────────────────────────
     let store = match state.lookup_store(&tenant_id) {
         Some(s) => s,

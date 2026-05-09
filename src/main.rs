@@ -280,13 +280,35 @@ async fn main() -> anyhow::Result<()> {
         nexo_marketing::spam_filter::RulesCache::new(spam_filter_store.clone());
     tracing::info!(tenant = %tenant, "spam filter ready");
 
+    // ─── Scoring config (per-tenant tunables) ──────────────────
+    nexo_marketing::scoring::migrate_scoring(&identity_pool)
+        .await
+        .context("scoring migrate")?;
+    let scoring_store =
+        nexo_marketing::scoring::ScoringConfigStore::new(identity_pool.clone());
+    let scoring_cache =
+        nexo_marketing::scoring::ScoringConfigCache::new(scoring_store);
+    tracing::info!(tenant = %tenant, "scoring config ready");
+
+    // ─── Marketing on/off toggle ───────────────────────────────
+    nexo_marketing::marketing_state::migrate(&identity_pool)
+        .await
+        .context("marketing_state migrate")?;
+    let marketing_state_store =
+        nexo_marketing::marketing_state::MarketingStateStore::new(identity_pool.clone());
+    let marketing_state_cache =
+        nexo_marketing::marketing_state::MarketingStateCache::new(marketing_state_store);
+    tracing::info!(tenant = %tenant, "marketing on/off cache ready");
+
     let plugin_deps = PluginDeps::new(tenant.clone(), lead_store.clone(), router.clone())
         .with_identity(identity.clone())
         .with_sellers(seller_lookup.clone())
         .with_templates(template_lookup.clone())
         .with_dedup(dedup.clone())
         .with_audit(audit_log.clone())
-        .with_spam_filter(spam_filter_cache.clone());
+        .with_spam_filter(spam_filter_cache.clone())
+        .with_scoring(scoring_cache.clone())
+        .with_marketing_state(marketing_state_cache.clone());
 
     // ─── Lead lifecycle bus (firehose) ────────────────────────
     // Shared between the broker handler (producer) and the
@@ -426,7 +448,9 @@ async fn main() -> anyhow::Result<()> {
         .with_draft_template(draft_template_handle.clone())
         .with_persons(persons.clone())
         .with_companies(companies.clone())
-        .with_spam_filter(spam_filter_cache.clone());
+        .with_spam_filter(spam_filter_cache.clone())
+        .with_scoring(scoring_cache.clone())
+        .with_marketing_state(marketing_state_cache.clone());
     if let Some(deps) = tracking_deps.clone() {
         admin_state_builder = admin_state_builder
             .with_tracking(deps.clone())
@@ -467,6 +491,8 @@ async fn main() -> anyhow::Result<()> {
     // /admin/spam-filter on the http server invalidates the
     // entry the broker hop will read on the next inbound.
     let broker_spam_filter = spam_filter_cache.clone();
+    let broker_scoring = scoring_cache.clone();
+    let broker_marketing_state = marketing_state_cache.clone();
     // M15.23.e WA half — tenant resolver dedicated to
     // WhatsApp inbounds. Falls back to the same default
     // tenant the email side uses so single-tenant operators
@@ -516,6 +542,8 @@ async fn main() -> anyhow::Result<()> {
                 let whatsapp_resolver = broker_whatsapp_resolver.clone();
                 let enrichment = broker_enrichment.clone();
                 let spam_filter = broker_spam_filter.clone();
+                let scoring_clone = broker_scoring.clone();
+                let mstate_clone = broker_marketing_state.clone();
                 async move {
                     // M15.39 — single broker subscriber, two
                     // dispatchers. Topic prefix routes between:
@@ -575,6 +603,8 @@ async fn main() -> anyhow::Result<()> {
                         Some(&guardrails),
                         enrichment.as_ref(),
                         Some(&spam_filter),
+                        Some(&scoring_clone),
+                        Some(&mstate_clone),
                     )
                     .await;
                 }

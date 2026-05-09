@@ -35,6 +35,7 @@ pub mod forwarder;
 pub mod guardrails;
 pub mod identity;
 pub mod lead;
+pub mod marketing_state;
 pub mod notification;
 pub mod notification_dedup;
 pub mod plugin;

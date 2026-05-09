@@ -187,6 +187,18 @@ pub struct PluginDeps {
     /// entry. `None` disables filtering — useful in tests +
     /// minimal setups where the operator hasn't enabled it.
     pub spam_filter: Option<crate::spam_filter::RulesCache>,
+    /// Per-tenant scoring config cache (thresholds + keyword
+    /// lists). When set, the broker hop reads the cached config
+    /// before invoking the scorer so tenant tuning lands on the
+    /// next inbound. `None` falls back to bundled defaults.
+    pub scoring: Option<crate::scoring::ScoringConfigCache>,
+    /// Per-tenant on/off toggle. When the tenant is paused, the
+    /// broker hop skips notification publishes (lead create +
+    /// thread bump still happen so inbox keeps populating) and
+    /// the followup sweep tool returns `paused: true` so the
+    /// agent runtime backs off. `None` ⇒ tenant always treated
+    /// as enabled.
+    pub marketing_state: Option<crate::marketing_state::MarketingStateCache>,
 }
 
 impl PluginDeps {
@@ -206,6 +218,8 @@ impl PluginDeps {
             audit: None,
             enrichment: None,
             spam_filter: None,
+            scoring: None,
+            marketing_state: None,
         }
     }
 
@@ -272,6 +286,25 @@ impl PluginDeps {
     /// /admin/spam-filter takes effect on the very next inbound.
     pub fn with_spam_filter(mut self, cache: crate::spam_filter::RulesCache) -> Self {
         self.spam_filter = Some(cache);
+        self
+    }
+
+    /// Builder-style wiring for the scoring config cache.
+    /// Read path on the broker hop's score_lead; write path on
+    /// the admin endpoint that PUT-s a tenant override.
+    pub fn with_scoring(mut self, cache: crate::scoring::ScoringConfigCache) -> Self {
+        self.scoring = Some(cache);
+        self
+    }
+
+    /// Builder-style wiring for the marketing on/off cache. Same
+    /// Arc shared with the admin endpoint that toggles it; broker
+    /// hop checks `is_enabled()` before any automated effect.
+    pub fn with_marketing_state(
+        mut self,
+        cache: crate::marketing_state::MarketingStateCache,
+    ) -> Self {
+        self.marketing_state = Some(cache);
         self
     }
 }

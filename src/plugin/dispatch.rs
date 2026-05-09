@@ -64,6 +64,33 @@ pub async fn dispatch(
     ctx: Option<&ToolContext>,
 ) -> Result<Value, ToolInvocationError> {
     let tenant = &deps.tenant_id;
+
+    // Marketing on/off gate: when the tenant is paused, every
+    // automation tool short-circuits to a `paused: true` reply
+    // so the agent runtime backs off without firing
+    // notification publishes / draft generates / followup
+    // schedules. Manual operator endpoints (admin handlers)
+    // still work — only the agent-runtime tool surface pauses.
+    if let Some(state_cache) = deps.marketing_state.as_ref() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if !state_cache.is_enabled(tenant.as_str(), now_ms).await {
+            tracing::info!(
+                target: "extension.marketing.dispatch",
+                tenant_id = %tenant.as_str(),
+                tool = %inv.tool_name,
+                "marketing paused — short-circuiting tool dispatch",
+            );
+            return Ok(serde_json::json!({
+                "ok": false,
+                "paused": true,
+                "error": {
+                    "code": "marketing_paused",
+                    "message": "marketing extension is paused for this tenant",
+                }
+            }));
+        }
+    }
+
     let result = match inv.tool_name.as_str() {
         "marketing_lead_profile" => tools::lead_profile::handle(tenant, inv.args).await,
         "marketing_lead_route" => {

@@ -609,6 +609,8 @@ pub async fn handle_inbound_event(
     guardrails: Option<&crate::guardrails::GuardrailHandle>,
     enrichment: Option<&EnrichmentDeps>,
     spam_filter: Option<&crate::spam_filter::RulesCache>,
+    scoring: Option<&crate::scoring::ScoringConfigCache>,
+    marketing_state: Option<&crate::marketing_state::MarketingStateCache>,
 ) -> HandledOutcome {
     if !topic.starts_with("plugin.inbound.email.") && topic != "plugin.inbound.email" {
         return HandledOutcome::Skipped;
@@ -686,6 +688,17 @@ pub async fn handle_inbound_event(
         // + agent_id presence; the forwarder (M15.39) routes to
         // WA / email outbound. Fire-and-forget — never blocks
         // the broker hop on a transient daemon hiccup.
+        //
+        // Marketing on/off toggle: when the tenant is paused
+        // we skip the notification publish entirely. The
+        // existing thread is still bumped above (operator's
+        // inbox keeps populating) — only the AUTOMATED outbound
+        // ping pauses.
+        let tenant_paused_replied = match marketing_state {
+            Some(c) => !c.is_enabled(tenant_id.as_str(), Utc::now().timestamp_millis()).await,
+            None => false,
+        };
+        if !tenant_paused_replied {
         if let (Some(lookup), Some(broker_sender)) = (sellers, broker.as_ref()) {
             match maybe_notify_lead_replied(tenant_id, lookup, templates, &lead, &parsed) {
                 NotificationOutcome::Publish { topic, payload } => {
@@ -772,6 +785,14 @@ pub async fn handle_inbound_event(
                     );
                 }
             }
+        }
+        } else {
+            tracing::info!(
+                target: "plugin.marketing.broker",
+                tenant_id = %tenant_id.as_str(),
+                lead_id = %lead.id.0,
+                "marketing paused — skipping lead_replied notification publish",
+            );
         }
         return HandledOutcome::LeadUpdated {
             lead_id: lead.id.clone(),
@@ -906,7 +927,13 @@ pub async fn handle_inbound_event(
     // unified). Score reasons are merged into `why_routed`
     // so the operator audit log surfaces the full
     // explanation in one place.
-    let lead_score = crate::scoring::score_lead(&parsed);
+    let lead_score = match scoring {
+        Some(cache) => {
+            let cfg = cache.get_or_load(tenant_id.as_str()).await;
+            crate::scoring::score_lead_with_config(&parsed, &cfg)
+        }
+        None => crate::scoring::score_lead(&parsed),
+    };
     for reason in lead_score.reasons() {
         why_routed.push(format!(
             "score:{}:{}",
@@ -1118,6 +1145,24 @@ pub async fn handle_inbound_event(
             // happens inline; the broker.publish is fire-and-
             // forget so a transient daemon hiccup doesn't
             // sink the lead-create itself.
+            //
+            // Marketing on/off toggle: when the tenant is
+            // paused we still create the lead (the operator's
+            // inbox keeps populating) but skip the outbound
+            // operator ping. They re-enable when ready and
+            // see what arrived during the pause.
+            let tenant_paused_created = match marketing_state {
+                Some(c) => !c.is_enabled(tenant_id.as_str(), now_ms).await,
+                None => false,
+            };
+            if tenant_paused_created {
+                tracing::info!(
+                    target: "plugin.marketing.broker",
+                    tenant_id = %tenant_id.as_str(),
+                    lead_id = %lead.id.0,
+                    "marketing paused — skipping lead_created notification publish",
+                );
+            } else
             if let (Some(lookup), Some(broker_sender)) = (sellers, broker.as_ref()) {
                 match maybe_notify_lead_created(tenant_id, lookup, templates, &lead, &parsed) {
                     NotificationOutcome::Publish { topic, payload } => {
@@ -1452,6 +1497,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await;
         assert_eq!(out, HandledOutcome::Skipped);
@@ -1469,6 +1516,8 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
+            None,
             None,
             None,
             None,
@@ -1501,6 +1550,8 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
+            None,
             None,
             None,
             None,
@@ -1579,6 +1630,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await;
         assert!(
@@ -1620,6 +1673,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await;
         let HandledOutcome::LeadCreated {
@@ -1635,6 +1690,8 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
+            None,
             None,
             None,
             None,
@@ -1685,6 +1742,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await;
         assert!(
@@ -1717,6 +1776,8 @@ mod tests {
             Some(&router),
             Some(&identity),
             Some(&bus),
+            None,
+            None,
             None,
             None,
             None,
@@ -1777,6 +1838,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await;
         let _consume_created = rx.recv().await;
@@ -1789,6 +1852,8 @@ mod tests {
             Some(&router),
             Some(&identity),
             Some(&bus),
+            None,
+            None,
             None,
             None,
             None,

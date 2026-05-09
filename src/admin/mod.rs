@@ -30,7 +30,9 @@ pub mod config;
 pub mod firehose;
 pub mod healthz;
 pub mod leads;
+pub mod marketing_state;
 pub mod persons;
+pub mod scoring;
 pub mod spam_filter;
 pub mod telemetry;
 pub mod tracking;
@@ -157,6 +159,15 @@ pub struct AdminState {
     /// when unused) so handler tests don't have to thread an
     /// `Option` through.
     pub draft_locks: crate::draft_lock::DraftLockMap,
+    /// Per-tenant scoring config cache (thresholds + keyword
+    /// lists). Same `Arc` shared with the broker hop's
+    /// `score_lead_with_config` call; admin writes invalidate.
+    pub scoring: Option<crate::scoring::ScoringConfigCache>,
+    /// Per-tenant on/off toggle. Operator-facing kill switch.
+    /// Read by the dispatcher (tools), broker hop (notification
+    /// publish gate), and `generate_draft_handler` (refuses
+    /// LLM-spending automation while paused).
+    pub marketing_state: Option<crate::marketing_state::MarketingStateCache>,
 }
 
 impl AdminState {
@@ -181,6 +192,8 @@ impl AdminState {
             draft_template: None,
             spam_filter: None,
             draft_locks: crate::draft_lock::DraftLockMap::new(),
+            scoring: None,
+            marketing_state: None,
         }
     }
 
@@ -375,6 +388,26 @@ impl AdminState {
         self
     }
 
+    /// Wire the shared scoring config cache. Same `Arc` lives
+    /// in `PluginDeps`; admin endpoint invalidates on write.
+    pub fn with_scoring(
+        mut self,
+        cache: crate::scoring::ScoringConfigCache,
+    ) -> Self {
+        self.scoring = Some(cache);
+        self
+    }
+
+    /// Wire the shared marketing on/off cache. Same `Arc` lives
+    /// in `PluginDeps`; admin endpoint invalidates on write.
+    pub fn with_marketing_state(
+        mut self,
+        cache: crate::marketing_state::MarketingStateCache,
+    ) -> Self {
+        self.marketing_state = Some(cache);
+        self
+    }
+
     pub fn lookup_store(&self, tenant_id: &TenantId) -> Option<Arc<LeadStore>> {
         self.stores.get(tenant_id).cloned()
     }
@@ -515,6 +548,22 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route(
             "/spam-filter/test",
             axum::routing::post(spam_filter::test_handler),
+        )
+        // Marketing on/off toggle. Pause halts automated
+        // effects (notifications, draft generation, follow-up
+        // sweeps) without losing inbound traffic.
+        .route(
+            "/marketing/state",
+            get(marketing_state::get_handler).put(marketing_state::put_handler),
+        )
+        // Tenant-tunable scoring weights + keyword lists.
+        // GET reads, PUT replaces with the supplied
+        // ScoringConfig, DELETE resets to bundled defaults.
+        .route(
+            "/scoring/config",
+            get(scoring::get_handler)
+                .put(scoring::put_handler)
+                .delete(scoring::delete_handler),
         )
         // M15.24 — operator dashboard aggregate snapshot.
         .route("/telemetry", get(telemetry::handler))
