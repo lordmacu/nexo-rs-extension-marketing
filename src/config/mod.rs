@@ -361,6 +361,9 @@ mod tests {
             notification_settings: None,
             smtp_credential: None,
             draft_template: None,
+            system_prompt: None,
+            model_provider: None,
+            model_id: None,
         }
     }
 

@@ -40,13 +40,14 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use nexo_microapp_sdk::templating::handlebars::{
     render_handlebars, HandlebarsRenderError,
 };
-use nexo_tool_meta::marketing::{Lead, Seller};
+use nexo_tool_meta::marketing::{Lead, LeadState, Seller};
 
-use crate::lead::ThreadMessage;
+use crate::lead::{MessageDirection, ThreadMessage};
 
 /// Structured context every generator receives. Keep this
 /// stable — adding fields is fine, removing breaks operator
@@ -542,6 +543,88 @@ fn build_system_prompt(agent_prompt: &str, ctx: &DraftContext) -> String {
     out
 }
 
+// ── Idempotent-draft signature ───────────────────────────────────
+//
+// Pure-fn over the input identity tuple a draft generation
+// depends on. Same tuple ⇒ same LLM output (modulo temperature
+// noise we ignore for dedup). The caller (admin handler + the
+// followup_sweep tool) computes the signature, looks it up in
+// the per-tenant store, and only spends tokens on a fresh
+// generate when the lookup misses.
+//
+// Inputs covered:
+// - lead.id           — different lead, different draft
+// - lead.state        — state transitions invalidate prior drafts
+// - last_inbound msg id — new inbound = new context
+// - seller.id         — different seller may sign differently
+// - seller.agent_id   — different agent persona
+// - prompt_hash       — agent system prompt + draft template +
+//                       model provider/id all baked into the
+//                       hash so a tenant edit on any of them
+//                       triggers regeneration
+
+/// Stable label for `LeadState` used inside the signature.
+/// Hardcoded here (vs `Display`) so a future rename of the
+/// `LeadState` enum doesn't silently change every signature
+/// already on disk.
+fn lead_state_label(state: &LeadState) -> &'static str {
+    match state {
+        LeadState::Cold => "cold",
+        LeadState::Engaged => "engaged",
+        LeadState::MeetingScheduled => "meeting_scheduled",
+        LeadState::Qualified => "qualified",
+        LeadState::Lost => "lost",
+    }
+}
+
+/// Hex-encoded sha256 over the draft generator's input
+/// identity. Returns 64 lowercase hex chars.
+///
+/// `last_inbound_message_id` is `None` for cold leads with no
+/// inbound row yet — empty string is folded into the hash so
+/// the cold-no-inbound state has a stable signature too.
+pub fn compute_draft_signature(
+    lead: &Lead,
+    last_inbound_message_id: Option<&str>,
+    seller: &Seller,
+) -> String {
+    let mut prompt_hasher = Sha256::new();
+    prompt_hasher.update(seller.system_prompt.as_deref().unwrap_or("").as_bytes());
+    prompt_hasher.update(b"\x1f");
+    prompt_hasher.update(seller.draft_template.as_deref().unwrap_or("").as_bytes());
+    prompt_hasher.update(b"\x1f");
+    prompt_hasher.update(seller.model_provider.as_deref().unwrap_or("").as_bytes());
+    prompt_hasher.update(b"\x1f");
+    prompt_hasher.update(seller.model_id.as_deref().unwrap_or("").as_bytes());
+    let prompt_hash = format!("{:x}", prompt_hasher.finalize());
+
+    let mut h = Sha256::new();
+    h.update(lead.id.0.as_bytes());
+    h.update(b"|");
+    h.update(lead_state_label(&lead.state).as_bytes());
+    h.update(b"|");
+    h.update(last_inbound_message_id.unwrap_or("").as_bytes());
+    h.update(b"|");
+    h.update(seller.id.0.as_bytes());
+    h.update(b"|");
+    h.update(seller.agent_id.as_deref().unwrap_or("").as_bytes());
+    h.update(b"|");
+    h.update(prompt_hash.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// Convenience: pull the most-recent inbound message id from a
+/// thread history (oldest-first) so the caller doesn't repeat
+/// the iter pattern at every callsite. Returns `None` when the
+/// thread carries no inbound row yet (cold leads).
+pub fn last_inbound_message_id(history: &[ThreadMessage]) -> Option<&str> {
+    history
+        .iter()
+        .rev()
+        .find(|m| m.direction == MessageDirection::Inbound)
+        .map(|m| m.id.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,6 +672,9 @@ mod tests {
             notification_settings: None,
             smtp_credential: None,
             draft_template: None,
+            system_prompt: None,
+            model_provider: None,
+            model_id: None,
         }
     }
 
@@ -818,5 +904,117 @@ thread_history: vec![],
             err,
             DraftGenError::TemplateParse(_) | DraftGenError::TemplateRender(_)
         ));
+    }
+
+    // ── Idempotent-draft signature ──────────────────────────────
+
+    #[test]
+    fn signature_stable_for_identical_inputs() {
+        let lead = lead_fixture();
+        let seller = seller_fixture();
+        let s1 = compute_draft_signature(&lead, Some("msg-1"), &seller);
+        let s2 = compute_draft_signature(&lead, Some("msg-1"), &seller);
+        assert_eq!(s1, s2);
+        assert_eq!(s1.len(), 64); // sha256 hex
+    }
+
+    #[test]
+    fn signature_changes_when_state_changes() {
+        let mut lead = lead_fixture();
+        let seller = seller_fixture();
+        let s_engaged = compute_draft_signature(&lead, Some("msg-1"), &seller);
+        lead.state = LeadState::Cold;
+        let s_cold = compute_draft_signature(&lead, Some("msg-1"), &seller);
+        assert_ne!(s_engaged, s_cold);
+    }
+
+    #[test]
+    fn signature_changes_when_last_inbound_changes() {
+        let lead = lead_fixture();
+        let seller = seller_fixture();
+        let s1 = compute_draft_signature(&lead, Some("msg-1"), &seller);
+        let s2 = compute_draft_signature(&lead, Some("msg-2"), &seller);
+        let s_none = compute_draft_signature(&lead, None, &seller);
+        assert_ne!(s1, s2);
+        assert_ne!(s1, s_none);
+    }
+
+    #[test]
+    fn signature_changes_when_seller_agent_changes() {
+        let lead = lead_fixture();
+        let mut seller = seller_fixture();
+        let s_no_agent = compute_draft_signature(&lead, Some("msg-1"), &seller);
+        seller.agent_id = Some("aana".into());
+        let s_aana = compute_draft_signature(&lead, Some("msg-1"), &seller);
+        seller.agent_id = Some("bobo".into());
+        let s_bobo = compute_draft_signature(&lead, Some("msg-1"), &seller);
+        assert_ne!(s_no_agent, s_aana);
+        assert_ne!(s_aana, s_bobo);
+    }
+
+    #[test]
+    fn signature_changes_when_prompt_changes() {
+        let lead = lead_fixture();
+        let mut seller = seller_fixture();
+        seller.system_prompt = Some("You are a helpful assistant.".into());
+        let s_v1 = compute_draft_signature(&lead, Some("msg-1"), &seller);
+        seller.system_prompt = Some("You are a sales rep.".into());
+        let s_v2 = compute_draft_signature(&lead, Some("msg-1"), &seller);
+        assert_ne!(s_v1, s_v2);
+    }
+
+    #[test]
+    fn signature_changes_when_draft_template_changes() {
+        let lead = lead_fixture();
+        let mut seller = seller_fixture();
+        seller.draft_template = Some("template v1".into());
+        let s1 = compute_draft_signature(&lead, Some("msg-1"), &seller);
+        seller.draft_template = Some("template v2".into());
+        let s2 = compute_draft_signature(&lead, Some("msg-1"), &seller);
+        assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn signature_changes_when_model_changes() {
+        let lead = lead_fixture();
+        let mut seller = seller_fixture();
+        seller.model_provider = Some("minimax".into());
+        seller.model_id = Some("m2.5".into());
+        let s_minimax = compute_draft_signature(&lead, Some("msg-1"), &seller);
+        seller.model_provider = Some("anthropic".into());
+        seller.model_id = Some("claude-opus-4-7".into());
+        let s_claude = compute_draft_signature(&lead, Some("msg-1"), &seller);
+        assert_ne!(s_minimax, s_claude);
+    }
+
+    #[test]
+    fn last_inbound_message_id_picks_most_recent_inbound() {
+        let inb = |id: &str, at: i64| ThreadMessage {
+            id: id.into(),
+            direction: MessageDirection::Inbound,
+            from_label: "Juan".into(),
+            body: "x".into(),
+            at_ms: at,
+            draft_status: None,
+            subject: None,
+        };
+        let outb = |id: &str, at: i64| ThreadMessage {
+            id: id.into(),
+            direction: MessageDirection::Outbound,
+            from_label: "Pedro".into(),
+            body: "x".into(),
+            at_ms: at,
+            draft_status: None,
+            subject: None,
+        };
+        let history = vec![
+            inb("m1", 100),
+            outb("m2", 200),
+            inb("m3", 300),
+            outb("m4", 400),
+        ];
+        assert_eq!(last_inbound_message_id(&history), Some("m3"));
+        let empty: Vec<ThreadMessage> = vec![];
+        assert_eq!(last_inbound_message_id(&empty), None);
     }
 }

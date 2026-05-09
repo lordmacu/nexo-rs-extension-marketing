@@ -201,6 +201,33 @@ pub enum AuditEvent {
         /// Wall-clock at_ms.
         at_ms: u64,
     },
+    /// Idempotent-draft dedup hit. Recorded by the
+    /// `generate_draft_handler` + the followup_sweep tool when
+    /// the pre-LLM signature lookup finds an existing pending
+    /// draft for the same input identity. No LLM call fires;
+    /// the existing draft is returned verbatim. Operator's
+    /// compliance view shows these alongside legitimate draft
+    /// generations to give visibility into the cache hit rate.
+    DraftDeduped {
+        /// Tenant scope.
+        tenant_id: String,
+        /// Lead the dedup fired against.
+        lead_id: String,
+        /// Reused draft's message id (from the prior
+        /// generate that actually called the LLM).
+        draft_message_id: String,
+        /// Signature hex — same value across the original
+        /// generation and the dedup hit. Surface for operator
+        /// debugging when investigating why a stale draft
+        /// keeps coming back.
+        signature: String,
+        /// Where the dedup happened: `"operator_pull"`
+        /// (`/leads/:id/drafts/generate`) or
+        /// `"followup_sweep"` (cron tool path).
+        source: String,
+        /// Wall-clock at_ms.
+        at_ms: u64,
+    },
     /// Spam / promo classifier dropped an inbound. Recorded
     /// pre-resolver so no lead row exists yet — the operator's
     /// compliance view filters by `kind = promo_filtered` to
@@ -241,6 +268,7 @@ impl EventMetadata for AuditEvent {
             Self::NotificationPublished { .. } => "notification_published",
             Self::TopicGuardrailFired { .. } => "topic_guardrail_fired",
             Self::DuplicatePersonDetected { .. } => "duplicate_person_detected",
+            Self::DraftDeduped { .. } => "draft_deduped",
             Self::PromoFiltered { .. } => "promo_filtered",
         }
     }
@@ -258,6 +286,7 @@ impl EventMetadata for AuditEvent {
             Self::NotificationPublished { lead_id, .. } => lead_id.as_str(),
             Self::TopicGuardrailFired { lead_id, .. } => lead_id.as_deref().unwrap_or(""),
             Self::DuplicatePersonDetected { lead_id, .. } => lead_id.as_str(),
+            Self::DraftDeduped { lead_id, .. } => lead_id.as_str(),
             // Filtered inbounds never created a lead — index
             // by sender email so the operator can pull "every
             // promo we dropped from this sender".
@@ -273,6 +302,7 @@ impl EventMetadata for AuditEvent {
             Self::NotificationPublished { tenant_id, .. } => tenant_id.as_str(),
             Self::TopicGuardrailFired { tenant_id, .. } => tenant_id.as_str(),
             Self::DuplicatePersonDetected { tenant_id, .. } => tenant_id.as_str(),
+            Self::DraftDeduped { tenant_id, .. } => tenant_id.as_str(),
             Self::PromoFiltered { tenant_id, .. } => tenant_id.as_str(),
         })
     }
@@ -285,6 +315,7 @@ impl EventMetadata for AuditEvent {
             Self::NotificationPublished { at_ms, .. } => *at_ms,
             Self::TopicGuardrailFired { at_ms, .. } => *at_ms,
             Self::DuplicatePersonDetected { at_ms, .. } => *at_ms,
+            Self::DraftDeduped { at_ms, .. } => *at_ms,
             Self::PromoFiltered { at_ms, .. } => *at_ms,
         }
     }

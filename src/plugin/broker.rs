@@ -335,6 +335,7 @@ fn inbound_message_from_parsed(parsed: &ParsedInbound, fallback_at_ms: i64) -> N
         at_ms: fallback_at_ms,
         draft_status: None,
         subject: None,
+        signature: None,
     }
 }
 
@@ -1310,6 +1311,9 @@ mod tests {
             smtp_credential: None,
             model_override: None,
             draft_template: None,
+            system_prompt: None,
+            model_provider: None,
+            model_id: None,
         }
     }
 

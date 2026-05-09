@@ -97,10 +97,25 @@ CREATE TABLE IF NOT EXISTS thread_messages (
     at_ms        INTEGER NOT NULL,
     draft_status TEXT,
     subject      TEXT,
+    -- Idempotent-draft signature: sha256 hex of the input
+    -- identity tuple (lead state + last_inbound msg + seller +
+    -- agent + prompt hash). Populated only on `direction =
+    -- 'draft'` rows. Lookup target for the pre-LLM dedup gate
+    -- in `generate_draft_handler` + the followup sweep tool.
+    -- NULL on non-draft directions and on legacy draft rows
+    -- created before the column landed.
+    signature    TEXT,
     PRIMARY KEY (tenant_id, lead_id, message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_thread_messages_lead
     ON thread_messages(tenant_id, lead_id, at_ms);
+-- Hot path for `find_pending_draft_by_signature` — every
+-- generate_draft request hits this index before deciding to
+-- spend tokens on a fresh LLM call.
+CREATE INDEX IF NOT EXISTS idx_thread_messages_pending_sig
+    ON thread_messages(tenant_id, lead_id, signature)
+    WHERE direction = 'draft' AND draft_status = 'pending'
+      AND signature IS NOT NULL;
 "#;
 
 /// Idempotent ALTER for existing DBs that pre-date the
@@ -118,6 +133,24 @@ const MIGRATION_SQL_ADD_SUBJECT: &str =
 /// column error is the success signal for fresh installs.
 const MIGRATION_SQL_ADD_OPERATOR_NOTES: &str =
     "ALTER TABLE leads ADD COLUMN operator_notes TEXT";
+
+/// Idempotent-draft `signature` column on thread_messages.
+/// Same swallow-duplicate-column discipline as the other
+/// retroactive columns. Populated only on draft rows; the
+/// dedup gate in `generate_draft_handler` reads via the
+/// partial index `idx_thread_messages_pending_sig`.
+const MIGRATION_SQL_ADD_SIGNATURE: &str =
+    "ALTER TABLE thread_messages ADD COLUMN signature TEXT";
+
+/// Partial index for the pending-draft dedup lookup. New DBs
+/// already have it from `MIGRATION_SQL`; this ALTER targets
+/// pre-existing DBs. `IF NOT EXISTS` makes it safe to re-run.
+const MIGRATION_SQL_ADD_SIGNATURE_INDEX: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_thread_messages_pending_sig
+    ON thread_messages(tenant_id, lead_id, signature)
+    WHERE direction = 'draft' AND draft_status = 'pending'
+      AND signature IS NOT NULL
+"#;
 
 /// Per-tenant lead store. The struct holds its tenant id +
 /// pool; `Clone` is cheap (Arc-shared pool) so callers spawn
@@ -165,6 +198,22 @@ impl LeadStore {
                 return Err(MarketingError::Sqlite(e));
             }
         }
+        // Idempotent-draft `signature` column. Same retro-add
+        // discipline. The partial index is `IF NOT EXISTS` so
+        // we run it unconditionally — it may already be present
+        // on fresh DBs via `MIGRATION_SQL`.
+        if let Err(e) = sqlx::query(MIGRATION_SQL_ADD_SIGNATURE)
+            .execute(&pool)
+            .await
+        {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(MarketingError::Sqlite(e));
+            }
+        }
+        sqlx::query(MIGRATION_SQL_ADD_SIGNATURE_INDEX)
+            .execute(&pool)
+            .await?;
         Ok(Self { pool, tenant_id })
     }
 
@@ -490,8 +539,8 @@ impl LeadStore {
     ) -> Result<(), MarketingError> {
         sqlx::query(
             "INSERT INTO thread_messages \
-             (tenant_id, lead_id, message_id, direction, from_label, body, at_ms, draft_status, subject) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             (tenant_id, lead_id, message_id, direction, from_label, body, at_ms, draft_status, subject, signature) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(tenant_id, lead_id, message_id) DO NOTHING",
         )
         .bind(self.tenant_id.as_str())
@@ -503,6 +552,7 @@ impl LeadStore {
         .bind(msg.at_ms)
         .bind(msg.draft_status.map(draft_status_str))
         .bind(msg.subject.as_deref())
+        .bind(msg.signature.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -664,6 +714,38 @@ impl LeadStore {
         .await?;
         Ok(rows.into_iter().map(ThreadMessage::from).collect())
     }
+
+    /// Idempotent-draft dedup lookup — returns the single
+    /// pending draft row whose `signature` matches, or `None`
+    /// when no such row exists. Backed by the partial index
+    /// `idx_thread_messages_pending_sig` (tenant + lead +
+    /// signature, gated on direction='draft' AND
+    /// draft_status='pending'); the LIMIT 1 + ORDER BY id is a
+    /// stable tie-break in case the same lead somehow ended up
+    /// with two pending drafts at the same signature (race
+    /// before the dedup gate landed) — caller treats either as
+    /// "use this one".
+    pub async fn find_pending_draft_by_signature(
+        &self,
+        lead_id: &LeadId,
+        signature: &str,
+    ) -> Result<Option<ThreadMessage>, MarketingError> {
+        let row: Option<ThreadMessageRow> = sqlx::query_as(
+            "SELECT message_id, direction, from_label, body, at_ms, draft_status, subject \
+             FROM thread_messages \
+             WHERE tenant_id = ? AND lead_id = ? \
+               AND direction = 'draft' AND draft_status = 'pending' \
+               AND signature = ? \
+             ORDER BY at_ms DESC, message_id ASC \
+             LIMIT 1",
+        )
+        .bind(self.tenant_id.as_str())
+        .bind(&lead_id.0)
+        .bind(signature)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(ThreadMessage::from))
+    }
 }
 
 /// Caller-provided message payload for `append_thread_message`.
@@ -681,6 +763,14 @@ pub struct NewThreadMessage {
     /// `None` ⇒ approve handler inherits the lead's
     /// subject (with `Re:` prefix when missing).
     pub subject: Option<String>,
+    /// Idempotent-draft signature — sha256 hex of the
+    /// `(lead_state, last_inbound_msg_id, seller_id, agent_id,
+    /// prompt_hash)` tuple. Populated only on `direction =
+    /// Draft` rows; non-draft callers pass `None`. The dedup
+    /// gate in `generate_draft_handler` looks up by this
+    /// value before deciding to spend tokens on a fresh LLM
+    /// call.
+    pub signature: Option<String>,
 }
 
 /// Wire-equivalent thread message exposed via `/leads/:id/thread`.
@@ -1214,7 +1304,9 @@ mod tests {
             from_label: "Cliente".into(),
             body: body.into(),
             at_ms: at,
-            draft_status: None, subject: None,
+            draft_status: None,
+            subject: None,
+            signature: None,
         }
     }
 
@@ -1269,6 +1361,7 @@ mod tests {
                 body: "draft body".into(),
                 at_ms: 5,
                 draft_status: Some(DraftStatus::Pending), subject: None,
+                signature: None,
             },
         )
         .await
@@ -1296,6 +1389,7 @@ mod tests {
                 body: body.into(),
                 at_ms: 1,
                 draft_status: Some(status), subject: None,
+                signature: None,
             },
         )
         .await
@@ -1398,6 +1492,7 @@ mod tests {
                 body: "real reply".into(),
                 at_ms: 1,
                 draft_status: None, subject: None,
+                signature: None,
             },
         )
         .await
@@ -1425,6 +1520,7 @@ mod tests {
                     at_ms: *i as i64,
                     draft_status: Some(*status),
                     subject: None,
+                    signature: None,
                 },
             )
             .await
@@ -1460,6 +1556,7 @@ mod tests {
                     body: "x".into(),
                     at_ms: 1,
                     draft_status: status, subject: None,
+                    signature: None,
                 },
             )
             .await
@@ -1486,6 +1583,7 @@ mod tests {
                 body: "acme body".into(),
                 at_ms: 1,
                 draft_status: Some(DraftStatus::Pending), subject: None,
+                signature: None,
             },
         )
         .await
@@ -1503,6 +1601,7 @@ mod tests {
                     body: "globex body".into(),
                     at_ms: 1,
                     draft_status: Some(DraftStatus::Pending), subject: None,
+                    signature: None,
                 },
             )
             .await
@@ -1532,6 +1631,7 @@ mod tests {
                 body: "p1".into(),
                 at_ms: 1,
                 draft_status: Some(DraftStatus::Pending), subject: None,
+                signature: None,
             },
         )
         .await
@@ -1545,6 +1645,7 @@ mod tests {
                 body: "p2".into(),
                 at_ms: 2,
                 draft_status: Some(DraftStatus::Pending), subject: None,
+                signature: None,
             },
         )
         .await
@@ -1559,6 +1660,7 @@ mod tests {
                 body: "p3".into(),
                 at_ms: 3,
                 draft_status: Some(DraftStatus::Approved), subject: None,
+                signature: None,
             },
         )
         .await
@@ -1573,6 +1675,7 @@ mod tests {
                 body: "hi".into(),
                 at_ms: 4,
                 draft_status: None, subject: None,
+                signature: None,
             },
         )
         .await
@@ -1603,6 +1706,7 @@ mod tests {
                         body: "x".into(),
                         at_ms: 1,
                         draft_status: Some(DraftStatus::Pending), subject: None,
+                        signature: None,
                     },
                 )
                 .await
@@ -1627,6 +1731,7 @@ mod tests {
                 body: "older".into(),
                 at_ms: 100,
                 draft_status: Some(DraftStatus::Pending), subject: None,
+                signature: None,
             },
         )
         .await
@@ -1640,6 +1745,7 @@ mod tests {
                 body: "newer".into(),
                 at_ms: 300,
                 draft_status: Some(DraftStatus::Pending), subject: None,
+                signature: None,
             },
         )
         .await
@@ -1653,6 +1759,7 @@ mod tests {
                 body: "approved".into(),
                 at_ms: 200,
                 draft_status: Some(DraftStatus::Approved), subject: None,
+                signature: None,
             },
         )
         .await
@@ -1682,6 +1789,7 @@ mod tests {
                     at_ms: i as i64 + 1,
                     draft_status: Some(DraftStatus::Pending),
                     subject: None,
+                    signature: None,
                 },
             )
             .await
@@ -1710,6 +1818,7 @@ mod tests {
                     body: body.into(),
                     at_ms: 1,
                     draft_status: Some(DraftStatus::Pending), subject: None,
+                    signature: None,
                 },
             )
             .await
@@ -1744,6 +1853,7 @@ mod tests {
                     body: "x".into(),
                     at_ms,
                     draft_status: None, subject: None,
+                    signature: None,
                 },
             )
             .await

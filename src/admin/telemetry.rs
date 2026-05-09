@@ -203,6 +203,7 @@ mod tests {
                         body: "b".into(),
                         at_ms: 1,
                         draft_status: Some(status), subject: None,
+                        signature: None,
                     },
                 )
                 .await
@@ -222,6 +223,7 @@ mod tests {
                     body: "hi".into(),
                     at_ms: now - 1000,
                     draft_status: None, subject: None,
+                    signature: None,
                 },
             )
             .await
@@ -236,6 +238,7 @@ mod tests {
                     body: "ok".into(),
                     at_ms: now - 500,
                     draft_status: None, subject: None,
+                    signature: None,
                 },
             )
             .await
@@ -254,6 +257,7 @@ mod tests {
                     body: "old".into(),
                     at_ms: now - 25 * 24 * 3_600_000,
                     draft_status: None, subject: None,
+                    signature: None,
                 },
             )
             .await

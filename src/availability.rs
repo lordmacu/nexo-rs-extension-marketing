@@ -249,6 +249,9 @@ mod tests {
             smtp_credential: None,
             model_override: None,
             draft_template: None,
+            system_prompt: None,
+            model_provider: None,
+            model_id: None,
         }
     }
 

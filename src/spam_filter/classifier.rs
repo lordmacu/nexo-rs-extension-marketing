@@ -459,13 +459,16 @@ mod tests {
 
     #[test]
     fn strict_preset_drops_image_heavy_2() {
-        // 2 images + ~120 chars of text — Balanced wouldn't drop
-        // (needs >=3 images), Strict drops.
+        // 2 images + ~140 chars of plain copy that has zero
+        // promo keywords — Balanced (image_heavy_min=3) keeps
+        // it because no other signal fires; Strict
+        // (image_heavy_min=2, max_text=500) drops as
+        // ImageHeavyLowText.
         let raw = raw_with_html(
-            r#"<img src="a"/><img src="b"/><p>Hola, mira esta promoción nueva. Aprovecha hoy.</p>"#,
+            r#"<img src="a"/><img src="b"/><p>Hola, te comparto el documento adjunto que solicitaste. Quedo atento a tus comentarios cuando lo revises.</p>"#,
         );
         let r_balanced = ResolvedRules::defaults_only();
-        let c_b = classify_with_rules(&raw, "x", "alice@example.com", &r_balanced);
+        let c_b = classify_with_rules(&raw, "Documento", "alice@example.com", &r_balanced);
         assert_eq!(c_b.verdict, PromoVerdict::Human);
 
         let r_strict = ResolvedRules::from_persisted(
@@ -473,7 +476,7 @@ mod tests {
             crate::spam_filter::defaults::STRICT_THRESHOLDS.clone(),
             &[],
         );
-        let c_s = classify_with_rules(&raw, "x", "alice@example.com", &r_strict);
+        let c_s = classify_with_rules(&raw, "Documento", "alice@example.com", &r_strict);
         // image_heavy threshold ≥2 imgs <500 chars under strict.
         assert_eq!(
             c_s.verdict,

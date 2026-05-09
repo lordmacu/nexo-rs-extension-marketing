@@ -291,6 +291,7 @@ pub async fn create_draft_handler(
         at_ms: now_ms,
         draft_status: Some(crate::lead::DraftStatus::Pending),
         subject,
+        signature: None,
     };
     if let Err(e) = store.append_thread_message(&id, new_msg).await {
         return marketing_error(e);
@@ -664,6 +665,7 @@ pub async fn approve_draft_handler(
         body: command.body.clone(),
         at_ms: now_ms,
         draft_status: None, subject: None,
+        signature: None,
     };
     if let Err(e) = store.append_thread_message(&lead_obj_id, outbound_msg).await {
         tracing::warn!(
@@ -1223,6 +1225,91 @@ pub async fn generate_draft_handler(
 
     let body_in = payload.map(|Json(b)| b).unwrap_or_default();
 
+    // ── Idempotent dedup gate ───────────────────────────────
+    // Compute the input-identity signature BEFORE spending
+    // tokens. If a pending draft already exists with this
+    // exact signature we return it verbatim — same input ⇒
+    // same output, no quality loss. Operator-hint bumps DO
+    // NOT contribute to the signature on purpose: the hint
+    // is meant to nudge a fresh take, so passing one always
+    // re-generates regardless of cache state.
+    //
+    // Hint-empty path (the common one — cron + UI default
+    // click) is the cache target.
+    let last_inbound_msg_id =
+        last_inbound.as_ref().map(|m| m.id.clone());
+    let signature = crate::draft::compute_draft_signature(
+        &lead,
+        last_inbound_msg_id.as_deref(),
+        &seller,
+    );
+    let hint_present = body_in
+        .operator_hint
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if !hint_present {
+        match store
+            .find_pending_draft_by_signature(&lead_obj_id, &signature)
+            .await
+        {
+            Ok(Some(existing)) => {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                if let Some(audit) = state.audit.as_ref() {
+                    let ev = crate::audit::AuditEvent::DraftDeduped {
+                        tenant_id: tenant_id.as_str().to_string(),
+                        lead_id: lead_id.clone(),
+                        draft_message_id: existing.id.clone(),
+                        signature: signature.clone(),
+                        source: "operator_pull".to_string(),
+                        at_ms: now_ms as u64,
+                    };
+                    if let Err(e) = audit.record(ev).await {
+                        tracing::warn!(
+                            target: "extension.marketing.draft_generate",
+                            error = %e,
+                            "audit record draft_deduped failed",
+                        );
+                    }
+                }
+                tracing::info!(
+                    target: "extension.marketing.draft_generate",
+                    lead_id = %lead_id,
+                    draft_message_id = %existing.id,
+                    signature = %signature,
+                    "draft dedup hit — returning existing pending draft",
+                );
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "ok": true,
+                        "result": { "draft": existing, "from_cache": true },
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    target: "extension.marketing.draft_generate",
+                    lead_id = %lead_id,
+                    signature = %signature,
+                    "draft dedup miss — generating fresh",
+                );
+            }
+            Err(e) => {
+                // Non-fatal: lookup failure should never block
+                // a generate. Log + fall through to fresh
+                // generation (we eat the duplicate cost rather
+                // than refuse the operator).
+                tracing::warn!(
+                    target: "extension.marketing.draft_generate",
+                    error = %e,
+                    "draft dedup lookup failed; falling through to fresh generate",
+                );
+            }
+        }
+    }
+
     // ── Generate ────────────────────────────────────────────
     let ctx = crate::draft::DraftContext {
         lead,
@@ -1272,13 +1359,20 @@ pub async fn generate_draft_handler(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "AI".into());
     let now_ms = chrono::Utc::now().timestamp_millis();
+    // Persist the signature only on the cache-targetable path
+    // (no operator hint). Hint-driven generations stay
+    // signature-NULL so they don't poison the cache for the
+    // next hint-empty regen — operator nudge ⇒ one-shot draft.
+    let persisted_signature = if hint_present { None } else { Some(signature.clone()) };
     let new_msg = crate::lead::NewThreadMessage {
         message_id: message_id.clone(),
         direction: MessageDirection::Draft,
         from_label,
         body,
         at_ms: now_ms,
-        draft_status: Some(crate::lead::DraftStatus::Pending), subject: None,
+        draft_status: Some(crate::lead::DraftStatus::Pending),
+        subject: None,
+        signature: persisted_signature,
     };
     if let Err(e) = store.append_thread_message(&lead_obj_id, new_msg).await {
         return marketing_error(e);
@@ -1460,7 +1554,9 @@ mod tests {
     async fn list_due_query_returns_followup_envelope() {
         let state = build_state_with_lead().await;
         let app = router(state);
-        let resp = app.oneshot(req("/leads?due=1")).await.unwrap();
+        // serde_urlencoded → bool requires the literal `true`/
+        // `false`; query-string `due=1` doesn't deserialize.
+        let resp = app.oneshot(req("/leads?due=true")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_to_json(resp).await;
         assert_eq!(v["result"]["view"], "due");
@@ -1485,6 +1581,7 @@ mod tests {
                     body: "Hola".into(),
                     at_ms: 100,
                     draft_status: None, subject: None,
+                    signature: None,
                 },
             )
             .await
@@ -1499,6 +1596,7 @@ mod tests {
                     body: "Saludos".into(),
                     at_ms: 200,
                     draft_status: None, subject: None,
+                    signature: None,
                 },
             )
             .await
@@ -1579,6 +1677,9 @@ mod tests {
             notification_settings: None,
             smtp_credential: None,
             draft_template: None,
+            system_prompt: None,
+            model_provider: None,
+            model_id: None,
         }]);
         let gen: Arc<dyn crate::draft::DraftGenerator + Send + Sync> = Arc::new(
             crate::draft::TemplateDraftGenerator::with_default_template(),
@@ -1637,6 +1738,7 @@ mod tests {
                     body: "¿Cuánto cuesta?".into(),
                     at_ms: 100,
                     draft_status: None, subject: None,
+                    signature: None,
                 },
             )
             .await
@@ -1755,6 +1857,9 @@ mod tests {
             notification_settings: None,
             smtp_credential: None,
             draft_template: None,
+            system_prompt: None,
+            model_provider: None,
+            model_id: None,
         }]);
         let gen: Arc<dyn crate::draft::DraftGenerator + Send + Sync> =
             Arc::new(crate::draft::TemplateDraftGenerator::new(
@@ -1795,6 +1900,7 @@ mod tests {
                     body: "pending body".into(),
                     at_ms: 100,
                     draft_status: Some(DraftStatus::Pending), subject: None,
+                    signature: None,
                 },
             )
             .await
@@ -1809,6 +1915,7 @@ mod tests {
                     body: "approved body".into(),
                     at_ms: 200,
                     draft_status: Some(DraftStatus::Approved), subject: None,
+                    signature: None,
                 },
             )
             .await
@@ -1979,6 +2086,7 @@ mod tests {
                     at_ms: 1,
                     draft_status: Some(DraftStatus::Pending),
                     subject: None,
+                    signature: None,
                 },
             )
             .await
@@ -2027,6 +2135,7 @@ mod tests {
                     at_ms: 1,
                     draft_status: Some(DraftStatus::Pending),
                     subject: Some("Old subject".into()),
+                    signature: None,
                 },
             )
             .await
@@ -2073,6 +2182,7 @@ mod tests {
                     at_ms: 1,
                     draft_status: Some(DraftStatus::Pending),
                     subject: Some("Keep me".into()),
+                    signature: None,
                 },
             )
             .await

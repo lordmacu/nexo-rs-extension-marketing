@@ -75,6 +75,7 @@ fn lead_fixture(seller: &str) -> Lead {
         next_check_at_ms: None,
         followup_attempts: 0,
         why_routed: Vec::new(),
+        operator_notes: None,
     }
 }
 
