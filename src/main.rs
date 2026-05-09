@@ -300,6 +300,10 @@ async fn main() -> anyhow::Result<()> {
         nexo_marketing::marketing_state::MarketingStateCache::new(marketing_state_store);
     tracing::info!(tenant = %tenant, "marketing on/off cache ready");
 
+    // ─── Broker depth observability (audit fix #8) ─────────────
+    let broker_metrics = nexo_marketing::broker_metrics::BrokerMetrics::new();
+    let broker_metrics_for_closure = broker_metrics.clone();
+
     let plugin_deps = PluginDeps::new(tenant.clone(), lead_store.clone(), router.clone())
         .with_identity(identity.clone())
         .with_sellers(seller_lookup.clone())
@@ -450,7 +454,8 @@ async fn main() -> anyhow::Result<()> {
         .with_companies(companies.clone())
         .with_spam_filter(spam_filter_cache.clone())
         .with_scoring(scoring_cache.clone())
-        .with_marketing_state(marketing_state_cache.clone());
+        .with_marketing_state(marketing_state_cache.clone())
+        .with_broker_metrics(broker_metrics.clone());
     if let Some(deps) = tracking_deps.clone() {
         admin_state_builder = admin_state_builder
             .with_tracking(deps.clone())
@@ -544,7 +549,12 @@ async fn main() -> anyhow::Result<()> {
                 let spam_filter = broker_spam_filter.clone();
                 let scoring_clone = broker_scoring.clone();
                 let mstate_clone = broker_marketing_state.clone();
+                let metrics = broker_metrics_for_closure.clone();
                 async move {
+                    // Audit fix #8 — depth tracking guard. RAII
+                    // dec on drop so an early return / panic
+                    // doesn't leave the counter stuck.
+                    let _depth_guard = metrics.enter();
                     // M15.39 — single broker subscriber, two
                     // dispatchers. Topic prefix routes between:
                     //   - inbound email pipeline (lead create /
@@ -607,6 +617,7 @@ async fn main() -> anyhow::Result<()> {
                         Some(&mstate_clone),
                     )
                     .await;
+                    metrics.record_processed();
                 }
             },
         )

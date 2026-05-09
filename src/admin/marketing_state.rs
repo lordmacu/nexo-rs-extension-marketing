@@ -60,6 +60,9 @@ pub async fn put_handler(
         return service_unavailable();
     };
     let now_ms = Utc::now().timestamp_millis();
+    // Capture pre-state for the audit row so the operator
+    // can see what flipped + roll back via copy/paste.
+    let before = cache.get(tenant_id.as_str(), now_ms).await;
     let new_state = MarketingState {
         tenant_id: tenant_id.as_str().to_string(),
         enabled: body.enabled,
@@ -82,6 +85,17 @@ pub async fn put_handler(
             .into_response();
     }
     cache.invalidate(tenant_id.as_str()).await;
+    if let Some(audit) = state.audit.as_ref() {
+        audit
+            .record_config_change(
+                tenant_id.as_str(),
+                "marketing_state",
+                serde_json::to_value(&before).ok(),
+                serde_json::to_value(&new_state).ok(),
+                now_ms as u64,
+            )
+            .await;
+    }
     tracing::info!(
         target: "extension.marketing.state",
         tenant_id = %tenant_id.as_str(),

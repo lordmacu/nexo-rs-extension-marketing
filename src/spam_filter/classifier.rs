@@ -108,7 +108,40 @@ pub fn classify_with_rules(
     let from_lower = from_email.to_ascii_lowercase();
     let domain = from_lower.split_once('@').map(|(_, d)| d.to_string());
 
-    // ── Allow rules — short-circuit to Human ──────────────────
+    // Audit fix #10 — precedence is *most-specific wins*:
+    //
+    //   1. sender_allow  → Human   (operator's strongest "let through")
+    //   2. sender_block  → Promo   (operator's strongest "drop")
+    //   3. domain_allow  → Human   (broad allow)
+    //   4. domain_block  → Promo   (broad drop)
+    //   5. heuristic signals
+    //
+    // Lets the operator say "allow @bigcorp.com but block
+    // marketing@bigcorp.com" — sender_block beats domain_allow
+    // because it's more specific. Within the sender level
+    // sender_allow wins over sender_block (operator deliberately
+    // marked someone as VIP, so even if they later blocked the
+    // address by accident the allow rule rescues them — same
+    // safety bias the rest of the classifier uses).
+
+    // 1. sender_allow — full bypass, most specific
+    if rules.allow_senders.contains(&from_lower) {
+        return PromoClassification {
+            signals: PromoSignals {
+                allow_match: Some(AllowMatch::Sender),
+                ..Default::default()
+            },
+            verdict: PromoVerdict::Human,
+        };
+    }
+    // 2. sender_block — drop, second-most specific
+    if rules.block_senders.contains(&from_lower) {
+        return PromoClassification {
+            signals: PromoSignals::default(),
+            verdict: PromoVerdict::Promo(BlockReason::SenderBlocklist),
+        };
+    }
+    // 3. domain_allow — broad bypass
     if let Some(d) = &domain {
         if rules.allow_domains.contains(d) {
             return PromoClassification {
@@ -120,23 +153,7 @@ pub fn classify_with_rules(
             };
         }
     }
-    if rules.allow_senders.contains(&from_lower) {
-        return PromoClassification {
-            signals: PromoSignals {
-                allow_match: Some(AllowMatch::Sender),
-                ..Default::default()
-            },
-            verdict: PromoVerdict::Human,
-        };
-    }
-
-    // ── Block rules — short-circuit to Promo ──────────────────
-    if rules.block_senders.contains(&from_lower) {
-        return PromoClassification {
-            signals: PromoSignals::default(),
-            verdict: PromoVerdict::Promo(BlockReason::SenderBlocklist),
-        };
-    }
+    // 4. domain_block — broad drop
     if let Some(d) = &domain {
         if rules.block_domains.contains(d) {
             return PromoClassification {
@@ -484,13 +501,42 @@ mod tests {
         );
     }
 
+    /// Audit fix #10 — sender_block (most specific) beats
+    /// domain_allow (broader). Lets the operator say "allow
+    /// @bigcorp but block marketing@bigcorp".
     #[test]
-    fn allow_domain_overrides_block_sender() {
-        // Both rules present — allow has higher priority.
+    fn sender_block_wins_over_domain_allow() {
         let raw = raw_text("Hi");
         let rules = vec![
-            rule(RuleKind::SenderBlock, "alice@example.com"),
+            rule(RuleKind::SenderBlock, "marketing@example.com"),
             rule(RuleKind::DomainAllow, "example.com"),
+        ];
+        let r = ResolvedRules::from_persisted(
+            Strictness::Balanced,
+            crate::spam_filter::defaults::BALANCED_THRESHOLDS.clone(),
+            &rules,
+        );
+        let blocked = classify_with_rules(&raw, "Hi", "marketing@example.com", &r);
+        assert_eq!(
+            blocked.verdict,
+            PromoVerdict::Promo(BlockReason::SenderBlocklist),
+            "sender_block must beat domain_allow (most-specific wins)",
+        );
+        // Other senders on the same domain still bypass via
+        // domain_allow — block was sender-specific.
+        let allowed = classify_with_rules(&raw, "Hi", "ana@example.com", &r);
+        assert_eq!(allowed.verdict, PromoVerdict::Human);
+    }
+
+    /// Audit fix #10 — within the sender level, sender_allow
+    /// wins over sender_block so a deliberate VIP-marked
+    /// address survives an accidental block.
+    #[test]
+    fn sender_allow_wins_over_sender_block() {
+        let raw = raw_text("Hi");
+        let rules = vec![
+            rule(RuleKind::SenderAllow, "alice@example.com"),
+            rule(RuleKind::SenderBlock, "alice@example.com"),
         ];
         let r = ResolvedRules::from_persisted(
             Strictness::Balanced,

@@ -50,6 +50,8 @@ pub async fn put_handler(
         return service_unavailable();
     };
     let now_ms = Utc::now().timestamp_millis();
+    // Pre-state for audit row.
+    let before = (*cache.get_or_load(tenant_id.as_str()).await).clone();
     if let Err(e) = cache.store().put(tenant_id.as_str(), &body, now_ms).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -61,6 +63,17 @@ pub async fn put_handler(
             .into_response();
     }
     cache.invalidate(tenant_id.as_str()).await;
+    if let Some(audit) = state.audit.as_ref() {
+        audit
+            .record_config_change(
+                tenant_id.as_str(),
+                "scoring",
+                serde_json::to_value(&before).ok(),
+                serde_json::to_value(&body).ok(),
+                now_ms as u64,
+            )
+            .await;
+    }
     tracing::info!(
         target: "extension.marketing.scoring",
         tenant_id = %tenant_id.as_str(),
@@ -80,6 +93,8 @@ pub async fn delete_handler(
     let Some(cache) = state.scoring.as_ref() else {
         return service_unavailable();
     };
+    let now_ms = Utc::now().timestamp_millis();
+    let before = (*cache.get_or_load(tenant_id.as_str()).await).clone();
     if let Err(e) = cache.store().reset(tenant_id.as_str()).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -92,6 +107,17 @@ pub async fn delete_handler(
     }
     cache.invalidate(tenant_id.as_str()).await;
     let defaults = ScoringConfig::default();
+    if let Some(audit) = state.audit.as_ref() {
+        audit
+            .record_config_change(
+                tenant_id.as_str(),
+                "scoring",
+                serde_json::to_value(&before).ok(),
+                serde_json::to_value(&defaults).ok(),
+                now_ms as u64,
+            )
+            .await;
+    }
     (
         StatusCode::OK,
         Json(json!({

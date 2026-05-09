@@ -137,11 +137,32 @@ pub struct ScoringConfig {
     pub brief_body_penalty: i32,
     /// Purchase-intent keyword boost. Triggered when any
     /// `purchase_intent_keywords` substring matches the
-    /// subject + body haystack (lowercase).
+    /// subject + body haystack (lowercase). Used as the
+    /// default weight for keywords that don't have a specific
+    /// override in `purchase_intent_keyword_weights`.
     pub purchase_intent_boost: i32,
     /// Lowercase substrings that flag a purchase / quote
     /// intent. Default = [`DEFAULT_PURCHASE_INTENT_KEYWORDS`].
     pub purchase_intent_keywords: Vec<String>,
+    /// Audit fix #9 — per-keyword weight overrides. Keys are
+    /// keyword strings (must also appear in
+    /// `purchase_intent_keywords` to fire); values are the
+    /// boost each adds when it matches. Lets the operator say
+    /// "demo only +10, quiero comprar +30" without breaking
+    /// the flat default for unspecified keywords.
+    ///
+    /// Composition: each matching keyword adds its own delta
+    /// (the SDK scorer sums rule contributions). Operator
+    /// guidance: choose modest values per-keyword — if 5
+    /// keywords match together they all stack. Score is
+    /// clamped to [0, 100] downstream so an over-boost just
+    /// pegs at 100, never wraps.
+    ///
+    /// Empty map (the default) preserves the legacy flat-boost
+    /// behaviour where any match contributes one
+    /// `purchase_intent_boost`.
+    #[serde(default)]
+    pub purchase_intent_keyword_weights: std::collections::HashMap<String, i32>,
     /// Boost applied when the sender's display name matches a
     /// senior-role token.
     pub senior_signature_boost: i32,
@@ -164,6 +185,7 @@ impl Default for ScoringConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            purchase_intent_keyword_weights: std::collections::HashMap::new(),
             senior_signature_boost: 15,
             senior_tokens: DEFAULT_SENIOR_TOKENS
                 .iter()
@@ -262,17 +284,67 @@ pub fn build_marketing_scorer_with_config(
     // Catches "Quiero comprar" / "Cotizar" / "Cuánto cuesta"
     // / "Looking to buy" style high-intent leads the
     // word-count rule alone would mis-rank.
-    let purchase_keywords = cfg.purchase_intent_keywords.clone();
-    s.push(HeuristicRule::with_detail(
-        "purchase_intent",
-        cfg.purchase_intent_boost,
-        "subject or body contains a purchase-intent keyword",
-        move |c: &LeadCtx| {
-            purchase_keywords
-                .iter()
-                .any(|kw| c.haystack_lower.contains(kw.as_str()))
-        },
-    ));
+    //
+    // Audit fix #9 — when the operator supplied per-keyword
+    // weights via `purchase_intent_keyword_weights`, each
+    // matched keyword contributes its own override (defaulting
+    // to `purchase_intent_boost` for unspecified keywords).
+    // Multi-match takes MAX so repeating "comprar" 3 times
+    // doesn't compound. The rule's static `delta` stays at
+    // `purchase_intent_boost` for back-compat — when no
+    // overrides are configured the fast-path matches the
+    // original flat-boost behaviour exactly. When overrides
+    // exist, the rule fires conditionally + the score
+    // composer picks up the max delta from the rule's
+    // `delta_override` (when present).
+    //
+    // Note: the SDK's `HeuristicScorer` uses a static `delta`
+    // per rule. To support per-match dynamic weights without
+    // changing the SDK, we instead push N rules — one per
+    // distinct override + one for the catch-all default. Each
+    // rule fires only when its keyword matches; the SDK's
+    // saturating-add semantics + Score's clamp-to-0-floor
+    // handle the composition.
+    let default_keywords: Vec<String> = cfg
+        .purchase_intent_keywords
+        .iter()
+        .filter(|k| !cfg.purchase_intent_keyword_weights.contains_key(k.as_str()))
+        .cloned()
+        .collect();
+    if !default_keywords.is_empty() {
+        s.push(HeuristicRule::with_detail(
+            "purchase_intent",
+            cfg.purchase_intent_boost,
+            "subject or body contains a default-weight purchase-intent keyword",
+            move |c: &LeadCtx| {
+                default_keywords
+                    .iter()
+                    .any(|kw| c.haystack_lower.contains(kw.as_str()))
+            },
+        ));
+    }
+    // One rule per keyword that has its own weight. Label +
+    // detail are owned `String`s (HeuristicRule's `with_detail`
+    // takes `impl Into<String>`) so each scorer build is
+    // self-contained — no leaked statics.
+    for (kw, weight) in cfg.purchase_intent_keyword_weights.iter() {
+        // Operator overrides only apply when the keyword is
+        // also in the active keyword list — otherwise the
+        // override would silently inject a phrase the operator
+        // hadn't enabled.
+        if !cfg.purchase_intent_keywords.iter().any(|k| k == kw) {
+            continue;
+        }
+        let label = format!("purchase_intent:{}", kw);
+        let detail = format!("purchase-intent keyword \"{}\" matched", kw);
+        let kw_owned = kw.clone();
+        s.push(HeuristicRule::with_detail(
+            label,
+            *weight,
+            detail,
+            move |c: &LeadCtx| c.haystack_lower.contains(&kw_owned),
+        ));
+    }
 
     let senior_tokens = cfg.senior_tokens.clone();
     s.push(HeuristicRule::with_detail(

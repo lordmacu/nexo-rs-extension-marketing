@@ -168,6 +168,12 @@ pub struct AdminState {
     /// publish gate), and `generate_draft_handler` (refuses
     /// LLM-spending automation while paused).
     pub marketing_state: Option<crate::marketing_state::MarketingStateCache>,
+    /// Audit fix #8 — broker hop in-flight + lifetime
+    /// counters. Always wired (cheap when unused) so the
+    /// /healthz handler doesn't have to thread an `Option`.
+    /// Same `BrokerMetrics` shared with the broker hop closure
+    /// in `main.rs` — incrementing there is reflected here.
+    pub broker_metrics: crate::broker_metrics::BrokerMetrics,
 }
 
 impl AdminState {
@@ -194,6 +200,7 @@ impl AdminState {
             draft_locks: crate::draft_lock::DraftLockMap::new(),
             scoring: None,
             marketing_state: None,
+            broker_metrics: crate::broker_metrics::BrokerMetrics::new(),
         }
     }
 
@@ -405,6 +412,19 @@ impl AdminState {
         cache: crate::marketing_state::MarketingStateCache,
     ) -> Self {
         self.marketing_state = Some(cache);
+        self
+    }
+
+    /// Wire the shared broker-metrics handle (audit fix #8).
+    /// Boot constructs one `BrokerMetrics`; the broker hop's
+    /// closure clones it once for `enter()` / `record_processed`,
+    /// AdminState clones it once so /healthz can read the
+    /// snapshot. Same Arc internals — both views are live.
+    pub fn with_broker_metrics(
+        mut self,
+        metrics: crate::broker_metrics::BrokerMetrics,
+    ) -> Self {
+        self.broker_metrics = metrics;
         self
     }
 

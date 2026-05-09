@@ -228,6 +228,33 @@ pub enum AuditEvent {
         /// Wall-clock at_ms.
         at_ms: u64,
     },
+    /// Operator changed a tenant-level config surface (audit
+    /// fix #6). Recorded by the admin PUT / POST / DELETE
+    /// handlers so the compliance view can answer "who lowered
+    /// the brief_body threshold + when, and what was the value
+    /// before?". `before_json` / `after_json` carry the full
+    /// pre/post snapshots so a roll-back is one operator copy
+    /// + paste away.
+    ConfigChanged {
+        /// Tenant scope.
+        tenant_id: String,
+        /// Stable scope label: `"scoring"` / `"spam_filter_config"` /
+        /// `"spam_filter_rule_added"` / `"spam_filter_rule_removed"` /
+        /// `"marketing_state"`.
+        scope: String,
+        /// JSON snapshot of the value BEFORE the change.
+        /// `null` for adds (new row) or when capturing the
+        /// pre-state would be expensive (e.g. resetting a full
+        /// rule list).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_json: Option<serde_json::Value>,
+        /// JSON snapshot of the value AFTER the change.
+        /// `null` for deletes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_json: Option<serde_json::Value>,
+        /// Wall-clock at_ms.
+        at_ms: u64,
+    },
     /// Inbound matched the unsubscribe / opt-out detector
     /// (audit fix #5). The lead is auto-transitioned to `lost`,
     /// the sender is auto-added to the per-tenant
@@ -295,6 +322,7 @@ impl EventMetadata for AuditEvent {
             Self::DraftDeduped { .. } => "draft_deduped",
             Self::PromoFiltered { .. } => "promo_filtered",
             Self::UnsubscribeDetected { .. } => "unsubscribe_detected",
+            Self::ConfigChanged { .. } => "config_changed",
         }
     }
 
@@ -319,6 +347,10 @@ impl EventMetadata for AuditEvent {
             Self::UnsubscribeDetected { lead_id, from_email, .. } => {
                 lead_id.as_deref().unwrap_or(from_email.as_str())
             }
+            // Config changes aren't lead-scoped — index by
+            // scope label so an operator can pull every
+            // mutation of `scoring` config in one query.
+            Self::ConfigChanged { scope, .. } => scope.as_str(),
         }
     }
 
@@ -333,6 +365,7 @@ impl EventMetadata for AuditEvent {
             Self::DraftDeduped { tenant_id, .. } => tenant_id.as_str(),
             Self::PromoFiltered { tenant_id, .. } => tenant_id.as_str(),
             Self::UnsubscribeDetected { tenant_id, .. } => tenant_id.as_str(),
+            Self::ConfigChanged { tenant_id, .. } => tenant_id.as_str(),
         })
     }
 
@@ -347,6 +380,7 @@ impl EventMetadata for AuditEvent {
             Self::DraftDeduped { at_ms, .. } => *at_ms,
             Self::PromoFiltered { at_ms, .. } => *at_ms,
             Self::UnsubscribeDetected { at_ms, .. } => *at_ms,
+            Self::ConfigChanged { at_ms, .. } => *at_ms,
         }
     }
 }
@@ -411,6 +445,38 @@ impl AuditLog {
             .append(&event)
             .await
             .map_err(AuditError::from_display)
+    }
+
+    /// Convenience for the admin handlers that mutate tenant
+    /// config (scoring weights, spam filter rules / config,
+    /// marketing on/off). Logs `tracing::warn` on failure
+    /// (audit failure must NEVER block a successful save —
+    /// the operator's edit already landed; missing the audit
+    /// row is a recovery issue for compliance).
+    pub async fn record_config_change(
+        &self,
+        tenant_id: impl Into<String>,
+        scope: impl Into<String>,
+        before_json: Option<serde_json::Value>,
+        after_json: Option<serde_json::Value>,
+        at_ms: u64,
+    ) {
+        let scope_str = scope.into();
+        let event = AuditEvent::ConfigChanged {
+            tenant_id: tenant_id.into(),
+            scope: scope_str.clone(),
+            before_json,
+            after_json,
+            at_ms,
+        };
+        if let Err(e) = self.record(event).await {
+            tracing::warn!(
+                target: "marketing.audit",
+                scope = %scope_str,
+                error = %e,
+                "audit record config_changed failed",
+            );
+        }
     }
 
     /// Filtered list. Caller passes the SDK `ListFilter`

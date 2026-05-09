@@ -95,6 +95,7 @@ pub async fn put_config_handler(
         Ok(c) => c,
         Err(e) => return store_error(e),
     };
+    let before = cfg.clone();
     cfg.strictness = body.strictness;
     if let Some(t) = body.thresholds {
         cfg.thresholds = t;
@@ -104,6 +105,17 @@ pub async fn put_config_handler(
         return store_error(e);
     }
     cache.invalidate(tenant_id.as_str()).await;
+    if let Some(audit) = state.audit.as_ref() {
+        audit
+            .record_config_change(
+                tenant_id.as_str(),
+                "spam_filter_config",
+                serde_json::to_value(&before).ok(),
+                serde_json::to_value(&cfg).ok(),
+                now_ms as u64,
+            )
+            .await;
+    }
     (
         StatusCode::OK,
         Json(json!({
@@ -148,6 +160,17 @@ pub async fn add_rule_handler(
         Err(e) => return store_error(e),
     };
     cache.invalidate(tenant_id.as_str()).await;
+    if let Some(audit) = state.audit.as_ref() {
+        audit
+            .record_config_change(
+                tenant_id.as_str(),
+                "spam_filter_rule_added",
+                None,
+                serde_json::to_value(&rule).ok(),
+                now_ms as u64,
+            )
+            .await;
+    }
     (
         StatusCode::OK,
         Json(json!({
@@ -187,6 +210,18 @@ pub async fn delete_rule_handler(
             .into_response();
     }
     cache.invalidate(tenant_id.as_str()).await;
+    if let Some(audit) = state.audit.as_ref() {
+        let now_ms = Utc::now().timestamp_millis();
+        audit
+            .record_config_change(
+                tenant_id.as_str(),
+                "spam_filter_rule_removed",
+                Some(serde_json::json!({ "rule_id": rule_id })),
+                None,
+                now_ms as u64,
+            )
+            .await;
+    }
     (
         StatusCode::OK,
         Json(json!({ "ok": true, "result": { "deleted": rule_id } })),

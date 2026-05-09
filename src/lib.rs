@@ -23,6 +23,7 @@ pub mod admin;
 pub mod audit;
 pub mod availability;
 pub mod broker;
+pub mod broker_metrics;
 pub mod compliance;
 pub mod config;
 pub mod draft;
