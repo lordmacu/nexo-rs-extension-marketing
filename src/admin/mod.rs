@@ -612,6 +612,12 @@ pub fn router(state: Arc<AdminState>) -> Router {
             "/email-templates/:id/render",
             axum::routing::post(email_templates::render_handler),
         )
+        // Preview render against in-progress (non-persisted)
+        // blocks JSON. Used by the builder UI for live preview.
+        .route(
+            "/email-templates/preview",
+            axum::routing::post(email_templates::preview_handler),
+        )
         // Marketing on/off toggle. Pause halts automated
         // effects (notifications, draft generation, follow-up
         // sweeps) without losing inbound traffic.

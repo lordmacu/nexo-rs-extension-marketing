@@ -191,6 +191,31 @@ pub struct RenderBody {
     pub vars: HashMap<String, String>,
 }
 
+/// Preview render for the builder UI — caller posts the
+/// in-progress blocks JSON directly (not persisted) and gets
+/// the rendered HTML back. Lets the editor show a live preview
+/// without the operator having to save first.
+#[derive(Debug, Deserialize)]
+pub struct PreviewBody {
+    #[serde(default)]
+    pub blocks: Vec<EmailBlock>,
+    #[serde(default)]
+    pub vars: HashMap<String, String>,
+}
+
+pub async fn preview_handler(
+    State(_state): State<Arc<AdminState>>,
+    Extension(_tenant_id): Extension<TenantId>,
+    Json(body): Json<PreviewBody>,
+) -> Response {
+    let html = render_template(&body.blocks, &body.vars);
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "result": { "html": html } })),
+    )
+        .into_response()
+}
+
 pub async fn render_handler(
     State(state): State<Arc<AdminState>>,
     Extension(tenant_id): Extension<TenantId>,
