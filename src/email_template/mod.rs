@@ -12,9 +12,11 @@
 //! body — same OutboundPublisher path as a manual compose.
 
 pub mod blocks;
+pub mod sanitize;
 pub mod store;
 
 pub use blocks::{render_block, render_template, EmailBlock, TextAlign};
+pub use sanitize::email_safe_html;
 pub use store::{
     migrate, EmailTemplate, EmailTemplateStore, TemplateStoreError,
 };

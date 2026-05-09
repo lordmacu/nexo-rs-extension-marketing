@@ -230,12 +230,14 @@ mod tests {
         vec![
             EmailBlock::Heading {
                 text: "Hola {{name}}".into(),
+                text_html: None,
                 level: 1,
                 color: None,
                 align: TextAlign::Center,
             },
             EmailBlock::Paragraph {
                 text: "Gracias por escribirnos.".into(),
+                text_html: None,
                 color: None,
                 align: TextAlign::Left,
                 font_size: 16,

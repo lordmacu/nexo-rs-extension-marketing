@@ -49,7 +49,17 @@ impl TextAlign {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EmailBlock {
     Heading {
+        /// Plain-text body. Used when `text_html` is `None`.
+        /// Always HTML-escaped during render.
         text: String,
+        /// Optional rich-text body emitted by the TipTap
+        /// editor. When present, supersedes `text` and is
+        /// rendered VERBATIM after passing through the
+        /// email-safe sanitizer (whitelist tags + attrs).
+        /// Stored on the wire as the post-sanitization HTML
+        /// so a reload doesn't re-sanitize.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text_html: Option<String>,
         /// 1, 2, 3 — clamped server-side. Anything else falls
         /// back to 2.
         #[serde(default = "default_heading_level")]
@@ -61,6 +71,10 @@ pub enum EmailBlock {
     },
     Paragraph {
         text: String,
+        /// See `Heading.text_html`. Same semantics, applies
+        /// inside the `<p>` element.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text_html: Option<String>,
         #[serde(default)]
         color: Option<String>,
         #[serde(default)]
@@ -154,9 +168,20 @@ pub fn render_template(blocks: &[EmailBlock], vars: &HashMap<String, String>) ->
 /// the one exception — emits its own nested table inside a tr.
 pub fn render_block(block: &EmailBlock, vars: &HashMap<String, String>) -> String {
     match block {
-        EmailBlock::Heading { text, level, color, align } => {
-            let text = substitute_vars(text, vars);
-            let text = escape_html(&text);
+        EmailBlock::Heading { text, text_html, level, color, align } => {
+            // Prefer the rich-text body when set. The sanitizer
+            // already ran when the operator saved; we run it
+            // again defensively so a forged blocks_json can't
+            // sneak `<script>` past the renderer.
+            let body = match text_html.as_deref() {
+                Some(html) if !html.is_empty() => {
+                    substitute_vars(&crate::email_template::email_safe_html(html), vars)
+                }
+                _ => {
+                    let plain = substitute_vars(text, vars);
+                    escape_html(&plain)
+                }
+            };
             let level = match *level {
                 1 | 2 | 3 => *level,
                 _ => 2,
@@ -168,17 +193,24 @@ pub fn render_block(block: &EmailBlock, vars: &HashMap<String, String>) -> Strin
             };
             let color = color.as_deref().unwrap_or("#1a1a1a");
             format!(
-                r#"<tr><td style="padding:12px 24px;text-align:{align};"><h{level} style="margin:0;font-size:{size}px;line-height:1.3;color:{color};font-weight:600;">{text}</h{level}></td></tr>"#,
+                r#"<tr><td style="padding:12px 24px;text-align:{align};"><h{level} style="margin:0;font-size:{size}px;line-height:1.3;color:{color};font-weight:600;">{body}</h{level}></td></tr>"#,
                 align = align.as_str(),
             )
         }
-        EmailBlock::Paragraph { text, color, align, font_size } => {
-            let text = substitute_vars(text, vars);
-            let text = escape_html(&text).replace('\n', "<br/>");
+        EmailBlock::Paragraph { text, text_html, color, align, font_size } => {
+            let body = match text_html.as_deref() {
+                Some(html) if !html.is_empty() => {
+                    substitute_vars(&crate::email_template::email_safe_html(html), vars)
+                }
+                _ => {
+                    let plain = substitute_vars(text, vars);
+                    escape_html(&plain).replace('\n', "<br/>")
+                }
+            };
             let color = color.as_deref().unwrap_or("#374151");
             let size = (*font_size).clamp(10, 32);
             format!(
-                r#"<tr><td style="padding:8px 24px;text-align:{align};"><p style="margin:0;font-size:{size}px;line-height:1.5;color:{color};">{text}</p></td></tr>"#,
+                r#"<tr><td style="padding:8px 24px;text-align:{align};"><p style="margin:0;font-size:{size}px;line-height:1.5;color:{color};">{body}</p></td></tr>"#,
                 align = align.as_str(),
             )
         }
@@ -320,6 +352,7 @@ mod tests {
     fn heading_renders_with_level_and_color() {
         let b = EmailBlock::Heading {
             text: "Hola Juan".into(),
+            text_html: None,
             level: 1,
             color: Some("#000000".into()),
             align: TextAlign::Center,
@@ -335,6 +368,7 @@ mod tests {
     fn heading_invalid_level_falls_back_to_h2() {
         let b = EmailBlock::Heading {
             text: "x".into(),
+            text_html: None,
             level: 7,
             color: None,
             align: TextAlign::default(),
@@ -347,6 +381,7 @@ mod tests {
     fn variables_substitute_in_text() {
         let b = EmailBlock::Paragraph {
             text: "Hola {{name}}, gracias.".into(),
+            text_html: None,
             color: None,
             align: TextAlign::Left,
             font_size: 16,
@@ -356,9 +391,44 @@ mod tests {
     }
 
     #[test]
+    fn rich_text_html_renders_inline_formatting() {
+        let b = EmailBlock::Paragraph {
+            text: "fallback".into(),
+            text_html: Some(
+                "Hola <strong>{{name}}</strong>, gracias.".into(),
+            ),
+            color: None,
+            align: TextAlign::Left,
+            font_size: 16,
+        };
+        let out = render_block(&b, &vars(&[("name", "Camila")]));
+        assert!(out.contains("<strong>Camila</strong>"));
+        // Plain `text` ignored when text_html present.
+        assert!(!out.contains("fallback"));
+    }
+
+    #[test]
+    fn rich_text_html_strips_script_defensively() {
+        // Even if a forged blocks_json carries a `<script>` in
+        // text_html, the renderer's defensive sanitizer drops
+        // it before output.
+        let b = EmailBlock::Paragraph {
+            text: "x".into(),
+            text_html: Some("<script>alert(1)</script>safe".into()),
+            color: None,
+            align: TextAlign::Left,
+            font_size: 16,
+        };
+        let out = render_block(&b, &HashMap::new());
+        assert!(!out.contains("<script"));
+        assert!(out.contains("safe"));
+    }
+
+    #[test]
     fn unknown_variables_pass_through() {
         let b = EmailBlock::Paragraph {
             text: "Hi {{unknown}} there".into(),
+            text_html: None,
             color: None,
             align: TextAlign::Left,
             font_size: 16,
@@ -371,6 +441,7 @@ mod tests {
     fn html_escapes_user_text() {
         let b = EmailBlock::Heading {
             text: "<script>alert(1)</script>".into(),
+            text_html: None,
             level: 2,
             color: None,
             align: TextAlign::default(),
@@ -464,12 +535,14 @@ mod tests {
         let b = EmailBlock::TwoColumn {
             left: vec![EmailBlock::Paragraph {
                 text: "left side".into(),
+                text_html: None,
                 color: None,
                 align: TextAlign::Left,
                 font_size: 14,
             }],
             right: vec![EmailBlock::Paragraph {
                 text: "right side".into(),
+                text_html: None,
                 color: None,
                 align: TextAlign::Right,
                 font_size: 14,
@@ -505,6 +578,7 @@ mod tests {
     fn render_template_wraps_in_600px_table() {
         let blocks = vec![EmailBlock::Heading {
             text: "Hi".into(),
+            text_html: None,
             level: 1,
             color: None,
             align: TextAlign::default(),
@@ -521,6 +595,7 @@ mod tests {
         let blocks = vec![
             EmailBlock::Heading {
                 text: "Title".into(),
+                text_html: None,
                 level: 1,
                 color: Some("#000".into()),
                 align: TextAlign::Center,
@@ -528,6 +603,7 @@ mod tests {
             EmailBlock::Spacer { height_px: 16 },
             EmailBlock::Paragraph {
                 text: "Body".into(),
+                text_html: None,
                 color: None,
                 align: TextAlign::Left,
                 font_size: 14,
