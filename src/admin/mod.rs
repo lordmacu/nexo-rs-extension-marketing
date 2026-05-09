@@ -28,6 +28,7 @@ pub mod audit;
 pub mod auth;
 pub mod compose;
 pub mod config;
+pub mod email_templates;
 pub mod firehose;
 pub mod healthz;
 pub mod leads;
@@ -175,6 +176,10 @@ pub struct AdminState {
     /// Same `BrokerMetrics` shared with the broker hop closure
     /// in `main.rs` — incrementing there is reflected here.
     pub broker_metrics: crate::broker_metrics::BrokerMetrics,
+    /// Per-tenant email-template store. CRUD endpoints +
+    /// compose-flow lookup go through this. `None` ⇒
+    /// /admin/email-templates routes 503.
+    pub email_template_store: Option<crate::email_template::EmailTemplateStore>,
 }
 
 impl AdminState {
@@ -202,6 +207,7 @@ impl AdminState {
             scoring: None,
             marketing_state: None,
             broker_metrics: crate::broker_metrics::BrokerMetrics::new(),
+            email_template_store: None,
         }
     }
 
@@ -429,6 +435,17 @@ impl AdminState {
         self
     }
 
+    /// Wire the email-template store. Boot opens one against
+    /// the per-tenant identity pool; admin endpoints + the
+    /// compose flow's template-picker lookup share the Arc.
+    pub fn with_email_template_store(
+        mut self,
+        store: crate::email_template::EmailTemplateStore,
+    ) -> Self {
+        self.email_template_store = Some(store);
+        self
+    }
+
     pub fn lookup_store(&self, tenant_id: &TenantId) -> Option<Arc<LeadStore>> {
         self.stores.get(tenant_id).cloned()
     }
@@ -576,6 +593,24 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route(
             "/compose/send",
             axum::routing::post(compose::send_handler),
+        )
+        // Block-based email templates. Operator authors via
+        // the builder UI; compose flow picks one + renders
+        // with recipient vars before send.
+        .route(
+            "/email-templates",
+            get(email_templates::list_handler)
+                .post(email_templates::create_handler),
+        )
+        .route(
+            "/email-templates/:id",
+            get(email_templates::get_handler)
+                .put(email_templates::update_handler)
+                .delete(email_templates::delete_handler),
+        )
+        .route(
+            "/email-templates/:id/render",
+            axum::routing::post(email_templates::render_handler),
         )
         // Marketing on/off toggle. Pause halts automated
         // effects (notifications, draft generation, follow-up

@@ -304,6 +304,14 @@ async fn main() -> anyhow::Result<()> {
     let broker_metrics = nexo_marketing::broker_metrics::BrokerMetrics::new();
     let broker_metrics_for_closure = broker_metrics.clone();
 
+    // ─── Email template store ──────────────────────────────────
+    nexo_marketing::email_template::migrate(&identity_pool)
+        .await
+        .context("email_template migrate")?;
+    let email_template_store =
+        nexo_marketing::email_template::EmailTemplateStore::new(identity_pool.clone());
+    tracing::info!(tenant = %tenant, "email template store ready");
+
     let plugin_deps = PluginDeps::new(tenant.clone(), lead_store.clone(), router.clone())
         .with_identity(identity.clone())
         .with_sellers(seller_lookup.clone())
@@ -455,7 +463,8 @@ async fn main() -> anyhow::Result<()> {
         .with_spam_filter(spam_filter_cache.clone())
         .with_scoring(scoring_cache.clone())
         .with_marketing_state(marketing_state_cache.clone())
-        .with_broker_metrics(broker_metrics.clone());
+        .with_broker_metrics(broker_metrics.clone())
+        .with_email_template_store(email_template_store.clone());
     if let Some(deps) = tracking_deps.clone() {
         admin_state_builder = admin_state_builder
             .with_tracking(deps.clone())
