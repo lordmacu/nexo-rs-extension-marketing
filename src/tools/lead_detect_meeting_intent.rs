@@ -2,6 +2,11 @@
 //! classifier. Stage 1 regex catches obvious "yes Tuesday at
 //! 3pm" / "sí, martes a las 15:00" / Calendly URL. Stage 2
 //! LLM lands later (M18); this commit ships the regex stage
+//!
+//! **F29 sweep:** marketing-specific by design. The intent
+//! classes are sales-pipeline shaped (booking confirm). The
+//! regex helpers could lift if a second consumer needs
+//! datetime / calendar-URL extraction outside the CRM frame.
 //! + a `Some(0.5)` confidence stub when text is ambiguous so
 //! callers can defer to operator review.
 //!

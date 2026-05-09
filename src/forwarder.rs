@@ -1,5 +1,11 @@
 //! Notification forwarder (M15.39).
 //!
+//! **F29 sweep:** marketing-specific by design. Subject
+//! routing logic + idempotency dedup uses the lifted SDK
+//! `dedup` cache; this module is the CRM-shaped consumer
+//! that knows the wa-bridge / email-plugin outbound topic
+//! conventions.
+//!
 //! Closes the operator-notification loop opened in M15.38.
 //! Subscribes to `agent.email.notification.*` (the very topic
 //! [`crate::notification`] publishes to) and routes the payload

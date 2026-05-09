@@ -2,6 +2,11 @@
 //! per-tenant `person_email` table — if a previous thread
 //! already mapped that address to a person, hit at confidence
 //! 0.95 (deterministic). Free; cache-cheap.
+//!
+//! **F29 sweep:** marketing-specific impl of the SDK's
+//! `EnrichmentSource`. Reads the lifted `PersonEmailStore`
+//! (`nexo-microapp-sdk::identity`) but emits CRM-shaped
+//! `EnrichmentResult` rows.
 
 use async_trait::async_trait;
 

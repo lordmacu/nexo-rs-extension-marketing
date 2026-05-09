@@ -1,6 +1,13 @@
 //! Identity resolver — drives the SDK fallback chain for an
 //! inbound, branches by domain kind, persists the result.
 //!
+//! **F29 sweep:** marketing-specific glue over lifted
+//! primitives. Fallback chain runner + classifier already in
+//! `nexo-microapp-sdk::enrichment`; this resolver wires the
+//! chain to `PersonStore`/`CompanyStore`/`PersonEmailStore`
+//! (also lifted to the SDK's `identity` feature) with
+//! CRM-specific persistence + merge events.
+//!
 //! Pipeline:
 //!   1. Classify domain (corporate / personal / disposable).
 //!   2. Disposable → outcome `Drop`.

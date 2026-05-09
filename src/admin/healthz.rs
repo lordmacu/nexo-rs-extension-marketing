@@ -2,6 +2,10 @@
 //! payload so the daemon's supervisor can read "extension up"
 //! without a token. Future M15.24 wires per-mailbox + sqlite
 //! status here.
+//!
+//! **F29 sweep:** generic-shape, 8 LOC of glue. Trivial enough
+//! that lifting would add more boilerplate (trait + impl) than
+//! it saves.
 
 use axum::Json;
 use serde_json::{json, Value};

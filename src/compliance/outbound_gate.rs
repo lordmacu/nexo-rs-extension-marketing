@@ -1,5 +1,13 @@
 //! Pre-outbound compliance check.
 //!
+//! **F29 sweep:** generic-shape primitive consumer.
+//! `nexo-compliance-primitives` (anti-loop / opt-out / PII /
+//! rate-limit) is already lifted to the workspace crate; this
+//! module is the CRM-side wiring that knows how to feed it
+//! `(person_email, seller_id, body)` from a draft. Lift only
+//! when a second consumer composes the same 4 primitives in
+//! the same order — today the wiring's CRM-flavoured.
+//!
 //! Every approved AI draft passes through `OutboundGate::check`
 //! before publishing to `plugin.outbound.email.<instance>`.
 //! The gate composes the framework's compliance primitives so

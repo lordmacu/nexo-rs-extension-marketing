@@ -1,5 +1,12 @@
 //! Per-tenant routing dispatcher.
 //!
+//! **F29 sweep:** marketing-specific by design. The dispatcher
+//! engine is already lifted to `nexo-microapp-sdk::routing`;
+//! this wrapper is the per-tenant glue (file path resolution,
+//! round-robin cursor walk, vacation gate hookup) that's
+//! single-consumer today. Lifting the wrapper would mean
+//! lifting `Seller` / `RoutingRule` paths — domain.
+//!
 //! Thin wrapper over the SDK's `routing::Dispatcher` that:
 //!   1. Loads the per-tenant `RuleSet` (file path encodes
 //!      tenant scope; YAML hot-swappable).

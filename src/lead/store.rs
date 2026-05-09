@@ -1,5 +1,13 @@
 //! Per-tenant sqlite store for leads.
 //!
+//! **F29 sweep:** marketing-specific by design. The columns
+//! (`person_id`, `seller_id`, `state`, `topic_tags_json`,
+//! `next_check_at_ms`, `followup_attempts`, `operator_notes`)
+//! are CRM concepts — no other microapp would consume them
+//! verbatim. Per-tenant file isolation is generic but the
+//! SDK's `events` feature already covers that pattern; this
+//! store layers a lead-shaped schema on top.
+//!
 //! Each tenant gets its own DB file under
 //! `${state_root}/marketing/<tenant_id>/leads.db`. Stronger
 //! isolation than a shared schema — operator query bug can't
@@ -66,6 +74,11 @@ CREATE TABLE IF NOT EXISTS leads (
     next_check_at_ms    INTEGER,
     followup_attempts   INTEGER NOT NULL DEFAULT 0,
     why_routed_json     TEXT NOT NULL DEFAULT '[]',
+    -- M15.21.notes — free-form operator scratch pad (markdown).
+    -- NULL = column never written; empty string is also legal
+    -- and round-trips faithfully so the editor can clear it
+    -- without re-introducing nulls.
+    operator_notes      TEXT,
     PRIMARY KEY (tenant_id, id)
 );
 CREATE INDEX IF NOT EXISTS idx_leads_thread          ON leads(tenant_id, thread_id);
@@ -98,6 +111,14 @@ CREATE INDEX IF NOT EXISTS idx_thread_messages_lead
 const MIGRATION_SQL_ADD_SUBJECT: &str =
     "ALTER TABLE thread_messages ADD COLUMN subject TEXT";
 
+/// M15.21.notes — same idempotent-ALTER discipline for the
+/// new `operator_notes` column on the leads table. Pre-existing
+/// DBs from earlier installs lack the column; running fresh
+/// installs already get it via `MIGRATION_SQL`. The duplicate-
+/// column error is the success signal for fresh installs.
+const MIGRATION_SQL_ADD_OPERATOR_NOTES: &str =
+    "ALTER TABLE leads ADD COLUMN operator_notes TEXT";
+
 /// Per-tenant lead store. The struct holds its tenant id +
 /// pool; `Clone` is cheap (Arc-shared pool) so callers spawn
 /// without copying. Cross-tenant access is impossible by
@@ -126,6 +147,18 @@ impl LeadStore {
         // is the success signal there.
         if let Err(e) =
             sqlx::query(MIGRATION_SQL_ADD_SUBJECT).execute(&pool).await
+        {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(MarketingError::Sqlite(e));
+            }
+        }
+        // M15.21.notes — idempotent column-add on the leads
+        // table. Same swallow-duplicate / propagate-others
+        // discipline as the `subject` migration above.
+        if let Err(e) = sqlx::query(MIGRATION_SQL_ADD_OPERATOR_NOTES)
+            .execute(&pool)
+            .await
         {
             let msg = e.to_string();
             if !msg.contains("duplicate column name") {
@@ -198,7 +231,8 @@ impl LeadStore {
         let row = sqlx::query_as::<_, LeadRow>(
             "SELECT id, tenant_id, thread_id, subject, person_id, seller_id, \
                     state, score, sentiment, intent, topic_tags_json, \
-                    last_activity_ms, next_check_at_ms, followup_attempts, why_routed_json \
+                    last_activity_ms, next_check_at_ms, followup_attempts, why_routed_json, \
+                    operator_notes \
              FROM leads WHERE tenant_id = ? AND thread_id = ?",
         )
         .bind(self.tenant_id.as_str())
@@ -276,6 +310,57 @@ impl LeadStore {
             .ok_or_else(|| MarketingError::Sqlite(sqlx::Error::RowNotFound))
     }
 
+    /// M15.21.notes — replace the free-form `operator_notes`
+    /// markdown for a lead. `Some(text)` writes verbatim
+    /// (empty string allowed — round-trips faithfully so the
+    /// editor can clear without re-introducing nulls).
+    /// `None` writes SQL NULL so reads observe "field never
+    /// authored". Returns the refreshed `Lead` so callers can
+    /// stamp firehose / audit without a second round-trip.
+    pub async fn update_operator_notes(
+        &self,
+        lead_id: &LeadId,
+        notes: Option<String>,
+    ) -> Result<Lead, MarketingError> {
+        sqlx::query(
+            "UPDATE leads SET operator_notes = ? \
+             WHERE tenant_id = ? AND id = ?",
+        )
+        .bind(notes.as_deref())
+        .bind(self.tenant_id.as_str())
+        .bind(&lead_id.0)
+        .execute(&self.pool)
+        .await?;
+        self.get(lead_id)
+            .await?
+            .ok_or_else(|| MarketingError::Sqlite(sqlx::Error::RowNotFound))
+    }
+
+    /// M15.24+ — list every lead in the tenant ordered by most
+    /// recent activity. Powers the operator dashboard's "inbox"
+    /// view (every received email regardless of follow-up state),
+    /// distinct from [`Self::list_due_for_followup`] which the
+    /// sweep loop consumes. `limit` caps the page so a tenant
+    /// with thousands of cold leads doesn't blow the response;
+    /// caller paginates via `last_activity_ms` cursor when needed.
+    pub async fn list_all(&self, limit: u32) -> Result<Vec<Lead>, MarketingError> {
+        let rows = sqlx::query_as::<_, LeadRow>(
+            "SELECT id, tenant_id, thread_id, subject, person_id, seller_id, \
+                    state, score, sentiment, intent, topic_tags_json, \
+                    last_activity_ms, next_check_at_ms, followup_attempts, why_routed_json, \
+                    operator_notes \
+             FROM leads \
+             WHERE tenant_id = ? \
+             ORDER BY last_activity_ms DESC \
+             LIMIT ?",
+        )
+        .bind(self.tenant_id.as_str())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(LeadRow::into_lead).collect())
+    }
+
     /// Iterate leads with `next_check_at_ms <= now_ms`. Used
     /// by the followup sweep tool. Returns at most `limit`
     /// rows so a swamped tenant doesn't blow the cron tick.
@@ -287,7 +372,8 @@ impl LeadStore {
         let rows = sqlx::query_as::<_, LeadRow>(
             "SELECT id, tenant_id, thread_id, subject, person_id, seller_id, \
                     state, score, sentiment, intent, topic_tags_json, \
-                    last_activity_ms, next_check_at_ms, followup_attempts, why_routed_json \
+                    last_activity_ms, next_check_at_ms, followup_attempts, why_routed_json, \
+                    operator_notes \
              FROM leads \
              WHERE tenant_id = ? AND next_check_at_ms IS NOT NULL \
                                  AND next_check_at_ms <= ? \
@@ -737,7 +823,8 @@ impl From<ThreadMessageRow> for ThreadMessage {
 const SELECT_LEAD: &str =
     "SELECT id, tenant_id, thread_id, subject, person_id, seller_id, \
             state, score, sentiment, intent, topic_tags_json, \
-            last_activity_ms, next_check_at_ms, followup_attempts, why_routed_json \
+            last_activity_ms, next_check_at_ms, followup_attempts, why_routed_json, \
+            operator_notes \
      FROM leads WHERE tenant_id = ? AND id = ?";
 
 #[derive(Debug, sqlx::FromRow)]
@@ -757,6 +844,11 @@ struct LeadRow {
     next_check_at_ms: Option<i64>,
     followup_attempts: i64,
     why_routed_json: String,
+    /// M15.21.notes — `None` keeps the column NULL on disk;
+    /// `Some("")` round-trips as an empty string so the
+    /// editor can clear the field without re-introducing
+    /// nulls (a delete UX would be ambiguous otherwise).
+    operator_notes: Option<String>,
 }
 
 impl LeadRow {
@@ -781,6 +873,7 @@ impl LeadRow {
             next_check_at_ms: self.next_check_at_ms,
             followup_attempts: self.followup_attempts.clamp(0, 255) as u8,
             why_routed,
+            operator_notes: self.operator_notes,
         }
     }
 }
@@ -898,6 +991,103 @@ mod tests {
         let got = s.get(&LeadId("l1".into())).await.unwrap().unwrap();
         assert_eq!(got.id.0, "l1");
         assert_eq!(got.why_routed, vec!["fixture".to_string()]);
+        // M15.21.notes — fresh leads land with NULL notes.
+        assert!(got.operator_notes.is_none());
+    }
+
+    /// M15.21.notes — operator can write a markdown note and
+    /// read it back; subsequent updates replace verbatim.
+    #[tokio::test]
+    async fn update_operator_notes_round_trips() {
+        let s = fresh_store("acme").await;
+        s.create(input("l1", "juan", "pedro")).await.unwrap();
+        let updated = s
+            .update_operator_notes(
+                &LeadId("l1".into()),
+                Some("called PA, voicemail".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            updated.operator_notes.as_deref(),
+            Some("called PA, voicemail"),
+        );
+        let read = s.get(&LeadId("l1".into())).await.unwrap().unwrap();
+        assert_eq!(
+            read.operator_notes.as_deref(),
+            Some("called PA, voicemail"),
+        );
+        // Replace verbatim — no append semantics.
+        let after = s
+            .update_operator_notes(&LeadId("l1".into()), Some("**WIN**".into()))
+            .await
+            .unwrap();
+        assert_eq!(after.operator_notes.as_deref(), Some("**WIN**"));
+    }
+
+    /// M15.21.notes — empty string is legal and round-trips
+    /// faithfully so the editor can clear without re-introducing
+    /// nulls (a delete UX would be ambiguous otherwise).
+    #[tokio::test]
+    async fn update_operator_notes_empty_string_persists_as_empty() {
+        let s = fresh_store("acme").await;
+        s.create(input("l1", "juan", "pedro")).await.unwrap();
+        let updated = s
+            .update_operator_notes(&LeadId("l1".into()), Some(String::new()))
+            .await
+            .unwrap();
+        assert_eq!(updated.operator_notes.as_deref(), Some(""));
+    }
+
+    /// M15.21.notes — `None` writes SQL NULL so reads observe
+    /// the "field never authored" sentinel.
+    #[tokio::test]
+    async fn update_operator_notes_none_clears_to_null() {
+        let s = fresh_store("acme").await;
+        s.create(input("l1", "juan", "pedro")).await.unwrap();
+        // Author a note, then null it.
+        s.update_operator_notes(&LeadId("l1".into()), Some("scratch".into()))
+            .await
+            .unwrap();
+        let cleared = s
+            .update_operator_notes(&LeadId("l1".into()), None)
+            .await
+            .unwrap();
+        assert!(cleared.operator_notes.is_none());
+    }
+
+    /// M15.21.notes — updating a non-existent lead surfaces the
+    /// canonical `RowNotFound` error so the admin handler can
+    /// translate it to a 404 response.
+    #[tokio::test]
+    async fn update_operator_notes_missing_lead_errors() {
+        let s = fresh_store("acme").await;
+        let err = s
+            .update_operator_notes(&LeadId("ghost".into()), Some("x".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MarketingError::Sqlite(sqlx::Error::RowNotFound)));
+    }
+
+    /// M15.21.notes — cross-tenant isolation. Tenant B's update
+    /// for a lead id colliding with tenant A's lead must NOT
+    /// touch tenant A's row. Each `LeadStore` already encodes
+    /// the tenant in its file path, so the test asserts the
+    /// invariant by-construction.
+    #[tokio::test]
+    async fn update_operator_notes_is_tenant_scoped() {
+        let a = fresh_store("acme").await;
+        let b = fresh_store("beta").await;
+        a.create(input("l1", "juan", "pedro")).await.unwrap();
+        b.create(input("l1", "luis", "ana")).await.unwrap();
+        a.update_operator_notes(&LeadId("l1".into()), Some("A note".into()))
+            .await
+            .unwrap();
+        // B's row stays NULL; A's row carries the new value.
+        let from_b = b.get(&LeadId("l1".into())).await.unwrap().unwrap();
+        assert!(from_b.operator_notes.is_none());
+        let from_a = a.get(&LeadId("l1".into())).await.unwrap().unwrap();
+        assert_eq!(from_a.operator_notes.as_deref(), Some("A note"));
     }
 
     #[tokio::test]

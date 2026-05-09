@@ -4,6 +4,11 @@
 //! in Latam B2B where corporate users send from personal
 //! providers.
 //!
+//! **F29 sweep:** marketing-specific impl of the SDK's
+//! `EnrichmentSource` (`nexo-microapp-sdk::enrichment`).
+//! Trait + chain runner generic; this concrete adapter
+//! emits CRM-shaped `EnrichmentResult`.
+//!
 //! Cheap (regex, no IO). Confidence band 0.6-0.85 depending
 //! on signal strength.
 

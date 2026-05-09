@@ -1,6 +1,11 @@
 //! `GET /firehose` — Server-Sent Events stream of lead lifecycle
 //! events for the authenticated tenant.
 //!
+//! **F29 sweep:** marketing-specific by design. SSE primitive
+//! lifted to `nexo-microapp-http::sse`; this handler is the
+//! CRM-shaped consumer (subscribes to `LeadEventBus`, filters
+//! by tenant, maps `LeadFirehoseEvent`).
+//!
 //! Auth: same bearer + `X-Tenant-Id` middleware as every other
 //! admin route. The stamped `TenantId` (set by `bearer_and_tenant_middleware`)
 //! drives the per-connection filter — operators only see frames

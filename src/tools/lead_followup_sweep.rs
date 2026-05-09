@@ -2,6 +2,11 @@
 //! over leads with `next_check_at_ms <= now`. Returns the
 //! due-list payload so the agent generates draft replies +
 //! the binary's outbound layer publishes them.
+//!
+//! **F29 sweep:** marketing-specific by design. Reads
+//! `LeadStore::list_due_for_followup` directly. Generic
+//! "due-row sweeper" pattern would only earn its keep with
+//! a second consumer (campaign engine, scheduled-task UI).
 
 use std::sync::Arc;
 

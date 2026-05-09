@@ -1,5 +1,11 @@
 //! Outbound publisher.
 //!
+//! **F29 sweep:** marketing-specific by design. Compliance
+//! gate uses lifted `nexo-compliance-primitives`; tracking
+//! injection uses lifted `nexo-microapp-sdk::tracking`. This
+//! module is the CRM-shaped glue that composes them with the
+//! email plugin's `OutboundCommand`.
+//!
 //! Composes the compliance gate (M15.23) + idempotency
 //! (thread_id, draft_id) + the email plugin's
 //! `OutboundCommand` shape, returning `OutboundDispatchResult`

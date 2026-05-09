@@ -1,5 +1,8 @@
 //! `marketing_lead_route` tool — calls the per-tenant
 //! `LeadRouter` and returns `LeadRouteResponse`.
+//!
+//! **F29 sweep:** marketing-specific by design. Agent-callable
+//! tool over the (lifted) routing dispatcher.
 
 use std::sync::Arc;
 

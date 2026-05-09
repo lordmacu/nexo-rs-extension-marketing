@@ -15,11 +15,12 @@
 
 use std::sync::Arc;
 
-use nexo_microapp_sdk::enrichment::FallbackChain;
+use nexo_microapp_sdk::enrichment::{EnrichmentCache, FallbackChain};
 use nexo_microapp_sdk::identity::{
-    LidPnMappingStore, PersonEmailStore, PersonPhoneStore, PersonStore,
+    CompanyStore, LidPnMappingStore, PersonEmailStore, PersonPhoneStore, PersonStore,
 };
 
+use crate::enrichment::Scraper;
 use crate::firehose::LeadEventBus;
 use crate::lead::{LeadStore, RouterHandle};
 use crate::notification::{SellerLookup, TemplateLookup};
@@ -89,6 +90,50 @@ impl IdentityDeps {
     }
 }
 
+/// Phase 82.15.bx+ — auto-company-enrichment dependencies. The
+/// broker hop consults these on every inbound: when the resolved
+/// person's domain is `Corporate`, we look up the cache + spawn
+/// a detached scraper task on cache miss to upsert a `Company`
+/// row + link `person.company_id`. `None` on `PluginDeps`
+/// disables auto-enrichment (tests + minimal setups stay clean).
+#[derive(Clone)]
+pub struct EnrichmentDeps {
+    /// HTTP scraper for domain → `name`/`industry`/`description`.
+    /// Cheap to clone (Arc-shared semaphore + reqwest pool).
+    pub scraper: Scraper,
+    /// 30-day TTL cache keyed by `(tenant_id, domain)`. Holds
+    /// the serialised `Company` so subsequent inbounds from the
+    /// same domain skip the scrape.
+    pub cache: Arc<dyn EnrichmentCache>,
+    /// Persistent `Company` store. The scrape callback upserts
+    /// here + the broker hop's link path reads back to set
+    /// `person.company_id`.
+    pub companies: Arc<dyn CompanyStore>,
+    /// Cache row TTL for corporate scrapes. Defaults to 30 days
+    /// (matches the SDK convention); operator can override
+    /// before passing in.
+    pub corporate_ttl_ms: i64,
+}
+
+impl EnrichmentDeps {
+    /// Default corporate TTL — 30 days in ms. Matches the SDK's
+    /// `enrichment::cache` documentation.
+    pub const DEFAULT_CORPORATE_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+    pub fn new(
+        scraper: Scraper,
+        cache: Arc<dyn EnrichmentCache>,
+        companies: Arc<dyn CompanyStore>,
+    ) -> Self {
+        Self {
+            scraper,
+            cache,
+            companies,
+            corporate_ttl_ms: Self::DEFAULT_CORPORATE_TTL_MS,
+        }
+    }
+}
+
 /// Shared dependencies the dispatch closure + broker handler
 /// need at runtime. Cloned per-call (each field is `Arc`-cheap).
 #[derive(Clone)]
@@ -128,6 +173,20 @@ pub struct PluginDeps {
     /// `None` ⇒ producers skip the recorder silently
     /// (tests + minimal setups).
     pub audit: Option<Arc<crate::audit::AuditLog>>,
+    /// Phase 82.15.bx+ — auto-company-enrichment via the
+    /// `DomainScraper` + `EnrichmentCache` + `CompanyStore`
+    /// triplet. `None` keeps today's behaviour (placeholder
+    /// `person.company_id = None` for every inbound regardless
+    /// of domain kind). Production deployments wire this in
+    /// `main.rs`; tests opt out.
+    pub enrichment: Option<EnrichmentDeps>,
+    /// Tenant-customizable spam / promo classifier. When set,
+    /// every inbound runs through the rule-aware classifier
+    /// before the lead pipeline; `Promo` verdicts drop the
+    /// message (no lead, no thread bump) and emit an audit
+    /// entry. `None` disables filtering — useful in tests +
+    /// minimal setups where the operator hasn't enabled it.
+    pub spam_filter: Option<crate::spam_filter::RulesCache>,
 }
 
 impl PluginDeps {
@@ -145,6 +204,8 @@ impl PluginDeps {
             templates: None,
             dedup: None,
             audit: None,
+            enrichment: None,
+            spam_filter: None,
         }
     }
 
@@ -188,6 +249,29 @@ impl PluginDeps {
     /// timeline.
     pub fn with_audit(mut self, log: Arc<crate::audit::AuditLog>) -> Self {
         self.audit = Some(log);
+        self
+    }
+
+    /// Builder-style wiring for the auto-enrichment triplet
+    /// (scraper + cache + companies). When set, every inbound
+    /// from a corporate domain triggers a cache lookup and (on
+    /// miss) a detached scrape task that upserts a `Company`
+    /// row + caches the result. The broker hop links
+    /// `person.company_id` synchronously when the cache hit is
+    /// available; on miss, the link is deferred until the next
+    /// inbound from the same domain (operator visibility via
+    /// firehose update is a follow-up).
+    pub fn with_enrichment(mut self, deps: EnrichmentDeps) -> Self {
+        self.enrichment = Some(deps);
+        self
+    }
+
+    /// Builder-style wiring for the spam filter cache. The same
+    /// `RulesCache` is captured by the broker hop (read path)
+    /// + the admin endpoints (write + invalidate path) so a PUT
+    /// /admin/spam-filter takes effect on the very next inbound.
+    pub fn with_spam_filter(mut self, cache: crate::spam_filter::RulesCache) -> Self {
+        self.spam_filter = Some(cache);
         self
     }
 }

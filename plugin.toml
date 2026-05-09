@@ -1,0 +1,99 @@
+# nexo-rs-extension-marketing — v2 manifest (Phase 81.13).
+#
+# Marketing runs as a daemon-spawned plugin-child via the plugin
+# registry's `subprocess.rs` host. The stdio pipe gives marketing
+# access to the daemon's broker (so `plugin.inbound.email.>`
+# events flow through), and the HTTP server keeps the
+# agent-creator microapp's `/api/marketing/*` proxy reachable on
+# loopback.
+
+manifest_version = 2
+
+[plugin]
+id              = "marketing"
+version         = "0.27.0"
+name            = "Marketing CRM"
+description     = "Email marketing CRM plugin for Nexo agents — multi-tenant lead state, identity resolution, AI drafts, routing rules."
+min_nexo_version = ">=0.0.0"
+
+# Phase 81.29 — tool allowlist for the host's handshake. The
+# subprocess advertises these in its `initialize` reply via
+# `PluginAdapter::declare_tools(marketing_tool_defs())`; the
+# daemon's subprocess host enforces that EVERY advertised name
+# appears in this list (defense against an out-of-tree binary
+# registering tools the operator did not authorize).
+[plugin.extends]
+tools = [
+    "marketing_lead_profile",
+    "marketing_lead_route",
+    "marketing_lead_schedule_followup",
+    "marketing_lead_mark_qualified",
+    "marketing_lead_detect_meeting_intent",
+    "marketing_lead_followup_sweep",
+]
+
+[plugin.capabilities]
+# Phase 82.15.bx — broker subscribe / publish allowlist.
+# Marketing is a CRM-style consumer, NOT a channel-adapter
+# plugin. The daemon's auto-derived `plugin.outbound.<kind>`
+# subscriptions don't fit; we declare the real surface here.
+
+[plugin.capabilities.broker]
+subscribe = [
+    # M15 inbound pipeline — email plugin publishes here when
+    # a new email lands. Marketing's `handle_inbound_event`
+    # consumes it, runs identity resolver + scoring + routing,
+    # persists the lead row, fires the AgentDraftGenerator.
+    "plugin.inbound.email.>",
+    # M15.39 — operator notification forwarder. Marketing
+    # publishes events here itself; the same process re-consumes
+    # them via topic-prefix dispatch to route to WhatsApp /
+    # email outbound.
+    "agent.email.notification.>",
+    # M15.23.e — duplicate-person matcher needs WhatsApp
+    # inbound JIDs to upsert `PersonPhone` rows. We only read
+    # the `from` / `chat` headers; the body is the agent
+    # runtime's concern.
+    "plugin.inbound.whatsapp.>",
+]
+publish = [
+    # M15.21 slice 2 — approved drafts publish to the email
+    # plugin's outbound topic. Email plugin's broker
+    # subscriber picks them up and runs the SMTP send.
+    "plugin.outbound.email.>",
+    # Notification forwarder publishes here from inside
+    # marketing; allowlisted so the host doesn't reject.
+    "agent.email.notification.>",
+]
+
+# Loopback admin API consumed by the agent-creator microapp's
+# `/api/marketing/*` proxy. Bearer auth via the env-stamped
+# `MARKETING_ADMIN_TOKEN`; the microapp stamps `X-Tenant-Id` from
+# its own auth context so the plugin never trusts client-supplied
+# tenant ids.
+[plugin.capabilities.http_server]
+port        = 18766
+bind        = "127.0.0.1"
+token_env   = "MARKETING_ADMIN_TOKEN"
+health_path = "/healthz"
+# Allowlisted env keys forwarded verbatim to the spawned binary
+# (the plugin host inherits parent env by default; this list is
+# documentation + parity with the extensions framework path).
+extra_env_passthrough = [
+    "MARKETING_TENANT_ID",
+    "MARKETING_TRACKING_SECRET",
+    "MARKETING_TRACKING_BASE_URL",
+]
+
+[plugin.entrypoint]
+# `./nexo-marketing` is rewritten to an absolute path by the
+# dev-daemon installer (subprocess.rs has no manifest-dir
+# resolution today). Production installers should write the
+# absolute path directly.
+command = "./nexo-marketing"
+
+[plugin.meta]
+author     = "Cristian García"
+license    = "MIT OR Apache-2.0"
+homepage   = "https://github.com/lordmacu/nexo-rs-extension-marketing"
+repository = "https://github.com/lordmacu/nexo-rs-extension-marketing"

@@ -1,5 +1,11 @@
 //! Operator notification publisher (M15.38).
 //!
+//! **F29 sweep:** marketing-specific by design. Publishes
+//! CRM-shaped `EmailNotification` frames keyed off
+//! `Seller::notification_settings`. The pub/sub primitive
+//! sits on the framework's broker; this module is the
+//! sales-pipeline consumer.
+//!
 //! Marketing publishes typed [`EmailNotification`] frames to
 //! `agent.email.notification.<agent_id>` whenever a lead-
 //! lifecycle event matches the bound seller's per-event
@@ -511,6 +517,7 @@ mod tests {
             model_override: None,
             notification_settings: settings,
             smtp_credential: None,
+            draft_template: None,
         }
     }
 
@@ -531,6 +538,7 @@ mod tests {
             next_check_at_ms: None,
             followup_attempts: 0,
             why_routed: Vec::new(),
+            operator_notes: None,
         }
     }
 

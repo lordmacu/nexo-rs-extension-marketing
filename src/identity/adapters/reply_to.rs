@@ -3,6 +3,12 @@
 //! `In-Reply-To:` originating address) at a corporate domain,
 //! that's almost always the operator using a personal forward
 //! that ultimately lands in the corporate mailbox. Free; deterministic.
+//!
+//! **F29 sweep:** marketing-specific impl of the SDK's
+//! `EnrichmentSource`. Header parsing logic could lift if a
+//! second consumer needs Reply-To extraction outside the CRM
+//! envelope shape; today the chain runner from the SDK is the
+//! generic seam.
 
 use async_trait::async_trait;
 

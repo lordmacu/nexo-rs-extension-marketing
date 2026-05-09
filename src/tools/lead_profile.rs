@@ -1,5 +1,8 @@
 //! `marketing_lead_profile` tool handler.
 //!
+//! **F29 sweep:** marketing-specific by design. Agent-callable
+//! tool that drives the (lifted) identity resolver chain.
+//!
 //! Takes (`tenant_id`, `from_email`, `subject`, `body_excerpt`)
 //! and returns a `LeadProfileResponse` with the resolved
 //! person + company + enrichment status. Hot path: cross-thread

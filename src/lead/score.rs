@@ -1,5 +1,13 @@
 //! Heuristic lead scorer (M15.23.f v1).
 //!
+//! **F29 sweep:** marketing-specific by design. The signal mix
+//! (`IntentClass`, `SentimentBand`, `DomainKind`, response
+//! latency) is sales-pipeline shaped. Generic `Score` +
+//! `ScoreReason` types already lifted in
+//! `nexo-microapp-sdk::scoring` (HeuristicScorer trait); this
+//! module is the CRM-specific consumer that picks the
+//! coefficients.
+//!
 //! Composes signals into a 0..=100 score with an explanation
 //! trace ("+15 corporate domain, +10 replied within 1h").
 //! LLM-backed scoring lives in M18 (intelligence module);

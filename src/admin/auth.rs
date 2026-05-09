@@ -1,5 +1,12 @@
 //! Bearer + `X-Tenant-Id` middleware.
 //!
+//! **F29 sweep:** generic-shape but single-consumer. The
+//! constant-time bearer compare + tenant header parse pattern
+//! is identical to `nexo-microapp-http`'s middleware; the
+//! marketing-specific bit is the `lookup_store(&tenant_id)`
+//! gate. Lift candidate when a second sibling extension wants
+//! the same shape — today the tenant-lookup callback differs.
+//!
 //! Two checks per request:
 //!   1. `Authorization: Bearer <MARKETING_ADMIN_TOKEN>` must
 //!      match. Constant-time compare so a probing caller

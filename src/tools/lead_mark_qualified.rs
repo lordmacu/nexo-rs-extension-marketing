@@ -4,6 +4,9 @@
 //! step forward). Call-to-`Lost` lives in a separate tool to
 //! keep the audit trail clean.
 //!
+//! **F29 sweep:** marketing-specific by design. CRM state
+//! machine consumer.
+//!
 //! M15.41 — when a `BrokerSender` + `SellerLookup` are
 //! available (Phase 81.17.c.ctx tool dispatch), publishes a
 //! `LeadTransitioned` notification post-success. Fire-and-

@@ -1,5 +1,13 @@
 //! Lead state machine — pure validation logic, no IO.
 //!
+//! **F29 sweep:** marketing-specific by design. The transition
+//! table is hard-coded against `LeadState` (cold / engaged /
+//! meeting_scheduled / qualified / lost) — sales-pipeline
+//! semantics, not generalisable. A generic `StateMachine<S>`
+//! helper would only earn its keep with a second consumer
+//! (lifecycle-tracking microapp, ticket workflow, …); today
+//! the per-CRM transition rules + typed errors win.
+//!
 //! ```text
 //!         cliente_writes
 //! cold ─────────────────────────► engaged

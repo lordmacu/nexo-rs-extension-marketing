@@ -1,5 +1,11 @@
 //! Public tracking ingest routes (M15.23.a.3).
 //!
+//! **F29 sweep:** marketing-specific by design. Pixel + click
+//! redirect signing + verification primitives lifted to
+//! `nexo-microapp-sdk::tracking`; this module is the
+//! axum-handler glue that resolves the tenant from the signed
+//! token and persists hits.
+//!
 //! Two GET handlers, both **un-authenticated** — they're hit by
 //! recipients' email clients (pixel) + browsers (click) so the
 //! bearer-auth middleware that guards every other admin route

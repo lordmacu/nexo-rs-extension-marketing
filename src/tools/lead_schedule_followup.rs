@@ -1,5 +1,8 @@
 //! `marketing_lead_schedule_followup` — set / clear next
 //! check-in for a lead's followup loop.
+//!
+//! **F29 sweep:** marketing-specific by design. Wraps
+//! `LeadStore::set_next_check`.
 
 use std::sync::Arc;
 

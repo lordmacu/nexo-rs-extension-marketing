@@ -1,5 +1,11 @@
 //! Broker subscriber for `plugin.inbound.email.*`.
 //!
+//! **F29 sweep:** marketing-specific by design. Drives the
+//! lead create/update pipeline (resolver → router →
+//! notification publish) on every inbound. Each callee is
+//! either lifted (resolver / router / scoring / guardrails)
+//! or domain (LeadStore + audit + firehose).
+//!
 //! Registered via `PluginAdapter::on_broker_event`. The
 //! daemon routes every event whose topic matches one of the
 //! manifest's `[plugin.subscriptions].broker_topics` patterns
@@ -28,12 +34,14 @@
 //! pipeline is real end-to-end up to lead creation.
 
 use chrono::Utc;
-use nexo_microapp_sdk::enrichment::{EnrichmentInput, FallbackChain, FallbackOutcome};
+use nexo_microapp_sdk::enrichment::{
+    DomainKind, EnrichmentInput, FallbackChain, FallbackOutcome,
+};
 use nexo_microapp_sdk::identity::{Person, PersonEmailStore, PersonStore};
 use nexo_microapp_sdk::plugin::BrokerSender;
 use nexo_tool_meta::marketing::{
-    EnrichmentResult, EnrichmentStatus, LeadId, PersonId, PersonInferred, TenantIdRef,
-    SellerId,
+    Company, CompanyId, EnrichmentResult, EnrichmentStatus, LeadId, PersonId,
+    PersonInferred, SellerId, TenantIdRef,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -48,7 +56,7 @@ use crate::notification::{
     maybe_notify_lead_created, maybe_notify_lead_replied, NotificationOutcome,
     SellerLookup,
 };
-use crate::plugin::IdentityDeps;
+use crate::plugin::{EnrichmentDeps, IdentityDeps};
 use crate::tenant::TenantId;
 
 /// Wire-shape mirror of `nexo_plugin_email::events::InboundEvent`,
@@ -90,6 +98,12 @@ pub enum HandledOutcome {
         thread_id: String,
         resolver_source: String,
     },
+    /// Spam / promo classifier (`spam_filter::classify_with_rules`)
+    /// flagged this inbound as advertising / mass-mail. No lead
+    /// created, no thread bump. The reason is the
+    /// `BlockReason::as_str()` label so the operator's audit log
+    /// surfaces a stable identifier.
+    PromoFiltered { reason: &'static str },
 }
 
 /// Deterministic person id from a lowercased email — same
@@ -363,11 +377,221 @@ async fn persist_person(
     }
 }
 
+/// Phase 82.15.bx+ — auto-company-enrichment hook. Runs between
+/// `resolve_person` and `persist_person` on every inbound when
+/// the manifest has `EnrichmentDeps` wired.
+///
+/// Behaviour:
+/// - `domain_kind != Corporate` → no-op, person stays unlinked.
+/// - Cache hit (TTL still valid) → look up the persisted
+///   `Company` via `find_by_domain` and link `person.company_id`
+///   synchronously. Fast path: zero network calls.
+/// - Cache miss → spawn a detached task that scrapes the domain,
+///   upserts the `Company` row, and writes the cache entry. The
+///   current inbound's lead is created with `company_id = None`;
+///   the next inbound from the same domain hits the cache and
+///   links instantly. Operator-visible refresh on first scrape
+///   completion is a follow-up (firehose `EnrichmentReady`).
+///
+/// Failures are logged at `warn` and never block the lead
+/// creation pipeline — enrichment is enrichment, not gate.
+async fn maybe_link_company_via_enrichment(
+    tenant_id: &TenantId,
+    domain_kind: DomainKind,
+    from_email: &str,
+    person: &mut Person,
+    enrichment: &EnrichmentDeps,
+) {
+    if !matches!(domain_kind, DomainKind::Corporate) {
+        return;
+    }
+    let Some(domain) = from_email
+        .rsplit_once('@')
+        .map(|(_, d)| d.to_ascii_lowercase())
+    else {
+        return;
+    };
+    if domain.is_empty() {
+        return;
+    }
+
+    let now_ms = Utc::now().timestamp_millis();
+    let tenant_str = tenant_id.as_str();
+
+    // Fast path — cache hit. Persistent `Company` row should
+    // exist already (the scrape callback that populated the
+    // cache also upserted it); look it up + link.
+    match enrichment.cache.get(tenant_str, &domain, now_ms).await {
+        Ok(Some(_entry)) => {
+            match enrichment.companies.find_by_domain(tenant_str, &domain).await {
+                Ok(Some(c)) => {
+                    person.company_id = Some(c.id);
+                    return;
+                }
+                Ok(None) => {
+                    // Cache says fresh but no row — operator wiped
+                    // the company table without clearing cache.
+                    // Force a re-scrape by invalidating + falling
+                    // through to the spawn path.
+                    let _ = enrichment.cache.invalidate(tenant_str, &domain).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "plugin.marketing.broker",
+                        error = %e,
+                        %domain,
+                        "company_store.find_by_domain failed; deferring link"
+                    );
+                    return;
+                }
+            }
+        }
+        Ok(None) => {
+            // miss / expired — fall through to spawn the scrape.
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "plugin.marketing.broker",
+                error = %e,
+                %domain,
+                "enrichment_cache.get failed; skipping auto-enrichment"
+            );
+            return;
+        }
+    }
+
+    // Cache miss → race the scrape against a 4s budget. Inside
+    // budget: link `person.company_id` synchronously (best UX:
+    // first email from the domain shows the company in the lead
+    // drawer immediately). Over budget: the spawned task keeps
+    // running so the cache + Company row land for the NEXT
+    // inbound, but this lead stays unlinked.
+    let scraper = enrichment.scraper.clone();
+    let companies = enrichment.companies.clone();
+    let cache = enrichment.cache.clone();
+    let ttl_ms = enrichment.corporate_ttl_ms;
+    let tenant = tenant_id.as_str().to_string();
+    let domain_owned = domain.clone();
+
+    // Detached scrape→upsert→cache sequence. Returns the upserted
+    // Company so the racer below can link `person.company_id`
+    // when the deadline still holds.
+    let scrape_task = async move {
+        let scraped = match scraper.scrape_domain(&domain_owned).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::info!(
+                    target: "plugin.marketing.broker",
+                    error = %e,
+                    domain = %domain_owned,
+                    "scraper failed; caching empty record so we don't retry on every inbound"
+                );
+                // Cache an empty entry so a 30-day window of
+                // inbounds from this domain doesn't hammer a
+                // dead site. Operator can `invalidate` to retry.
+                let payload = serde_json::json!({"failed": true}).to_string();
+                let _ = cache
+                    .put(
+                        &tenant,
+                        &domain_owned,
+                        &payload,
+                        ttl_ms,
+                        None,
+                        Utc::now().timestamp_millis(),
+                    )
+                    .await;
+                return None;
+            }
+        };
+        let company = Company {
+            id: CompanyId(format!("co-{}", Uuid::new_v4())),
+            tenant_id: TenantIdRef(tenant.clone()),
+            domain: domain_owned.clone(),
+            name: scraped.name.clone().unwrap_or_else(|| domain_owned.clone()),
+            industry: scraped.industry.clone(),
+            size_band: None,
+            enriched_at_ms: Some(Utc::now().timestamp_millis()),
+            is_personal_domain: false,
+        };
+        let upserted = match companies.upsert(&tenant, &company).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    target: "plugin.marketing.broker",
+                    error = %e,
+                    domain = %domain_owned,
+                    "company_store.upsert failed after scrape"
+                );
+                return None;
+            }
+        };
+        if let Ok(payload) = serde_json::to_string(&upserted) {
+            if let Err(e) = cache
+                .put(
+                    &tenant,
+                    &domain_owned,
+                    &payload,
+                    ttl_ms,
+                    scraped.etag,
+                    Utc::now().timestamp_millis(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    target: "plugin.marketing.broker",
+                    error = %e,
+                    domain = %domain_owned,
+                    "enrichment_cache.put failed; next inbound will re-scrape"
+                );
+            }
+        }
+        Some(upserted)
+    };
+
+    // 4s — generous enough for responsive corporate sites
+    // (median ~600ms with /about redirect), tight enough that a
+    // slow / down domain doesn't stall lead-create. tokio::spawn
+    // so the task survives a timeout: the caller drops the
+    // JoinHandle but the spawned future keeps running with its
+    // owned scraper / cache / companies clones.
+    const FIRST_SCRAPE_BUDGET: std::time::Duration =
+        std::time::Duration::from_secs(4);
+    let domain_for_log = domain.clone();
+    let handle = tokio::spawn(scrape_task);
+    match tokio::time::timeout(FIRST_SCRAPE_BUDGET, handle).await {
+        Ok(Ok(Some(c))) => {
+            person.company_id = Some(c.id);
+        }
+        Ok(Ok(None)) => {
+            // Scrape failed (already logged). Person stays
+            // unlinked; cache holds an empty record so this
+            // domain doesn't re-scrape on every inbound.
+        }
+        Ok(Err(join_err)) => {
+            tracing::warn!(
+                target: "plugin.marketing.broker",
+                error = %join_err,
+                domain = %domain_for_log,
+                "scrape task panicked"
+            );
+        }
+        Err(_elapsed) => {
+            tracing::debug!(
+                target: "plugin.marketing.broker",
+                domain = %domain_for_log,
+                budget_ms = FIRST_SCRAPE_BUDGET.as_millis() as u64,
+                "scrape exceeded budget; person stays unlinked, next inbound will hit cache"
+            );
+        }
+    }
+}
+
 /// Handle one inbound-email broker event. The full pipeline:
 /// decode → resolve → route → upsert person → create / bump
 /// lead. Each stage logs at appropriate level + the outcome
 /// surfaces structured for unit tests + future firehose
 /// publishing.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_inbound_event(
     topic: &str,
     payload: serde_json::Value,
@@ -382,6 +606,8 @@ pub async fn handle_inbound_event(
     dedup: Option<&crate::notification_dedup::DedupCache>,
     audit: Option<&crate::audit::AuditLog>,
     guardrails: Option<&crate::guardrails::GuardrailHandle>,
+    enrichment: Option<&EnrichmentDeps>,
+    spam_filter: Option<&crate::spam_filter::RulesCache>,
 ) -> HandledOutcome {
     if !topic.starts_with("plugin.inbound.email.") && topic != "plugin.inbound.email" {
         return HandledOutcome::Skipped;
@@ -552,10 +778,80 @@ pub async fn handle_inbound_event(
         };
     }
 
+    // ─── Spam / promo classifier (cold-lead path only) ────────
+    // Existing-thread inbounds bypass the classifier above on
+    // purpose: once an operator is engaged with a sender we
+    // trust replies even when the heuristic would flag them.
+    // Block rules the operator configures still apply because
+    // the same sender / domain will be caught here on the next
+    // *cold* attempt.
+    if let Some(cache) = spam_filter {
+        let now_ms = Utc::now().timestamp_millis();
+        let resolved = cache.get_or_load(tenant_id.as_str(), now_ms).await;
+        let classification = crate::spam_filter::classify_with_rules(
+            &wire.raw_bytes,
+            &parsed.subject,
+            &parsed.from_email,
+            &resolved,
+        );
+        if let crate::spam_filter::classifier::PromoVerdict::Promo(reason) =
+            classification.verdict
+        {
+            tracing::info!(
+                target: "plugin.marketing.broker",
+                from = %parsed.from_email,
+                subject = %parsed.subject,
+                reason = reason.as_str(),
+                keyword_hits = classification.signals.keyword_hits,
+                image_count = classification.signals.image_count,
+                visible_text_chars = classification.signals.visible_text_chars,
+                "spam_filter dropped inbound",
+            );
+            if let Some(audit_log) = audit {
+                let event = crate::audit::AuditEvent::PromoFiltered {
+                    tenant_id: tenant_id.as_str().to_string(),
+                    from_email: parsed.from_email.clone(),
+                    subject: parsed.subject.clone(),
+                    reason: reason.as_str().to_string(),
+                    matched_keywords: classification.signals.matched_keywords.clone(),
+                    image_count: classification.signals.image_count,
+                    visible_text_chars: classification.signals.visible_text_chars,
+                    at_ms: now_ms as u64,
+                };
+                if let Err(e) = audit_log.record(event).await {
+                    tracing::warn!(
+                        target: "plugin.marketing.broker",
+                        error = %e,
+                        "audit record promo_filtered failed",
+                    );
+                }
+            }
+            return HandledOutcome::PromoFiltered {
+                reason: reason.as_str(),
+            };
+        }
+    }
+
     // ─── Resolver pass ────────────────────────────────────────
     let (person_id, resolver_source) = match identity {
         Some(deps) => {
-            let (person, source) = resolve_person(tenant_id, &parsed, &deps.chain).await;
+            let (mut person, source) =
+                resolve_person(tenant_id, &parsed, &deps.chain).await;
+            // Phase 82.15.bx+ — auto-enrich corporate domains
+            // before persisting. Cache hit links synchronously;
+            // miss spawns a detached scrape (next inbound links).
+            // Always runs on the resolved Person (not the
+            // post-upsert PersonId) so we can mutate company_id.
+            if let Some(enr) = enrichment {
+                maybe_link_company_via_enrichment(
+                    tenant_id,
+                    parsed.from_domain_kind,
+                    &parsed.from_email,
+                    &mut person,
+                    enr,
+                )
+                .await;
+            }
             (persist_person(tenant_id, person, deps).await, source)
         }
         None => (
@@ -1013,6 +1309,7 @@ mod tests {
             notification_settings: Some(SellerNotificationSettings::default()),
             smtp_credential: None,
             model_override: None,
+            draft_template: None,
         }
     }
 
@@ -1149,6 +1446,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await;
         assert_eq!(out, HandledOutcome::Skipped);
@@ -1166,6 +1465,8 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
+            None,
             None,
             None,
             None,
@@ -1196,6 +1497,8 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
+            None,
             None,
             None,
             None,
@@ -1270,6 +1573,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await;
         assert!(
@@ -1309,6 +1614,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await;
         let HandledOutcome::LeadCreated {
@@ -1324,6 +1631,8 @@ mod tests {
             &store,
             Some(&router),
             Some(&identity),
+            None,
+            None,
             None,
             None,
             None,
@@ -1370,6 +1679,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await;
         assert!(
@@ -1402,6 +1713,8 @@ mod tests {
             Some(&router),
             Some(&identity),
             Some(&bus),
+            None,
+            None,
             None,
             None,
             None,
@@ -1458,6 +1771,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await;
         let _consume_created = rx.recv().await;
@@ -1470,6 +1785,8 @@ mod tests {
             Some(&router),
             Some(&identity),
             Some(&bus),
+            None,
+            None,
             None,
             None,
             None,

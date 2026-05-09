@@ -155,6 +155,33 @@ pub enum AuditEvent {
         /// Wall-clock at_ms.
         at_ms: u64,
     },
+    /// M15.21.followup-override — operator bypassed the
+    /// followup cadence for one lead (skip the next iteration
+    /// or postpone to a specific timestamp). Recorded so the
+    /// compliance view can show every manual override
+    /// adjacent to the lead's transition + routing rows.
+    FollowupOverridden {
+        /// Tenant scope.
+        tenant_id: String,
+        /// Lead the override targeted.
+        lead_id: String,
+        /// `"skip"` (cancels the pending iteration —
+        /// `next_check_at_ms` becomes NULL until the next
+        /// inbound bumps it back) or `"postpone"` (moves
+        /// `next_check_at_ms` forward to a specific operator-
+        /// chosen timestamp without incrementing
+        /// `followup_attempts`).
+        action: String,
+        /// Wall-clock ms the followup is bumped to. Only
+        /// populated when `action = "postpone"`.
+        postpone_until_ms: Option<i64>,
+        /// Operator-supplied note (free-form). Defaults to
+        /// `"operator override"` when omitted from the request
+        /// body.
+        reason: String,
+        /// Wall-clock at_ms.
+        at_ms: u64,
+    },
     /// Operator-targeted notification published to the
     /// broker (LeadCreated / LeadReplied / LeadTransitioned /
     /// MeetingIntent).
@@ -174,6 +201,35 @@ pub enum AuditEvent {
         /// Wall-clock at_ms.
         at_ms: u64,
     },
+    /// Spam / promo classifier dropped an inbound. Recorded
+    /// pre-resolver so no lead row exists yet — the operator's
+    /// compliance view filters by `kind = promo_filtered` to
+    /// audit which inbounds were silently swallowed and adjust
+    /// allow-rules / strictness if needed.
+    PromoFiltered {
+        /// Tenant scope.
+        tenant_id: String,
+        /// Sender email (lowercase).
+        from_email: String,
+        /// Subject as parsed by `decode_inbound_email`.
+        subject: String,
+        /// Stable label from `BlockReason::as_str()`
+        /// (`image_only` / `image_heavy_low_text` /
+        /// `noreply_with_keyword` / `multi_weak_signals` /
+        /// `domain_blocklist` / `sender_blocklist`).
+        reason: String,
+        /// Up to 8 default-or-tenant keywords that fired —
+        /// useful for the operator dialog "why was this
+        /// dropped?".
+        matched_keywords: Vec<String>,
+        /// Number of `<img>` tags counted in the body.
+        image_count: u32,
+        /// Visible text length after stripping HTML +
+        /// collapsing whitespace.
+        visible_text_chars: u32,
+        /// Wall-clock at_ms.
+        at_ms: u64,
+    },
 }
 
 impl EventMetadata for AuditEvent {
@@ -181,9 +237,11 @@ impl EventMetadata for AuditEvent {
         match self {
             Self::RoutingDecided { .. } => "routing_decided",
             Self::LeadTransitioned { .. } => "lead_transitioned",
+            Self::FollowupOverridden { .. } => "followup_overridden",
             Self::NotificationPublished { .. } => "notification_published",
             Self::TopicGuardrailFired { .. } => "topic_guardrail_fired",
             Self::DuplicatePersonDetected { .. } => "duplicate_person_detected",
+            Self::PromoFiltered { .. } => "promo_filtered",
         }
     }
 
@@ -196,9 +254,14 @@ impl EventMetadata for AuditEvent {
         match self {
             Self::RoutingDecided { lead_id, .. } => lead_id.as_deref().unwrap_or(""),
             Self::LeadTransitioned { lead_id, .. } => lead_id.as_str(),
+            Self::FollowupOverridden { lead_id, .. } => lead_id.as_str(),
             Self::NotificationPublished { lead_id, .. } => lead_id.as_str(),
             Self::TopicGuardrailFired { lead_id, .. } => lead_id.as_deref().unwrap_or(""),
             Self::DuplicatePersonDetected { lead_id, .. } => lead_id.as_str(),
+            // Filtered inbounds never created a lead — index
+            // by sender email so the operator can pull "every
+            // promo we dropped from this sender".
+            Self::PromoFiltered { from_email, .. } => from_email.as_str(),
         }
     }
 
@@ -206,9 +269,11 @@ impl EventMetadata for AuditEvent {
         Some(match self {
             Self::RoutingDecided { tenant_id, .. } => tenant_id.as_str(),
             Self::LeadTransitioned { tenant_id, .. } => tenant_id.as_str(),
+            Self::FollowupOverridden { tenant_id, .. } => tenant_id.as_str(),
             Self::NotificationPublished { tenant_id, .. } => tenant_id.as_str(),
             Self::TopicGuardrailFired { tenant_id, .. } => tenant_id.as_str(),
             Self::DuplicatePersonDetected { tenant_id, .. } => tenant_id.as_str(),
+            Self::PromoFiltered { tenant_id, .. } => tenant_id.as_str(),
         })
     }
 
@@ -216,9 +281,11 @@ impl EventMetadata for AuditEvent {
         match self {
             Self::RoutingDecided { at_ms, .. } => *at_ms,
             Self::LeadTransitioned { at_ms, .. } => *at_ms,
+            Self::FollowupOverridden { at_ms, .. } => *at_ms,
             Self::NotificationPublished { at_ms, .. } => *at_ms,
             Self::TopicGuardrailFired { at_ms, .. } => *at_ms,
             Self::DuplicatePersonDetected { at_ms, .. } => *at_ms,
+            Self::PromoFiltered { at_ms, .. } => *at_ms,
         }
     }
 }

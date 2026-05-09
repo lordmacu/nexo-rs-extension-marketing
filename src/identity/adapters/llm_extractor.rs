@@ -5,6 +5,13 @@
 //! `(tenant_id, message_id)` upstream so re-runs don't double-
 //! bill.
 //!
+//! **F29 sweep:** marketing-specific impl of the SDK's
+//! `EnrichmentSource`. JSON-schema-coerced LLM extraction is
+//! a tempting lift candidate but the CRM JSON schema
+//! (company / role / intent) is domain — generic version
+//! would need to take the schema as input, which is the
+//! `nexo-microapp-sdk::scoring::HeuristicScorer` pattern.
+//!
 //! The SDK doesn't ship an LLM client (provider-agnostic by
 //! convention — every microapp wires its own). We define the
 //! `LlmExtractorBackend` trait + a `NoopLlmExtractor` for

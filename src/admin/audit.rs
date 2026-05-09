@@ -1,6 +1,11 @@
 //! `GET /audit` — protected query endpoint over the AI
 //! decision audit log (M15.23.c).
 //!
+//! **F29 sweep:** marketing-specific by design. Reads the CRM
+//! `AuditEvent` rows; query params (`lead_id`, `kind`) are
+//! domain. Generic event-store query already in the SDK's
+//! `events` feature.
+//!
 //! Bearer auth + `X-Tenant-Id` already applied by the
 //! middleware. The handler reads four optional query params:
 //!
@@ -54,7 +59,13 @@ pub async fn handler(
     let Some(audit) = state.audit.as_ref() else {
         return (
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": { "code": "audit_disabled" } })),
+            Json(json!({
+                "ok": false,
+                "error": {
+                    "code": "audit_disabled",
+                    "message": "audit log is not configured for this tenant",
+                },
+            })),
         )
             .into_response();
     };
@@ -68,23 +79,37 @@ pub async fn handler(
         limit,
     };
 
+    // Wrap with the canonical `{ok, result}` envelope every other
+    // marketing endpoint uses. The frontend's shared `call()`
+    // helper unwraps `result` — without the envelope it threw
+    // "HTTP 200" for what is actually a successful empty list.
     match audit.list(&filter).await {
-        Ok(rows) => Json(json!({
-            "events": rows,
-            "count": rows.len(),
-            "filter": {
-                "lead_id": q.lead_id,
-                "kind": q.kind,
-                "since_ms": q.since_ms,
-                "limit": limit,
-            },
-        }))
-        .into_response(),
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "result": {
+                    "events": rows,
+                    "count": rows.len(),
+                    "filter": {
+                        "lead_id": q.lead_id,
+                        "kind": q.kind,
+                        "since_ms": q.since_ms,
+                        "limit": limit,
+                    },
+                },
+            })),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(
-                json!({ "error": { "code": "audit_store", "detail": e.to_string() } }),
-            ),
+            Json(json!({
+                "ok": false,
+                "error": {
+                    "code": "audit_store",
+                    "message": e.to_string(),
+                },
+            })),
         )
             .into_response(),
     }
@@ -180,8 +205,10 @@ mod tests {
         let body = to_bytes(resp.into_body(), 8 * 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         // Tenant scoping kicks in — globex row never leaks.
-        assert_eq!(v["count"], 3);
-        let kinds: Vec<&str> = v["events"]
+        // Envelope: `{ok:true, result:{events,count,filter}}`.
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["count"], 3);
+        let kinds: Vec<&str> = v["result"]["events"]
             .as_array()
             .unwrap()
             .iter()
@@ -203,8 +230,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), 8 * 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["count"], 1);
-        assert_eq!(v["events"][0]["kind"], "lead_transitioned");
+        assert_eq!(v["result"]["count"], 1);
+        assert_eq!(v["result"]["events"][0]["kind"], "lead_transitioned");
     }
 
     #[tokio::test]
@@ -217,7 +244,7 @@ mod tests {
         let resp = router(state).oneshot(req).await.unwrap();
         let body = to_bytes(resp.into_body(), 8 * 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["count"], 3);
+        assert_eq!(v["result"]["count"], 3);
     }
 
     #[tokio::test]
@@ -232,7 +259,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         // Two rows ≥ 20 (transitioned + notification) — globex
         // at_ms=40 doesn't leak via tenant scoping.
-        assert_eq!(v["count"], 2);
+        assert_eq!(v["result"]["count"], 2);
     }
 
     #[tokio::test]

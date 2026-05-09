@@ -1,6 +1,6 @@
 [package]
 name        = "nexo-rs-extension-marketing"
-version     = "0.26.0"
+version     = "0.27.0"
 edition     = "2021"
 rust-version = "1.80"
 license     = "MIT OR Apache-2.0"
@@ -88,9 +88,13 @@ tower-http = { version = "0.5", features = ["cors", "trace"] }
 # Framework deps — path during dev, crates.io after publish.
 # The extension is sibling to nexo-rs-plugin-browser; same
 # pattern there points at ../proyecto for local hacking.
-nexo-microapp-sdk          = { path = "../proyecto/crates/microapp-sdk", features = ["identity", "routing", "enrichment", "plugin", "tracking-store", "scoring", "events", "guardrails", "templating", "templating-handlebars", "email-threading", "dedup"] }
+nexo-microapp-sdk          = { path = "../proyecto/crates/microapp-sdk", features = ["identity", "routing", "enrichment", "plugin", "tracking-store", "scoring", "events", "guardrails", "templating", "templating-handlebars", "email-threading", "dedup", "admin"] }
 nexo-microapp-http         = { path = "../proyecto/crates/microapp-http" }
 nexo-tool-meta             = { path = "../proyecto/crates/tool-meta" }
+# Phase 82.10.t.x — `AgentDraftGenerator` builds chat messages
+# typed as `nexo_llm::types::ChatMessage` for the SDK's
+# `BrokerSender::complete_llm` call.
+nexo-llm                   = { path = "../proyecto/crates/llm" }
 nexo-compliance-primitives = { path = "../proyecto/crates/compliance-primitives" }
 # SSE handler stream type bound on `futures::Stream`.
 futures = "0.3"

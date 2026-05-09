@@ -1,5 +1,10 @@
 //! M15.24 — `/telemetry` aggregate snapshot.
 //!
+//! **F29 sweep:** marketing-specific by design. Aggregates
+//! CRM counts (leads-by-state, drafts-pending, scraper hits).
+//! Generic Prometheus-counter primitive is the right lift
+//! candidate but lives upstream in `nexo-core`.
+//!
 //! Powers the operator's `/marketing/health` dashboard.
 //! Single GET returns headline counts the operator
 //! glances at:

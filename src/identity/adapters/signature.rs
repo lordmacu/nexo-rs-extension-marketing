@@ -2,6 +2,15 @@
 //! lines of the body, regex-extracts `name | role | company`
 //! shapes common in B2B signatures.
 //!
+//! **F29 sweep:** marketing-specific impl of the SDK's
+//! `EnrichmentSource` trait (already in
+//! `nexo-microapp-sdk::enrichment`). The trait + fallback
+//! chain runner are generic; this concrete impl reads
+//! `EmailEnvelope` shape and emits CRM-shaped
+//! `EnrichmentResult` rows (company / role inference). Lift
+//! when a second microapp wants signature parsing without the
+//! CRM scaffolding.
+//!
 //! Cheap (regex over a few hundred bytes, no IO). Confidence
 //! 0.7-0.95 depending on signal density.
 

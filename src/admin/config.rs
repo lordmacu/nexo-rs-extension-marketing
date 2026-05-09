@@ -1,5 +1,11 @@
 //! `GET /config/*` — read-only YAML config endpoints.
 //!
+//! **F29 sweep:** marketing-specific by design. Each handler
+//! reads CRM-shaped YAML (mailboxes, sellers, rules, followup
+//! profiles, draft template, topic guardrails). Generic
+//! YAML-file-per-tenant pattern could lift but the file
+//! schemas are domain.
+//!
 //! Each handler validates the auth-stamped tenant, resolves
 //! the state root from `AdminState`, and delegates to a
 //! `crate::config::load_*` helper. Missing config file → empty

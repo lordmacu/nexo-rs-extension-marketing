@@ -1,7 +1,21 @@
-//! `/leads` read endpoints.
+//! `/leads` read + mutation endpoints.
+//!
+//! **F29 sweep:** marketing-specific by design. Every endpoint
+//! reaches into CRM-shaped types (`LeadStore`, `LeadId`, drafts,
+//! state transitions, operator notes, followup overrides). The
+//! axum router glue is generic but the SDK's
+//! `nexo-microapp-http` already covers that boilerplate;
+//! these handlers are the lead-shaped surface that builds on
+//! top.
 //!
 //! - `GET /leads` — list. Optional `?state=engaged&limit=50`.
 //! - `GET /leads/:lead_id` — single fetch. 404 when missing.
+//! - `POST /leads/:lead_id/transition` — manual state move.
+//! - `PUT /leads/:lead_id/notes` — operator scratch pad
+//!   (M15.21.notes).
+//! - `POST /leads/:lead_id/followup/override` — skip /
+//!   postpone the followup cadence (M15.21.followup-override).
+//! - draft CRUD endpoints (`/drafts/...`).
 //!
 //! Tenant id comes from the auth middleware via
 //! `Extension<TenantId>` — the URL never carries it.
@@ -26,13 +40,19 @@ const MAX_LIMIT: u32 = 500;
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
     /// `cold | engaged | meeting_scheduled | qualified | lost`.
-    /// Filter out when omitted; the store's count_by_state +
-    /// list_due_for_followup cover the use cases that need a
-    /// state filter today.
+    /// When set, returns `count_by_state` (telemetry headline);
+    /// without it the handler returns the inbox view (`list_all`)
+    /// or — under `?due=1` — the followup-sweep envelope.
     #[serde(default)]
     pub state: Option<String>,
     #[serde(default)]
     pub limit: Option<u32>,
+    /// `true` swaps the default list to `list_due_for_followup`
+    /// (next_check_at_ms <= now). The followup sweep cron uses
+    /// this; the operator dashboard does not. Default `false`
+    /// = inbox view.
+    #[serde(default)]
+    pub due: bool,
 }
 
 pub async fn list_handler(
@@ -72,15 +92,28 @@ pub async fn list_handler(
         }
     }
 
-    // No filter → return the followup-due list (most useful
-    // single-call endpoint for the operator dashboard's
-    // landing view).
+    // Default: inbox view — every lead in the tenant ordered by
+    // `last_activity_ms DESC`. Operator dashboard's landing list.
+    // The followup sweep cron passes `?due=1` to get the
+    // `next_check_at_ms <= now` envelope it needs.
     let now = chrono::Utc::now().timestamp_millis();
-    match store.list_due_for_followup(now, limit).await {
+    if q.due {
+        return match store.list_due_for_followup(now, limit).await {
+            Ok(leads) => ok(json!({
+                "leads": leads,
+                "now_ms": now,
+                "limit": limit,
+                "view": "due",
+            })),
+            Err(e) => marketing_error(e),
+        };
+    }
+    match store.list_all(limit).await {
         Ok(leads) => ok(json!({
             "leads": leads,
             "now_ms": now,
             "limit": limit,
+            "view": "inbox",
         })),
         Err(e) => marketing_error(e),
     }
@@ -842,6 +875,191 @@ pub async fn transition_handler(
     }))
 }
 
+// ── M15.21.followup-override — skip / postpone endpoint ───────
+
+/// `POST /leads/:lead_id/followup/override` body. Tagged-union
+/// shape so the daemon can validate per-action fields without
+/// a permissive sentinel pattern. `action: skip` clears
+/// `next_check_at_ms`; `action: postpone` requires `until_ms`.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum FollowupOverrideBody {
+    /// Cancel the pending followup iteration. The lead stays
+    /// active — a future inbound bumps `next_check_at_ms`
+    /// back. `followup_attempts` is NOT incremented (skip is
+    /// a manual decision, not an exhausted retry).
+    Skip {
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// Move `next_check_at_ms` forward to a specific operator-
+    /// chosen wall-clock timestamp (ms). Validated to be > now
+    /// so a postpone never accidentally re-schedules into the
+    /// past.
+    Postpone {
+        until_ms: i64,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+}
+
+/// `POST /leads/:lead_id/followup/override` — operator bypass
+/// of the followup cadence for one lead. Validates payload,
+/// runs `set_next_check`, records audit, publishes firehose.
+/// Typed errors:
+///  - 400 invalid_body            — missing fields per action
+///  - 400 postpone_in_past        — until_ms <= now
+///  - 404 lead_not_found          — wrong tenant / id
+pub async fn followup_override_handler(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path(lead_id): Path<String>,
+    Json(payload): Json<FollowupOverrideBody>,
+) -> Response {
+    use nexo_tool_meta::marketing::TenantIdRef;
+    let store = match state.lookup_store(&tenant_id) {
+        Some(s) => s,
+        None => return server_error("store_missing", "tenant store not mounted"),
+    };
+    let id = LeadId(lead_id.clone());
+    if matches!(store.get(&id).await, Ok(None)) {
+        return error(
+            StatusCode::NOT_FOUND,
+            "lead_not_found",
+            &format!("no lead with id {lead_id:?} for the active tenant"),
+        );
+    }
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let (next_check_at_ms, action_label, raw_reason) = match payload {
+        FollowupOverrideBody::Skip { reason } => (None, "skip", reason),
+        FollowupOverrideBody::Postpone { until_ms, reason } => {
+            if until_ms <= now_ms {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "postpone_in_past",
+                    &format!(
+                        "until_ms ({until_ms}) must be strictly after now ({now_ms})"
+                    ),
+                );
+            }
+            (Some(until_ms), "postpone", reason)
+        }
+    };
+    // `increment_attempts: false` — skip + postpone are
+    // operator decisions, not exhausted retries. The followup
+    // sweep increments attempts only when IT fires the bump
+    // automatically.
+    let lead = match store.set_next_check(&id, next_check_at_ms, false).await {
+        Ok(l) => l,
+        Err(MarketingError::Sqlite(sqlx::Error::RowNotFound)) => {
+            return error(
+                StatusCode::NOT_FOUND,
+                "lead_not_found",
+                &format!("no lead with id {lead_id:?} for the active tenant"),
+            );
+        }
+        Err(e) => return marketing_error(e),
+    };
+    let reason = raw_reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("operator override")
+        .to_string();
+
+    // ── Audit ──────────────────────────────────────────────
+    if let Some(audit) = state.audit.as_ref() {
+        let event = crate::audit::AuditEvent::FollowupOverridden {
+            tenant_id: tenant_id.as_str().to_string(),
+            lead_id: lead_id.clone(),
+            action: action_label.to_string(),
+            postpone_until_ms: next_check_at_ms,
+            reason: reason.clone(),
+            at_ms: now_ms.max(0) as u64,
+        };
+        if let Err(e) = audit.record(event).await {
+            tracing::warn!(
+                target: "extension.marketing.followup_override",
+                error = %e,
+                "followup override audit record failed (non-fatal)"
+            );
+        }
+    }
+
+    // ── Firehose ───────────────────────────────────────────
+    state.firehose.publish(
+        crate::firehose::LeadFirehoseEvent::FollowupOverridden {
+            tenant_id: TenantIdRef(tenant_id.as_str().to_string()),
+            lead_id: id.clone(),
+            action: action_label.to_string(),
+            next_check_at_ms,
+            reason: reason.clone(),
+            at_ms: now_ms,
+        },
+    );
+
+    ok(json!({
+        "lead": lead,
+        "action": action_label,
+        "next_check_at_ms": next_check_at_ms,
+        "reason": reason,
+    }))
+}
+
+// ── M15.21.notes — operator notes endpoint ─────────────────────
+
+/// `PUT /leads/:lead_id/notes` body. `notes: null` clears the
+/// column to SQL NULL; `notes: ""` persists an empty string
+/// (legal terminal state — round-trips faithfully). The shape
+/// is wire-symmetric to the field on the `Lead` struct so
+/// callers can serialise the response straight back into the
+/// editor without re-shaping.
+#[derive(Debug, Deserialize)]
+pub struct UpdateNotesBody {
+    /// `Some` writes verbatim (empty string allowed); `None`
+    /// (or omitted from JSON) clears the field to SQL NULL.
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+/// `PUT /leads/:lead_id/notes` — replace the lead's free-form
+/// operator notes (markdown). Idempotent: re-sending the same
+/// body is a no-op. Caller MUST hold a tenant scope (the auth
+/// middleware enforces it). 404 when the lead doesn't exist
+/// for this tenant.
+pub async fn update_notes_handler(
+    State(state): State<Arc<AdminState>>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path(lead_id): Path<String>,
+    Json(payload): Json<UpdateNotesBody>,
+) -> Response {
+    let store = match state.lookup_store(&tenant_id) {
+        Some(s) => s,
+        None => return server_error("store_missing", "tenant store not mounted"),
+    };
+    let id = LeadId(lead_id.clone());
+    // Defense-in-depth: surface a clean 404 before reaching
+    // the UPDATE so the caller doesn't get the less-specific
+    // RowNotFound that bubbles up from `update_operator_notes`
+    // when the row is missing.
+    if matches!(store.get(&id).await, Ok(None)) {
+        return error(
+            StatusCode::NOT_FOUND,
+            "lead_not_found",
+            &format!("no lead with id {lead_id:?} for the active tenant"),
+        );
+    }
+    match store.update_operator_notes(&id, payload.notes).await {
+        Ok(lead) => ok(json!({ "lead": lead })),
+        Err(MarketingError::Sqlite(sqlx::Error::RowNotFound)) => error(
+            StatusCode::NOT_FOUND,
+            "lead_not_found",
+            &format!("no lead with id {lead_id:?} for the active tenant"),
+        ),
+        Err(e) => marketing_error(e),
+    }
+}
+
 /// Inverse of `parse_state` — used by the transition
 /// handler's audit + firehose payload.
 fn state_label(s: LeadState) -> &'static str {
@@ -977,22 +1195,31 @@ pub async fn generate_draft_handler(
         }
     };
 
-    // ── Last inbound (best-effort, non-fatal) ───────────────
-    let last_inbound = match store.list_thread(&lead_obj_id).await {
-        Ok(messages) => messages
-            .into_iter()
-            .rev()
-            .find(|m| m.direction == MessageDirection::Inbound),
+    // ── Thread history + last inbound ───────────────────────
+    // We pull the FULL chronological thread (oldest first) so
+    // the LLM-driven generator can build a multi-turn prompt
+    // and reflect the entire conversation in its reply, not
+    // just the latest inbound. `last_inbound` is the convenient
+    // single-message path the legacy Handlebars template still
+    // references; both fields share the same source so they
+    // never disagree.
+    let thread_history = match store.list_thread(&lead_obj_id).await {
+        Ok(messages) => messages,
         Err(e) => {
             tracing::warn!(
                 target: "extension.marketing.draft_generate",
                 error = %e,
                 lead_id = %lead_id,
-                "thread fetch failed during draft generation; proceeding without inbound context"
+                "thread fetch failed during draft generation; proceeding without thread context"
             );
-            None
+            Vec::new()
         }
     };
+    let last_inbound = thread_history
+        .iter()
+        .rev()
+        .find(|m| m.direction == MessageDirection::Inbound)
+        .cloned();
 
     let body_in = payload.map(|Json(b)| b).unwrap_or_default();
 
@@ -1001,6 +1228,7 @@ pub async fn generate_draft_handler(
         lead,
         seller,
         last_inbound,
+        thread_history,
         operator_hint: body_in
             .operator_hint
             .filter(|s| !s.trim().is_empty()),
@@ -1212,7 +1440,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_no_filter_returns_due_envelope() {
+    async fn list_no_filter_returns_inbox_envelope() {
         let state = build_state_with_lead().await;
         let app = router(state);
         let resp = app.oneshot(req("/leads")).await.unwrap();
@@ -1220,6 +1448,25 @@ mod tests {
         let v = body_to_json(resp).await;
         assert!(v["result"]["leads"].is_array());
         assert!(v["result"]["limit"].is_u64());
+        assert_eq!(v["result"]["view"], "inbox");
+        // The seeded lead has `next_check_at_ms = None` — the
+        // pre-fix code would return [] here (only due-for-
+        // followup); inbox view returns it.
+        let leads = v["result"]["leads"].as_array().unwrap();
+        assert_eq!(leads.len(), 1, "inbox view must return cold leads");
+    }
+
+    #[tokio::test]
+    async fn list_due_query_returns_followup_envelope() {
+        let state = build_state_with_lead().await;
+        let app = router(state);
+        let resp = app.oneshot(req("/leads?due=1")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["result"]["view"], "due");
+        // Seeded lead has no `next_check_at_ms` — the followup
+        // sweep view excludes it.
+        assert_eq!(v["result"]["leads"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -1331,6 +1578,7 @@ mod tests {
             model_override: None,
             notification_settings: None,
             smtp_credential: None,
+            draft_template: None,
         }]);
         let gen: Arc<dyn crate::draft::DraftGenerator + Send + Sync> = Arc::new(
             crate::draft::TemplateDraftGenerator::with_default_template(),
@@ -1506,6 +1754,7 @@ mod tests {
             model_override: None,
             notification_settings: None,
             smtp_credential: None,
+            draft_template: None,
         }]);
         let gen: Arc<dyn crate::draft::DraftGenerator + Send + Sync> =
             Arc::new(crate::draft::TemplateDraftGenerator::new(

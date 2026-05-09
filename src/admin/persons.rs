@@ -1,6 +1,11 @@
 //! M15.21.b — Person + enrichment surface for the lead
 //! drawer.
 //!
+//! **F29 sweep:** marketing-specific by design. Reads the
+//! lifted `PersonStore` (SDK `identity` feature) but emits
+//! CRM-shaped JSON (PersonDetail with EnrichmentResult +
+//! Company + tags) for the operator UI.
+//!
 //! Two endpoints:
 //!
 //! - `GET /persons/:person_id` — returns the Person row

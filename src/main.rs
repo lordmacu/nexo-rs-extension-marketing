@@ -46,7 +46,7 @@ use nexo_microapp_sdk::BrokerEvent;
 
 const DEFAULT_BIND: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 18766;
-const MANIFEST: &str = include_str!("../nexo-plugin.toml");
+const MANIFEST: &str = include_str!("../plugin.toml");
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -144,12 +144,55 @@ async fn main() -> anyhow::Result<()> {
     // table created via the SDK's identity migration. WA
     // ingest collapses cross-namespace inbounds into a
     // single Person row when the mapping is populated.
+    // Phase 82.15.bx+ — auto-enrichment cache lives on the
+    // same identity pool: shares one SQLite file, one
+    // migration touchpoint, keeps the per-tenant state dir
+    // tidy. Migrate the table before any reads.
+    let enrichment_pool = identity_pool.clone();
+    nexo_microapp_sdk::enrichment::cache::migrate(&enrichment_pool)
+        .await
+        .context("enrichment_cache migrate")?;
+    let enrichment_cache: Arc<dyn nexo_microapp_sdk::enrichment::EnrichmentCache> =
+        Arc::new(nexo_microapp_sdk::enrichment::cache::SqliteEnrichmentCache::new(
+            enrichment_pool,
+        ));
     let lid_pn_mappings: Arc<dyn nexo_microapp_sdk::identity::LidPnMappingStore> =
         Arc::new(
             nexo_microapp_sdk::identity::SqliteLidPnMappingStore::new(
-                identity_pool,
+                identity_pool.clone(),
             ),
         );
+    // Phase 82.15.bx+ — domain scraper for corporate
+    // auto-enrichment. Default config: 4 concurrent fetches,
+    // 8s timeout, robots-aware. Cheap to clone (Arc semaphore
+    // + reqwest pool) so the broker hop spawns scrape tasks
+    // freely.
+    let scraper = match nexo_marketing::enrichment::Scraper::new(
+        nexo_marketing::enrichment::ScraperConfig::default(),
+    ) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(
+                target: "nexo_marketing",
+                error = %e,
+                "scraper init failed; auto-enrichment disabled"
+            );
+            None
+        }
+    };
+    let enrichment = scraper.map(|sc| {
+        nexo_marketing::plugin::EnrichmentDeps::new(
+            sc,
+            enrichment_cache.clone(),
+            companies.clone(),
+        )
+    });
+    if enrichment.is_some() {
+        tracing::info!(
+            target: "nexo_marketing",
+            "auto-enrichment ready (scraper + cache + companies)"
+        );
+    }
     let chain = Arc::new(FallbackChain::new(
         vec![Box::new(DisplayNameParser), Box::new(ReplyToReader)],
         0.7,
@@ -221,12 +264,29 @@ async fn main() -> anyhow::Result<()> {
         "audit log ready"
     );
 
+    // ─── Spam / promo filter (per-tenant rules) ────────────────
+    // Migrate the schema on the same identity pool — single
+    // SQLite file per tenant, same model as the enrichment
+    // cache. The cache `Arc` is captured both by the broker hop
+    // (read path) and the admin endpoints (invalidate-on-write
+    // path) so PUT /admin/spam-filter takes effect on the very
+    // next inbound.
+    nexo_marketing::spam_filter::store::migrate(&identity_pool)
+        .await
+        .context("spam_filter migrate")?;
+    let spam_filter_store =
+        nexo_marketing::spam_filter::SpamFilterStore::new(identity_pool.clone());
+    let spam_filter_cache =
+        nexo_marketing::spam_filter::RulesCache::new(spam_filter_store.clone());
+    tracing::info!(tenant = %tenant, "spam filter ready");
+
     let plugin_deps = PluginDeps::new(tenant.clone(), lead_store.clone(), router.clone())
         .with_identity(identity.clone())
         .with_sellers(seller_lookup.clone())
         .with_templates(template_lookup.clone())
         .with_dedup(dedup.clone())
-        .with_audit(audit_log.clone());
+        .with_audit(audit_log.clone())
+        .with_spam_filter(spam_filter_cache.clone());
 
     // ─── Lead lifecycle bus (firehose) ────────────────────────
     // Shared between the broker handler (producer) and the
@@ -334,9 +394,21 @@ async fn main() -> anyhow::Result<()> {
         nexo_marketing::draft::TemplateDraftGenerator::from_handle(
             draft_template_handle.clone(),
         );
+    // Phase 82.10.t.x — wrap the template generator in the
+    // LLM-driven `AgentDraftGenerator`. Reads the seller's
+    // denormalised `system_prompt` + `ModelRef` (stamped by
+    // the operator microapp at PUT-time), builds a multi-turn
+    // chat from `ctx.thread_history`, and calls the daemon's
+    // `complete_llm` plugin RPC. Falls back to the template
+    // generator on any failure path so the operator always
+    // gets a draft to review.
+    let agent_gen = nexo_marketing::draft::AgentDraftGenerator::new(
+        broker_sender_cell.clone(),
+        template_gen,
+    );
     let draft_generator: Arc<
         dyn nexo_marketing::draft::DraftGenerator + Send + Sync,
-    > = Arc::new(template_gen);
+    > = Arc::new(agent_gen);
 
     // ─── Surface 1: HTTP admin ────────────────────────────────
     let mut admin_state_builder = AdminState::new(bearer)
@@ -353,7 +425,8 @@ async fn main() -> anyhow::Result<()> {
         .with_draft_generator(draft_generator)
         .with_draft_template(draft_template_handle.clone())
         .with_persons(persons.clone())
-        .with_companies(companies.clone());
+        .with_companies(companies.clone())
+        .with_spam_filter(spam_filter_cache.clone());
     if let Some(deps) = tracking_deps.clone() {
         admin_state_builder = admin_state_builder
             .with_tracking(deps.clone())
@@ -367,7 +440,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("bind {addr}"))?;
     tracing::info!(%addr, "admin HTTP listening");
-    tokio::spawn(async move {
+    let http_handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!(error = %e, "admin HTTP server crashed");
         }
@@ -385,6 +458,15 @@ async fn main() -> anyhow::Result<()> {
     let broker_dedup = dedup.clone();
     let broker_sender_cell_for_closure = broker_sender_cell.clone();
     let broker_audit = audit_log.clone();
+    // Phase 82.15.bx+ — clone the auto-enrichment triplet for
+    // capture by the broker hop closure. `Option<EnrichmentDeps>`
+    // — `None` keeps today's behaviour when scraper init failed
+    // (network sandbox, e.g.).
+    let broker_enrichment = enrichment.clone();
+    // Spam filter cache: same Arc pair (cache + admin) so a PUT
+    // /admin/spam-filter on the http server invalidates the
+    // entry the broker hop will read on the next inbound.
+    let broker_spam_filter = spam_filter_cache.clone();
     // M15.23.e WA half — tenant resolver dedicated to
     // WhatsApp inbounds. Falls back to the same default
     // tenant the email side uses so single-tenant operators
@@ -432,6 +514,8 @@ async fn main() -> anyhow::Result<()> {
                 let audit_log = broker_audit.clone();
                 let guardrails = broker_guardrails.clone();
                 let whatsapp_resolver = broker_whatsapp_resolver.clone();
+                let enrichment = broker_enrichment.clone();
+                let spam_filter = broker_spam_filter.clone();
                 async move {
                     // M15.39 — single broker subscriber, two
                     // dispatchers. Topic prefix routes between:
@@ -489,6 +573,8 @@ async fn main() -> anyhow::Result<()> {
                         Some(dedup.as_ref()),
                         Some(audit_log.as_ref()),
                         Some(&guardrails),
+                        enrichment.as_ref(),
+                        Some(&spam_filter),
                     )
                     .await;
                 }
@@ -498,6 +584,19 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("plugin stdio loop crashed")?;
 
+    // When the daemon spawns this binary as a real plugin
+    // subprocess, stdin is the plugin contract pipe and
+    // `run_stdio` blocks until the daemon shuts us down. When
+    // a sibling-process launcher (e.g. `scripts/dev-daemon.sh`
+    // backgrounding the binary) has no plugin-contract pipe,
+    // stdin EOFs immediately and `run_stdio` returns Ok(()) —
+    // dropping the spawned HTTP task because main() exits.
+    // Keep the binary alive on the HTTP task so the admin
+    // surface (`/api/marketing/*` proxy target) stays
+    // reachable until something explicitly stops the process.
+    if let Err(e) = http_handle.await {
+        tracing::warn!(error = %e, "admin HTTP task aborted");
+    }
     Ok(())
 }
 

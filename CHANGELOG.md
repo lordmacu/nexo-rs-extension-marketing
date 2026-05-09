@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.27.0 — 2026-05-08 (M15.21 operator-driven mutations + M15.27 SDK lift sweep + boot-stay-alive fix)
+
+### New endpoints
+
+- **`PUT /leads/:lead_id/notes`** — operator scratch pad
+  (M15.21.notes). Body: `{ notes: string | null }`. `null`
+  clears the SQL column; empty string round-trips as
+  `Some("")` so the editor can clear without re-introducing
+  nulls. 5 store-level tests cover round-trip / empty /
+  null-clear / missing-lead-error / cross-tenant isolation.
+- **`POST /leads/:lead_id/followup/override`** — Skip /
+  Postpone bypass (M15.21.followup-override). Tagged-union
+  body: `{ action: "skip" }` or `{ action: "postpone",
+  until_ms }`. `postpone_in_past` (until_ms ≤ now) returns
+  `400`; `lead_not_found` returns `404`. Stamps
+  `AuditEvent::FollowupOverridden` + emits
+  `LeadFirehoseEvent::FollowupOverridden`.
+
+### Wire-shape additions
+
+- `Lead.operator_notes: Option<String>` — free-form markdown
+  per lead, never authored by the LLM. `skip_serializing_if`
+  so existing API consumers don't see the field unless it's
+  set.
+- `Seller.draft_template: Option<String>` — per-seller
+  Handlebars template that overrides the tenant default
+  when non-empty. Empty / whitespace-only inherits.
+- New audit variant `FollowupOverridden`.
+- New firehose variant `FollowupOverridden`.
+
+### Store schema
+
+- `leads` table gains `operator_notes TEXT` column (nullable).
+  Idempotent `ALTER TABLE leads ADD COLUMN operator_notes`
+  for pre-existing DBs.
+
+### Boot reliability
+
+- `main.rs` now awaits the spawned `axum::serve` task after
+  `PluginAdapter::run_stdio()` returns. When the binary is
+  spawned as a sibling process (e.g. via
+  `scripts/dev-daemon.sh`) instead of as a daemon-supervised
+  plugin, stdin EOFs immediately and `run_stdio` returns
+  `Ok(())` — without the explicit join, the spawned HTTP
+  task died with `main()`. Daemon-supervised plugins are
+  unaffected (stdin stays open).
+
+### Draft generator
+
+- `TemplateDraftGenerator` checks `Seller::draft_template`
+  before reaching for the tenant handle. Whitespace-only
+  override falls back to the tenant template; malformed
+  override surfaces the same `TemplateParse` /
+  `TemplateRender` errors.
+
+### M15.27 SDK lift sweep (F29)
+
+Walked every M15.* file in the extension + microapp's
+`src/marketing/`. Added `**F29 sweep:**` doctrine
+annotations to ~30 files distinguishing "marketing-specific
+by design" vs "lifted to SDK feature X". Cero archivos M15
+sin verdict. No new SDK lifts in this round — the candidate
+primitives identified during M15.* (state-machine helper,
+admin-extension HTTP proxy) need a second consumer before
+earning their keep.
+
+### Tests
+
+- 400/400 marketing lib tests pass (3 new draft tests +
+  5 new store tests for operator_notes).
+
 ## 0.13.2 — 2026-05-08 (M15.48 — integration test for live-reload pipelines)
 
 Closes F15. End-to-end coverage for the two `arc_swap`-backed

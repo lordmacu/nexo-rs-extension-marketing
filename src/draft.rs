@@ -1,5 +1,14 @@
 //! M15.21 slice 4 — pluggable draft generation.
 //!
+//! **F29 sweep:** marketing-specific by design. The Handlebars
+//! sandbox + render helpers are already lifted to
+//! `nexo-microapp-sdk::templating::handlebars`; this module is
+//! the CRM-shaped consumer (DraftContext = lead + seller +
+//! last_inbound + operator_hint, per-seller template override
+//! reads `Seller::draft_template`). The trait seam itself
+//! (`DraftGenerator`) is single-consumer today — lifting the
+//! trait shape without a second impl would be premature.
+//!
 //! The operator-facing flow is a pull, not a push: the lead
 //! drawer surfaces a "Generate AI draft" affordance and the
 //! admin endpoint triggers a `DraftGenerator` to produce the
@@ -56,6 +65,16 @@ pub struct DraftContext {
     /// inbound rows yet — placeholder leads + cold outbound
     /// where marketing initiates the conversation.
     pub last_inbound: Option<ThreadMessage>,
+    /// Full chronological history of the thread (oldest first):
+    /// inbound + outbound + previously-approved drafts. The LLM
+    /// generator turns this into a multi-turn prompt so replies
+    /// reflect the entire conversation, not just the latest
+    /// message. Empty when the lead is brand-new. Capped at the
+    /// caller (typically 50 messages) to keep token budget sane;
+    /// older messages get summarised at the call site when
+    /// truncation is needed.
+    #[serde(default)]
+    pub thread_history: Vec<ThreadMessage>,
     /// Optional operator hint passed in the generate request
     /// body. Lets the operator nudge the generator
     /// ("focus on pricing", "mention the demo on Friday")
@@ -229,6 +248,7 @@ pub fn validation_fixture_context() -> serde_json::Value {
         next_check_at_ms: None,
         followup_attempts: 0,
         why_routed: vec!["validation".into()],
+        operator_notes: None,
     };
     let seller = Seller {
         id: SellerId("seller-preview".into()),
@@ -245,6 +265,10 @@ pub fn validation_fixture_context() -> serde_json::Value {
         model_override: None,
         notification_settings: None,
         smtp_credential: None,
+        system_prompt: None,
+        model_provider: None,
+        model_id: None,
+        draft_template: None,
     };
     let inbound = crate::lead::ThreadMessage {
         id: "preview-msg".into(),
@@ -258,7 +282,8 @@ pub fn validation_fixture_context() -> serde_json::Value {
     let ctx = DraftContext {
         lead,
         seller,
-        last_inbound: Some(inbound),
+        last_inbound: Some(inbound.clone()),
+        thread_history: vec![inbound],
         operator_hint: Some("Preview hint".into()),
     };
     serde_json::to_value(&ctx).unwrap_or_else(|_| serde_json::json!({}))
@@ -274,7 +299,15 @@ impl DraftGenerator for TemplateDraftGenerator {
         // reference the same paths the API returns.
         let context = serde_json::to_value(ctx)
             .map_err(|e| DraftGenError::TemplateRender(e.to_string()))?;
-        let body = self.template.load_full();
+        // M15.21.seller-template — per-seller override wins
+        // when set + non-empty. The tenant-level template
+        // (hot-swappable handle) is the fallback. Empty
+        // string is treated as "inherit" so the editor's
+        // clear-to-fall-back UX matches the field semantics.
+        let body = match ctx.seller.draft_template.as_deref() {
+            Some(s) if !s.trim().is_empty() => std::sync::Arc::new(s.to_string()),
+            _ => self.template.load_full(),
+        };
         let rendered = render_handlebars(&body, &context)?;
         let trimmed = rendered.trim();
         if trimmed.is_empty() {
@@ -282,6 +315,231 @@ impl DraftGenerator for TemplateDraftGenerator {
         }
         Ok(rendered)
     }
+}
+
+/// Phase 82.10.t.x — LLM-driven draft generator.
+///
+/// Reads the seller's denormalised `system_prompt` + `ModelRef`
+/// (stamped by the operator microapp at PUT-time from the bound
+/// agent), builds a multi-turn chat from `ctx.thread_history`,
+/// and calls `BrokerSender::complete_llm` so the daemon executes
+/// against its configured providers + secrets. The seller's
+/// `model_override`, when set, beats the agent default.
+///
+/// On any failure path (missing fields, broker unavailable, LLM
+/// error) the generator falls back to the bundled
+/// [`TemplateDraftGenerator`] so the operator always gets a
+/// pending draft to review — the agent draft is a quality
+/// improvement, not a hard gate.
+pub struct AgentDraftGenerator {
+    /// Hot-swap cell that the broker-event handler stores into
+    /// every time the daemon delivers an event. Reading
+    /// `load_full()` at generate time gives us the latest
+    /// sender without locking around a long-lived handle.
+    broker_cell: std::sync::Arc<
+        arc_swap::ArcSwapOption<nexo_microapp_sdk::plugin::BrokerSender>,
+    >,
+    /// Fallback when the broker isn't connected yet (boot race)
+    /// or the LLM call errors.
+    fallback: TemplateDraftGenerator,
+}
+
+impl AgentDraftGenerator {
+    /// Wire at boot. The `broker_cell` is the same `ArcSwapOption`
+    /// the broker-event closure populates; the `fallback` is the
+    /// bundled TemplateDraftGenerator (or any other impl).
+    pub fn new(
+        broker_cell: std::sync::Arc<
+            arc_swap::ArcSwapOption<nexo_microapp_sdk::plugin::BrokerSender>,
+        >,
+        fallback: TemplateDraftGenerator,
+    ) -> Self {
+        Self {
+            broker_cell,
+            fallback,
+        }
+    }
+
+    /// Resolve the (provider, model) the LLM call should target.
+    /// Operator-set `model_override` wins; otherwise the bound
+    /// agent's denormalised `model_provider` + `model_id`. Returns
+    /// `None` when neither is set — caller falls back to the
+    /// template generator.
+    fn resolve_model(seller: &nexo_tool_meta::marketing::Seller) -> Option<(String, String)> {
+        if let Some(over) = seller.model_override.as_ref() {
+            if !over.provider.is_empty() && !over.model.is_empty() {
+                return Some((over.provider.clone(), over.model.clone()));
+            }
+        }
+        match (seller.model_provider.as_ref(), seller.model_id.as_ref()) {
+            (Some(p), Some(m)) if !p.is_empty() && !m.is_empty() => {
+                Some((p.clone(), m.clone()))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[async_trait]
+impl DraftGenerator for AgentDraftGenerator {
+    async fn generate(&self, ctx: &DraftContext) -> Result<String, DraftGenError> {
+        let Some(broker) = self.broker_cell.load_full() else {
+            tracing::warn!(
+                target: "extension.marketing.draft_generate",
+                "broker sender not yet wired; falling back to template generator"
+            );
+            return self.fallback.generate(ctx).await;
+        };
+        let Some((provider, model)) = Self::resolve_model(&ctx.seller) else {
+            tracing::warn!(
+                target: "extension.marketing.draft_generate",
+                seller_id = %ctx.seller.id.0,
+                "seller has no model_override and no denormalised agent ModelRef; falling back to template"
+            );
+            return self.fallback.generate(ctx).await;
+        };
+        let system_prompt = match ctx.seller.system_prompt.as_deref() {
+            Some(s) if !s.trim().is_empty() => Some(build_system_prompt(s, ctx)),
+            _ => Some(build_system_prompt("", ctx)),
+        };
+
+        // Convert thread_history into chat messages.
+        // Inbound  → role "user"
+        // Outbound → role "assistant"
+        // Drafts (any status) → skip — we don't want to
+        //   replay our own pending suggestions back as
+        //   model-authored history.
+        let mut messages: Vec<nexo_llm::types::ChatMessage> = Vec::new();
+        for tm in ctx.thread_history.iter() {
+            let role = match tm.direction {
+                crate::lead::MessageDirection::Inbound => nexo_llm::types::ChatRole::User,
+                crate::lead::MessageDirection::Outbound => {
+                    nexo_llm::types::ChatRole::Assistant
+                }
+                crate::lead::MessageDirection::Draft => continue,
+            };
+            // Compose a brief "From: <label>" prefix on inbound
+            // so the model knows who's writing when the thread
+            // has multiple participants. Outbound bodies stay
+            // unwrapped — the assistant's own past replies.
+            let content = match role {
+                nexo_llm::types::ChatRole::User if !tm.from_label.is_empty() => {
+                    format!("From: {}\n\n{}", tm.from_label, tm.body)
+                }
+                _ => tm.body.clone(),
+            };
+            messages.push(nexo_llm::types::ChatMessage {
+                role,
+                content,
+                tool_call_id: None,
+                name: None,
+                tool_calls: vec![],
+                attachments: vec![],
+            });
+        }
+        // Operator hint goes as a final user-side instruction so
+        // the LLM treats it as guidance about the next reply.
+        if let Some(hint) = ctx.operator_hint.as_deref() {
+            if !hint.trim().is_empty() {
+                messages.push(nexo_llm::types::ChatMessage {
+                    role: nexo_llm::types::ChatRole::User,
+                    content: format!("[Operator hint for this reply]\n{hint}"),
+                    tool_call_id: None,
+                    name: None,
+                    tool_calls: vec![],
+                    attachments: vec![],
+                });
+            }
+        }
+        // Empty thread + no hint — anchor on a single user
+        // message so the model has SOMETHING to reply to.
+        if messages.is_empty() {
+            messages.push(nexo_llm::types::ChatMessage {
+                role: nexo_llm::types::ChatRole::User,
+                content: format!(
+                    "Draft an initial outreach message for this lead. Subject: {}",
+                    ctx.lead.subject
+                ),
+                tool_call_id: None,
+                name: None,
+                tool_calls: vec![],
+                attachments: vec![],
+            });
+        }
+
+        let params = nexo_microapp_sdk::plugin::LlmCompleteParams {
+            provider,
+            model,
+            messages,
+            max_tokens: Some(1024),
+            temperature: Some(0.7),
+            system_prompt,
+        };
+        match broker.complete_llm(params).await {
+            Ok(r) => {
+                let body = r.content.trim();
+                if body.is_empty() {
+                    tracing::warn!(
+                        target: "extension.marketing.draft_generate",
+                        seller_id = %ctx.seller.id.0,
+                        "LLM returned empty body; falling back to template"
+                    );
+                    return self.fallback.generate(ctx).await;
+                }
+                Ok(body.to_string())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "extension.marketing.draft_generate",
+                    seller_id = %ctx.seller.id.0,
+                    error = ?e,
+                    "LLM call failed; falling back to template"
+                );
+                self.fallback.generate(ctx).await
+            }
+        }
+    }
+}
+
+/// Compose a system prompt from the agent's `system_prompt`
+/// (denormalised onto the seller) plus a small marketing
+/// addendum that anchors output style. The addendum is short
+/// on purpose — most of the persona steering (including
+/// language) comes from the agent's own prompt; we only add
+/// constraints specific to the email-reply use case.
+///
+/// All framing strings are English so the codebase stays
+/// consistent with the framework's "code in English" rule;
+/// the agent's `system_prompt` (operator-authored) decides
+/// the output language and tone via its own copy.
+fn build_system_prompt(agent_prompt: &str, ctx: &DraftContext) -> String {
+    let mut out = String::new();
+    if !agent_prompt.trim().is_empty() {
+        out.push_str(agent_prompt.trim());
+        out.push_str("\n\n");
+    }
+    out.push_str(
+        "You are drafting an email reply to a lead. Return ONLY the message \
+         body — no subject line, no headers, no extra signature (the seller's \
+         signature is appended downstream). Keep the tone natural, concise, \
+         and professional. One question or call-to-action per reply. Never \
+         invent prices, exact dates, or commitments the seller would have to \
+         honour. Reply in the same language as the most recent inbound \
+         message unless the agent persona above pins a different language.",
+    );
+    if !ctx.seller.signature_text.is_empty() {
+        out.push_str(&format!(
+            "\n\nSeller signature (do NOT echo this — the system appends it): {}",
+            ctx.seller.signature_text.replace('\n', " | "),
+        ));
+    }
+    if !ctx.lead.topic_tags.is_empty() {
+        out.push_str(&format!(
+            "\n\nThread topic tags: {}.",
+            ctx.lead.topic_tags.join(", "),
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -310,6 +568,7 @@ mod tests {
             next_check_at_ms: None,
             followup_attempts: 0,
             why_routed: vec!["rule:warm-corp".into()],
+            operator_notes: None,
         }
     }
 
@@ -329,6 +588,7 @@ mod tests {
             model_override: None,
             notification_settings: None,
             smtp_credential: None,
+            draft_template: None,
         }
     }
 
@@ -344,6 +604,75 @@ mod tests {
         }
     }
 
+    /// M15.21.seller-template — when the seller carries a
+    /// non-empty `draft_template` override, the renderer uses
+    /// it INSTEAD of the tenant-level handle.
+    #[tokio::test]
+    async fn seller_draft_template_override_wins_over_tenant() {
+        let gen = TemplateDraftGenerator::with_default_template();
+        let mut seller = seller_fixture();
+        seller.draft_template =
+            Some("Solo seller template: {{seller.name}}.".into());
+        let ctx = DraftContext {
+            lead: lead_fixture(),
+            seller,
+            last_inbound: None,
+thread_history: vec![],
+            operator_hint: None,
+        };
+        let body = gen.generate(&ctx).await.unwrap();
+        assert_eq!(body, "Solo seller template: Pedro García.");
+    }
+
+    /// M15.21.seller-template — `Some("")` inherits the tenant
+    /// template (whitespace-only treated the same way) so the
+    /// editor's clear-to-fallback UX behaves predictably.
+    #[tokio::test]
+    async fn seller_empty_draft_template_inherits_tenant() {
+        let gen = TemplateDraftGenerator::with_default_template();
+        let mut seller = seller_fixture();
+        seller.draft_template = Some("   \n   ".into());
+        let ctx = DraftContext {
+            lead: lead_fixture(),
+            seller,
+            last_inbound: Some(inbound_fixture(
+                "¿Cuánto cuesta el plan Pro?",
+                "Juan",
+            )),
+            thread_history: vec![],
+            operator_hint: None,
+        };
+        let body = gen.generate(&ctx).await.unwrap();
+        // Tenant default rendered — operator-friendly fingerprint.
+        assert!(body.contains("Hola Juan,"));
+        assert!(body.contains("Pedro García"));
+    }
+
+    /// M15.21.seller-template — malformed override surfaces
+    /// the same `TemplateParse` / `TemplateRender` errors as a
+    /// malformed tenant template (no special-case bypass).
+    #[tokio::test]
+    async fn seller_draft_template_malformed_surfaces_render_error() {
+        let gen = TemplateDraftGenerator::with_default_template();
+        let mut seller = seller_fixture();
+        seller.draft_template = Some("{{#if".into());
+        let ctx = DraftContext {
+            lead: lead_fixture(),
+            seller,
+            last_inbound: None,
+thread_history: vec![],
+            operator_hint: None,
+        };
+        let err = gen.generate(&ctx).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DraftGenError::TemplateParse(_) | DraftGenError::TemplateRender(_),
+            ),
+            "{err:?}",
+        );
+    }
+
     #[tokio::test]
     async fn default_template_renders_with_full_context() {
         let gen = TemplateDraftGenerator::with_default_template();
@@ -354,6 +683,7 @@ mod tests {
                 "¿Cuánto cuesta el plan Pro?",
                 "Juan",
             )),
+            thread_history: vec![],
             operator_hint: None,
         };
         let body = gen.generate(&ctx).await.unwrap();
@@ -371,6 +701,7 @@ mod tests {
             lead: lead_fixture(),
             seller: seller_fixture(),
             last_inbound: None,
+thread_history: vec![],
             operator_hint: None,
         };
         let body = gen.generate(&ctx).await.unwrap();
@@ -387,6 +718,7 @@ mod tests {
             lead: lead_fixture(),
             seller: seller_fixture(),
             last_inbound: None,
+thread_history: vec![],
             operator_hint: Some("Mencionar la promo de mayo".into()),
         };
         let body = gen.generate(&ctx).await.unwrap();
@@ -403,6 +735,7 @@ mod tests {
             lead: lead_fixture(),
             seller: seller_fixture(),
             last_inbound: None,
+thread_history: vec![],
             operator_hint: None,
         };
         let body = gen.generate(&ctx).await.unwrap();
@@ -423,6 +756,7 @@ mod tests {
             lead: lead_fixture(),
             seller: seller_fixture(),
             last_inbound: None,
+thread_history: vec![],
             operator_hint: None,
         };
         let err = gen.generate(&ctx).await.unwrap_err();
@@ -439,6 +773,7 @@ mod tests {
             lead: lead_fixture(),
             seller: seller_fixture(),
             last_inbound: None,
+thread_history: vec![],
             operator_hint: None,
         };
         let err = gen.generate(&ctx).await.unwrap_err();
@@ -455,6 +790,7 @@ mod tests {
             lead: lead_fixture(),
             seller: seller_fixture(),
             last_inbound: None,
+thread_history: vec![],
             operator_hint: None,
         };
         let body = gen.generate(&ctx).await.unwrap();
@@ -474,6 +810,7 @@ mod tests {
             lead: lead_fixture(),
             seller: seller_fixture(),
             last_inbound: None,
+thread_history: vec![],
             operator_hint: None,
         };
         let err = gen.generate(&ctx).await.unwrap_err();

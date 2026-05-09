@@ -31,6 +31,7 @@ pub mod firehose;
 pub mod healthz;
 pub mod leads;
 pub mod persons;
+pub mod spam_filter;
 pub mod telemetry;
 pub mod tracking;
 
@@ -143,6 +144,11 @@ pub struct AdminState {
     /// only; the company side surfaces 503 when the
     /// operator tries to set a company.
     pub companies: Option<Arc<dyn nexo_microapp_sdk::identity::CompanyStore>>,
+    /// Per-tenant spam / promo filter cache. Same `RulesCache`
+    /// captured by the broker hop at boot — every admin write
+    /// invalidates the cached entry so subsequent inbounds see
+    /// the fresh state. `None` ⇒ `/admin/spam-filter/*` 503s.
+    pub spam_filter: Option<crate::spam_filter::RulesCache>,
 }
 
 impl AdminState {
@@ -165,6 +171,7 @@ impl AdminState {
             persons: None,
             companies: None,
             draft_template: None,
+            spam_filter: None,
         }
     }
 
@@ -346,6 +353,19 @@ impl AdminState {
         self
     }
 
+    /// Wire the shared spam-filter cache. Boot constructs the
+    /// `RulesCache` once and threads it both into `PluginDeps`
+    /// (read path on the broker hop) and into `AdminState`
+    /// (write path that invalidates the cache after PUT/POST/
+    /// DELETE), so admin edits land on the very next inbound.
+    pub fn with_spam_filter(
+        mut self,
+        cache: crate::spam_filter::RulesCache,
+    ) -> Self {
+        self.spam_filter = Some(cache);
+        self
+    }
+
     pub fn lookup_store(&self, tenant_id: &TenantId) -> Option<Arc<LeadStore>> {
         self.stores.get(tenant_id).cloned()
     }
@@ -368,6 +388,16 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route(
             "/leads/:lead_id/transition",
             axum::routing::post(leads::transition_handler),
+        )
+        // M15.21.notes — free-form operator scratch pad.
+        .route(
+            "/leads/:lead_id/notes",
+            axum::routing::put(leads::update_notes_handler),
+        )
+        // M15.21.followup-override — skip / postpone bypass.
+        .route(
+            "/leads/:lead_id/followup/override",
+            axum::routing::post(leads::followup_override_handler),
         )
         .route(
             "/leads/:lead_id/drafts",
@@ -457,6 +487,26 @@ pub fn router(state: Arc<AdminState>) -> Router {
             get(tracking::engagement_handler),
         )
         .route("/audit", get(audit::handler))
+        // Spam / promo filter — tenant-customizable rules +
+        // strictness preset. Read path is cached; writes
+        // invalidate.
+        .route("/spam-filter", get(spam_filter::get_handler))
+        .route(
+            "/spam-filter/config",
+            axum::routing::put(spam_filter::put_config_handler),
+        )
+        .route(
+            "/spam-filter/rules",
+            axum::routing::post(spam_filter::add_rule_handler),
+        )
+        .route(
+            "/spam-filter/rules/:rule_id",
+            axum::routing::delete(spam_filter::delete_rule_handler),
+        )
+        .route(
+            "/spam-filter/test",
+            axum::routing::post(spam_filter::test_handler),
+        )
         // M15.24 — operator dashboard aggregate snapshot.
         .route("/telemetry", get(telemetry::handler))
         .layer(auth_layer);

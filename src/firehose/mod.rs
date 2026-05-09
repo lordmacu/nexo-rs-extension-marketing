@@ -1,5 +1,14 @@
 //! In-process broadcast bus for lead lifecycle events.
 //!
+//! **F29 sweep:** marketing-specific by design.
+//! [`LeadFirehoseEvent`] carries CRM-shaped variants
+//! (`Created` / `ThreadBumped` / `Transitioned` /
+//! `FollowupOverridden`) keyed off `LeadId`. The
+//! `tokio::broadcast` glue around them is 30 LOC of bus
+//! plumbing — already mirrored by the SDK's `events` feature
+//! (which the audit log consumes). Lifting this would
+//! duplicate the SDK's primitive without a second consumer.
+//!
 //! Producers (`crate::plugin::broker`) publish typed
 //! [`LeadFirehoseEvent`] values whenever they touch a lead;
 //! consumers (`crate::admin::firehose` SSE endpoint) subscribe
@@ -67,6 +76,21 @@ pub enum LeadFirehoseEvent {
         at_ms: i64,
         reason: String,
     },
+    /// M15.21.followup-override — operator-driven bypass of
+    /// the followup cadence. `action` is `"skip"` (cancels the
+    /// pending iteration) or `"postpone"` (bumps
+    /// `next_check_at_ms` to a specific timestamp).
+    /// `next_check_at_ms` carries the new value (`None` after
+    /// skip; `Some(ms)` after postpone) so the UI can refresh
+    /// its drawer without an extra REST round-trip.
+    FollowupOverridden {
+        tenant_id: TenantIdRef,
+        lead_id: LeadId,
+        action: String,
+        next_check_at_ms: Option<i64>,
+        reason: String,
+        at_ms: i64,
+    },
 }
 
 impl LeadFirehoseEvent {
@@ -75,7 +99,8 @@ impl LeadFirehoseEvent {
         match self {
             Self::Created { tenant_id, .. }
             | Self::ThreadBumped { tenant_id, .. }
-            | Self::Transitioned { tenant_id, .. } => &tenant_id.0,
+            | Self::Transitioned { tenant_id, .. }
+            | Self::FollowupOverridden { tenant_id, .. } => &tenant_id.0,
         }
     }
 }

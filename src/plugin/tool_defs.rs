@@ -1,6 +1,10 @@
 //! Static [`ToolDef`] catalogue advertised to the daemon in the
 //! `initialize` reply.
 //!
+//! **F29 sweep:** marketing-specific by design. Hand-rolled
+//! `marketing_lead_*` tool catalogue. The `ToolDef` shape
+//! itself lives in `nexo-microapp-sdk::plugin`.
+//!
 //! Sibling pattern of `nexo-rs-plugin-browser/src/tool_defs.rs`:
 //! every tool is hand-rolled here. Adding a tool requires editing
 //! this file + `dispatch.rs` + `nexo-plugin.toml`

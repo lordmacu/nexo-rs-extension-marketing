@@ -3,6 +3,11 @@
 //! `ToolReply / ToolError` surface to the plugin contract's
 //! `Value / ToolInvocationError`.
 //!
+//! **F29 sweep:** marketing-specific by design. Match arms
+//! are CRM tool names (`marketing_lead_*`). Generic match
+//! ToolInvocation → handler primitive lives in
+//! `nexo-microapp-sdk::plugin::PluginAdapter`.
+//!
 //! Sibling pattern of `nexo-rs-plugin-browser/src/dispatch.rs`:
 //! a single match on `tool_name` keeps the routing trivially
 //! auditable. Adding a tool here requires a paired

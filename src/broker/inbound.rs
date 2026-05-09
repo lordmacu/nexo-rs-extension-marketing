@@ -1,5 +1,11 @@
 //! Inbound email decoder.
 //!
+//! **F29 sweep:** marketing-specific by design. Decodes the
+//! email plugin's `InboundEvent` (mail-aware shape) into a
+//! `ParsedInbound` (mail-aware shape) — both ends are
+//! email-domain. RFC 5322 parsing is generic but the wire
+//! shape lives in the framework's `nexo-plugin-email`.
+//!
 //! Subscribes (in the binary; this module is pure) to
 //! `plugin.inbound.email.*` and decodes the email plugin's
 //! `InboundEvent` payload (raw RFC 5322 bytes + IMAP UID +

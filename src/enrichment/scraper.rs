@@ -1,5 +1,12 @@
 //! Corporate domain scraper.
 //!
+//! **F29 sweep:** marketing-specific by design. Cache + fetch
+//! primitives lifted to `nexo-microapp-sdk::enrichment::cache`;
+//! this module is the CRM-shaped consumer (extracts
+//! Organization / company-name / industry signals into
+//! `CompanyEnrichment`). Generic scraping helpers stay in the
+//! SDK; the CRM extractor stays here.
+//!
 //! Fetches `https://<domain>/` (and falls back to `/about`),
 //! extracts company name + industry hints from meta tags and
 //! JSON-LD `Organization` blocks. Concurrency is bounded by a

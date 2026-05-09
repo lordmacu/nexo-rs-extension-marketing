@@ -360,6 +360,7 @@ mod tests {
             model_override: None,
             notification_settings: None,
             smtp_credential: None,
+            draft_template: None,
         }
     }
 
