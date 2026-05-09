@@ -884,6 +884,34 @@ impl LeadStore {
         Ok(row.map(|r| LeadId(r.try_get("lead_id").unwrap_or_default())))
     }
 
+    /// Every outbound rfc_message_id we sent for a lead, newest
+    /// first. Powers per-message engagement views in the lead
+    /// drawer (operator queries each id against the tracking
+    /// store to see opens / clicks for that specific outbound).
+    pub async fn list_outbound_message_ids(
+        &self,
+        lead_id: &LeadId,
+    ) -> Result<Vec<OutboundMessageIdRow>, MarketingError> {
+        let rows = sqlx::query(
+            "SELECT rfc_message_id, thread_id, sent_at_ms \
+             FROM outbound_message_ids \
+             WHERE tenant_id = ? AND lead_id = ? \
+             ORDER BY sent_at_ms DESC",
+        )
+        .bind(self.tenant_id.as_str())
+        .bind(&lead_id.0)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| OutboundMessageIdRow {
+                rfc_message_id: r.try_get("rfc_message_id").unwrap_or_default(),
+                thread_id: r.try_get("thread_id").unwrap_or_default(),
+                sent_at_ms: r.try_get("sent_at_ms").unwrap_or_default(),
+            })
+            .collect())
+    }
+
     /// Idempotent-draft dedup lookup — returns the single
     /// pending draft row whose `signature` matches, or `None`
     /// when no such row exists. Backed by the partial index
@@ -915,6 +943,16 @@ impl LeadStore {
         .await?;
         Ok(row.map(ThreadMessage::from))
     }
+}
+
+/// Row shape for `list_outbound_message_ids`. Surfaces the
+/// minimum the lead-drawer UI needs to enumerate per-message
+/// engagement.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct OutboundMessageIdRow {
+    pub rfc_message_id: String,
+    pub thread_id: String,
+    pub sent_at_ms: i64,
 }
 
 /// Caller-provided message payload for `append_thread_message`.

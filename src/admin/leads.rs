@@ -590,23 +590,85 @@ pub async fn approve_draft_handler(
         .map(|m| m.as_str().to_string())
         .unwrap_or_else(|| format!("outbound-{}", uuid::Uuid::new_v4()));
 
+    // Pre-track the outbound rfc_message_id (compose-flow
+    // parity) so the customer's reply on this specific message
+    // resolves back to THIS lead via outbound_message_ids
+    // even if the reply chain doesn't echo the original
+    // thread_id. Format mirrors compose:
+    // `{lead_id}.{outbound_msg_id}@{seller_domain}`.
+    let seller_domain = seller
+        .primary_email
+        .split_once('@')
+        .map(|(_, d)| d.to_string())
+        .unwrap_or_else(|| "marketing.local".into());
+    let approve_rfc_message_id = format!(
+        "{}.{}@{}",
+        lead.id.0, outbound_msg_id, seller_domain
+    );
+    if let Err(e) = store
+        .record_outbound_message_id(
+            &approve_rfc_message_id,
+            &lead.id,
+            &lead.thread_id,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+    {
+        tracing::warn!(
+            target: "extension.marketing.draft_approve",
+            error = %e,
+            "outbound_message_id persist failed; reply may not thread back to this lead",
+        );
+    }
+
+    // Audit fix #99 — in_reply_to should chain against the
+    // LATEST inbound on the thread, not the original root.
+    // Keeps the recipient's mail client view tidy AND lets
+    // multi-round threads accumulate the references chain
+    // properly per RFC 5322 §3.6.4. Falls back to the lead's
+    // thread_id (the legacy single-element references) when
+    // no inbound row exists yet (cold compose path that hasn't
+    // received a reply).
+    let approve_thread = match store.list_thread(&lead_obj_id).await {
+        Ok(rows) => rows,
+        Err(_) => Vec::new(),
+    };
+    let latest_inbound_id: Option<String> = approve_thread
+        .iter()
+        .rev()
+        .find(|m| m.direction == crate::lead::MessageDirection::Inbound)
+        .map(|m| m.id.clone());
+    let in_reply_to_target = latest_inbound_id
+        .clone()
+        .unwrap_or_else(|| lead.thread_id.clone());
+    // References = thread_root + every subsequent inbound id.
+    // Mail clients walk this list to render the conversation
+    // hierarchy. Keeping it short (max ~10 entries) avoids
+    // header bloat on long threads.
+    let mut references: Vec<String> = vec![lead.thread_id.clone()];
+    for m in approve_thread
+        .iter()
+        .filter(|m| m.direction == crate::lead::MessageDirection::Inbound)
+        .rev()
+        .take(8)
+    {
+        if !references.contains(&m.id) {
+            references.push(m.id.clone());
+        }
+    }
+
     let email = OutboundEmail {
         to: vec![recipient_email],
         cc: vec![],
         bcc: vec![],
         subject,
         body: html_body,
-        // Thread the reply against the original `Message-Id`
-        // when the lead carries one — keeps the thread tidy
-        // in the recipient's mail client.
-        in_reply_to: Some(lead.thread_id.clone()),
-        references: vec![lead.thread_id.clone()],
-        // Approve flow doesn't pre-track its outbound id today;
-        // the email plugin generates one. The legacy thread
-        // already has the customer's Message-Id stored as its
-        // thread_id so reply threading works without the
-        // outbound_message_ids table here.
-        message_id: None,
+        in_reply_to: Some(in_reply_to_target),
+        references,
+        // Pre-supplied so the email plugin honours it verbatim
+        // (lets `outbound_message_ids` resolve replies on this
+        // exact message later).
+        message_id: Some(approve_rfc_message_id.clone()),
     };
     let dispatch_input = DispatchInput {
         thread_id: lead.thread_id.clone(),
@@ -706,6 +768,7 @@ pub async fn approve_draft_handler(
         "status": "approved",
         "topic": topic,
         "outbound_message_id": outbound_msg_id,
+        "rfc_message_id": approve_rfc_message_id,
         "tracking_msg_id": msg_id.map(|m| m.as_str().to_string()),
     }))
 }
