@@ -827,9 +827,76 @@ pub async fn handle_inbound_event(
         };
     }
 
+    // Compose follow-up — when this inbound is a reply to a
+    // CRM-supplied outbound (compose / pre-tracked
+    // approve), `In-Reply-To` echoes the rfc_message_id we
+    // persisted in `outbound_message_ids`. Resolve back to
+    // the originating Lead so the reply threads correctly
+    // even though `parsed.thread_id` was a synthetic seed
+    // (cold compose) that doesn't match the customer's
+    // reply chain.
+    //
+    // Order: tries `in_reply_to` first (the strongest
+    // signal — that's the message the customer hit reply on),
+    // then walks `references` (oldest = root). Match short-
+    // circuits to the LeadUpdated path same as a header-derived
+    // thread match.
+    let mut compose_resolved_lead: Option<nexo_tool_meta::marketing::Lead> = None;
+    if compose_resolved_lead.is_none() {
+        if let Some(irt) = parsed.in_reply_to.as_deref() {
+            if let Ok(Some(lead_id)) = store
+                .find_lead_by_outbound_message_id(irt)
+                .await
+            {
+                if let Ok(Some(lead)) = store.get(&lead_id).await {
+                    compose_resolved_lead = Some(lead);
+                }
+            }
+        }
+    }
+    if compose_resolved_lead.is_none() {
+        for r in parsed.references.iter() {
+            if let Ok(Some(lead_id)) = store
+                .find_lead_by_outbound_message_id(r)
+                .await
+            {
+                if let Ok(Some(lead)) = store.get(&lead_id).await {
+                    compose_resolved_lead = Some(lead);
+                    break;
+                }
+            }
+        }
+    }
+    let resolved_via_compose = compose_resolved_lead.is_some();
+
     // Existing thread short-circuits everything below — fastest
     // path. Resolver + router are skipped because the lead is
-    // already attributed.
+    // already attributed. The compose-resolved lookup above
+    // takes precedence when it matched.
+    if let Some(lead) = compose_resolved_lead.or_else(|| {
+        // Sync-blocking variant — `find_by_thread` returns a
+        // Result we map to Option here for the chain.
+        None
+    }) {
+        tracing::debug!(
+            target: "plugin.marketing.broker",
+            lead_id = %lead.id.0,
+            via_compose = resolved_via_compose,
+            "inbound resolved via compose outbound_message_ids"
+        );
+        let now_ms = Utc::now().timestamp_millis();
+        let _ = store
+            .append_thread_message(
+                &lead.id,
+                inbound_message_from_parsed(&parsed, now_ms),
+            )
+            .await;
+        return HandledOutcome::LeadUpdated {
+            lead_id: lead.id,
+            thread_id: parsed.thread_id,
+        };
+    }
+
     if let Ok(Some(lead)) = store.find_by_thread(&parsed.thread_id).await {
         tracing::debug!(
             target: "plugin.marketing.broker",

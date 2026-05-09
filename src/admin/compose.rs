@@ -245,6 +245,41 @@ pub async fn send_handler(
         .map(|m| m.as_str().to_string())
         .unwrap_or_else(|| format!("outbound-{}", Uuid::new_v4()));
 
+    // RFC 5322 Message-Id we pre-supply so the email plugin
+    // uses it verbatim. The recipient's reply will echo this
+    // id in `In-Reply-To` — the broker hop's reply path
+    // resolves it via `find_lead_by_outbound_message_id` so
+    // the reply threads back to THIS lead instead of creating
+    // a sibling.
+    //
+    // Format: `<{lead_id}.{outbound_msg_id}@{seller_domain}>`
+    // — angle brackets are added by the email plugin's
+    // builder, we store the bare value here.
+    let seller_domain = seller
+        .primary_email
+        .split_once('@')
+        .map(|(_, d)| d.to_string())
+        .unwrap_or_else(|| "marketing.local".into());
+    let rfc_message_id = format!(
+        "{}.{}@{}",
+        lead_id.0, outbound_msg_id, seller_domain
+    );
+    if let Err(e) = store
+        .record_outbound_message_id(
+            &rfc_message_id,
+            &lead_id,
+            &thread_id,
+            now_ms,
+        )
+        .await
+    {
+        tracing::warn!(
+            target: "extension.marketing.compose",
+            error = %e,
+            "outbound_message_id persist failed; reply may not thread back to this lead",
+        );
+    }
+
     // ── Dispatch via OutboundPublisher ──────────────────────
     let email = OutboundEmail {
         to: vec![to_email.clone()],
@@ -255,6 +290,7 @@ pub async fn send_handler(
         // Cold outreach — no thread to reply against.
         in_reply_to: None,
         references: vec![],
+        message_id: Some(rfc_message_id.clone()),
     };
     let dispatch_input = DispatchInput {
         thread_id: thread_id.clone(),
@@ -345,6 +381,7 @@ pub async fn send_handler(
                 "lead_id": lead.id.0,
                 "thread_id": thread_id,
                 "outbound_message_id": outbound_msg_id,
+                "rfc_message_id": rfc_message_id,
                 "tracking_msg_id": tracking_msg_id.map(|m| m.as_str().to_string()),
                 "topic": topic,
             },

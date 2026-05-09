@@ -20,7 +20,7 @@
 
 use serde_json;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -87,6 +87,24 @@ CREATE INDEX IF NOT EXISTS idx_leads_seller_state  ON leads(tenant_id, seller_id
 CREATE INDEX IF NOT EXISTS idx_leads_next_check      ON leads(tenant_id, next_check_at_ms)
     WHERE next_check_at_ms IS NOT NULL;
 
+-- Outbound Message-Id → Lead mapping. Populated by the
+-- compose handler (and any future call site that wants reply
+-- threading) BEFORE the broker hop publishes the outbound.
+-- The broker hop's inbound path queries this on every reply
+-- so the recipient's `In-Reply-To` resolves to the
+-- originating Lead even when the cold-outreach used a
+-- synthetic thread_id.
+CREATE TABLE IF NOT EXISTS outbound_message_ids (
+    tenant_id      TEXT NOT NULL,
+    rfc_message_id TEXT NOT NULL,
+    lead_id        TEXT NOT NULL,
+    thread_id      TEXT NOT NULL,
+    sent_at_ms     INTEGER NOT NULL,
+    PRIMARY KEY (tenant_id, rfc_message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_outbound_msg_ids_lead
+    ON outbound_message_ids(tenant_id, lead_id);
+
 CREATE TABLE IF NOT EXISTS thread_messages (
     tenant_id    TEXT NOT NULL,
     lead_id      TEXT NOT NULL,
@@ -133,6 +151,21 @@ const MIGRATION_SQL_ADD_SUBJECT: &str =
 /// column error is the success signal for fresh installs.
 const MIGRATION_SQL_ADD_OPERATOR_NOTES: &str =
     "ALTER TABLE leads ADD COLUMN operator_notes TEXT";
+
+/// Outbound Message-Id → Lead mapping. New DBs already have it
+/// from `MIGRATION_SQL`; idempotent CREATE for old DBs.
+const MIGRATION_SQL_OUTBOUND_IDS: &str = r#"
+CREATE TABLE IF NOT EXISTS outbound_message_ids (
+    tenant_id      TEXT NOT NULL,
+    rfc_message_id TEXT NOT NULL,
+    lead_id        TEXT NOT NULL,
+    thread_id      TEXT NOT NULL,
+    sent_at_ms     INTEGER NOT NULL,
+    PRIMARY KEY (tenant_id, rfc_message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_outbound_msg_ids_lead
+    ON outbound_message_ids(tenant_id, lead_id);
+"#;
 
 /// Idempotent-draft `signature` column on thread_messages.
 /// Same swallow-duplicate-column discipline as the other
@@ -212,6 +245,10 @@ impl LeadStore {
             }
         }
         sqlx::query(MIGRATION_SQL_ADD_SIGNATURE_INDEX)
+            .execute(&pool)
+            .await?;
+        // Outbound Message-Id mapping table.
+        sqlx::query(MIGRATION_SQL_OUTBOUND_IDS)
             .execute(&pool)
             .await?;
         Ok(Self { pool, tenant_id })
@@ -797,6 +834,54 @@ impl LeadStore {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(ThreadMessage::from).collect())
+    }
+
+    /// Persist a CRM-supplied `Message-Id` so a future inbound
+    /// reply (whose `In-Reply-To` echoes this id) can be
+    /// resolved back to the originating Lead. Idempotent on
+    /// `(tenant_id, rfc_message_id)` — a re-publish of the
+    /// same outbound is a no-op.
+    pub async fn record_outbound_message_id(
+        &self,
+        rfc_message_id: &str,
+        lead_id: &LeadId,
+        thread_id: &str,
+        sent_at_ms: i64,
+    ) -> Result<(), MarketingError> {
+        sqlx::query(
+            "INSERT INTO outbound_message_ids \
+                 (tenant_id, rfc_message_id, lead_id, thread_id, sent_at_ms) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(tenant_id, rfc_message_id) DO NOTHING",
+        )
+        .bind(self.tenant_id.as_str())
+        .bind(rfc_message_id)
+        .bind(&lead_id.0)
+        .bind(thread_id)
+        .bind(sent_at_ms)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Resolve a sender's `In-Reply-To` to the LeadId we
+    /// originally sent. Returns `None` when this message id
+    /// wasn't one of ours (cold inbound from a stranger).
+    /// Strips angle brackets so callers don't have to.
+    pub async fn find_lead_by_outbound_message_id(
+        &self,
+        rfc_message_id: &str,
+    ) -> Result<Option<LeadId>, MarketingError> {
+        let trimmed = rfc_message_id.trim_matches(|c| c == '<' || c == '>');
+        let row = sqlx::query(
+            "SELECT lead_id FROM outbound_message_ids \
+             WHERE tenant_id = ? AND rfc_message_id = ?",
+        )
+        .bind(self.tenant_id.as_str())
+        .bind(trimmed)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| LeadId(r.try_get("lead_id").unwrap_or_default())))
     }
 
     /// Idempotent-draft dedup lookup — returns the single

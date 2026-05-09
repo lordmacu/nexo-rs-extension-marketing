@@ -251,6 +251,7 @@ async fn assert_7_outbound_publisher_idempotency_is_per_publisher() {
             body: format!("body {}", uuid::Uuid::new_v4()),
             in_reply_to: None,
             references: vec![],
+            message_id: None,
         },
     };
 

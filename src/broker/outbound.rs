@@ -41,6 +41,15 @@ pub struct OutboundEmail {
     pub in_reply_to: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<String>,
+    /// Optional pre-generated RFC 5322 `Message-Id` (with or
+    /// without angle brackets). When the marketing extension
+    /// sets this, the email plugin honours it verbatim instead
+    /// of generating its own. Lets compose persist the id to
+    /// the `outbound_message_ids` table BEFORE send so the
+    /// recipient's reply (which echoes our id in
+    /// `In-Reply-To`) threads back to the originating Lead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 }
 
 /// Per-call inputs the publisher needs to compose the
@@ -178,6 +187,7 @@ mod tests {
                 body: body.into(),
                 in_reply_to: Some("abc-001@acme.com".into()),
                 references: vec!["abc-001@acme.com".into()],
+                message_id: None,
             },
         }
     }

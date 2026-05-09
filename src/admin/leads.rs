@@ -601,6 +601,12 @@ pub async fn approve_draft_handler(
         // in the recipient's mail client.
         in_reply_to: Some(lead.thread_id.clone()),
         references: vec![lead.thread_id.clone()],
+        // Approve flow doesn't pre-track its outbound id today;
+        // the email plugin generates one. The legacy thread
+        // already has the customer's Message-Id stored as its
+        // thread_id so reply threading works without the
+        // outbound_message_ids table here.
+        message_id: None,
     };
     let dispatch_input = DispatchInput {
         thread_id: lead.thread_id.clone(),
