@@ -44,7 +44,25 @@ use nexo_tool_meta::marketing::{
     PersonInferred, SellerId, TenantIdRef,
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+/// Audit fix #12 — deterministic CompanyId derived from
+/// `(tenant_id, domain)` so concurrent scrapes of the same
+/// domain compute the SAME id. The `SqliteCompanyStore::upsert`
+/// path keys ON CONFLICT(tenant_id, id) DO UPDATE; with a
+/// stable id, two simultaneous upserts coalesce into one row
+/// instead of racing two distinct UUIDs to two dup rows.
+fn deterministic_company_id(tenant_id: &str, domain: &str) -> CompanyId {
+    let mut h = Sha256::new();
+    h.update(tenant_id.as_bytes());
+    h.update(b"|");
+    h.update(domain.to_lowercase().as_bytes());
+    let hex = format!("{:x}", h.finalize());
+    // First 32 hex chars (128 bits) is plenty for collision
+    // resistance within a single tenant's company namespace.
+    CompanyId(format!("co-{}", &hex[..32]))
+}
 
 use crate::broker::inbound::{decode_inbound_email, ParseError, ParsedInbound};
 use crate::firehose::{LeadEventBus, LeadFirehoseEvent};
@@ -481,31 +499,67 @@ async fn maybe_link_company_via_enrichment(
         let scraped = match scraper.scrape_domain(&domain_owned).await {
             Ok(p) => p,
             Err(e) => {
+                // Audit fix #11 — TTL by error class so a
+                // transient hiccup doesn't lock the domain out
+                // for 30 days. Categories:
+                //
+                //   BlockedByRobots          → 7d
+                //   UpstreamFailed 5xx       → 1d (server hiccup)
+                //   UpstreamFailed 4xx       → 30d (won't change)
+                //   Http (DNS / connect)     → 6h
+                //   NoSignals (parsed empty) → 30d
+                //   Config (operator bug)    → 1h, also re-tries
+                //
+                // The cached payload carries `failed_kind` +
+                // `retry_after_ms` so an operator dashboard can
+                // surface "domain X retries on Y date" without
+                // knowing the per-class table.
+                use crate::enrichment::ScraperError as SE;
+                const HOUR: i64 = 60 * 60 * 1000;
+                const DAY: i64 = 24 * HOUR;
+                let (failure_ttl_ms, kind_label) = match &e {
+                    SE::BlockedByRobots => (7 * DAY, "robots_blocked"),
+                    SE::UpstreamFailed { status } if *status >= 500 => {
+                        (DAY, "upstream_5xx")
+                    }
+                    SE::UpstreamFailed { .. } => (30 * DAY, "upstream_4xx"),
+                    SE::Http(_) => (6 * HOUR, "network"),
+                    SE::NoSignals => (30 * DAY, "no_signals"),
+                    SE::Config(_) => (HOUR, "scraper_config"),
+                };
+                let now_ms = Utc::now().timestamp_millis();
                 tracing::info!(
                     target: "plugin.marketing.broker",
                     error = %e,
                     domain = %domain_owned,
-                    "scraper failed; caching empty record so we don't retry on every inbound"
+                    failure_kind = kind_label,
+                    retry_after_hours = failure_ttl_ms / HOUR,
+                    "scraper failed; caching with class-specific TTL"
                 );
-                // Cache an empty entry so a 30-day window of
-                // inbounds from this domain doesn't hammer a
-                // dead site. Operator can `invalidate` to retry.
-                let payload = serde_json::json!({"failed": true}).to_string();
+                let payload = serde_json::json!({
+                    "failed": true,
+                    "failed_kind": kind_label,
+                    "retry_after_ms": now_ms + failure_ttl_ms,
+                })
+                .to_string();
                 let _ = cache
-                    .put(
-                        &tenant,
-                        &domain_owned,
-                        &payload,
-                        ttl_ms,
-                        None,
-                        Utc::now().timestamp_millis(),
-                    )
+                    .put(&tenant, &domain_owned, &payload, failure_ttl_ms, None, now_ms)
                     .await;
                 return None;
             }
         };
+        // Audit fix #12 — deterministic id from
+        // sha256(tenant | domain) so two concurrent scrapes of
+        // the same domain compute the SAME id and the
+        // SqliteCompanyStore's `ON CONFLICT(tenant_id, id) DO
+        // UPDATE` collapses them into one row instead of
+        // racing two distinct UUIDs to two duplicate rows.
+        // Pre-existing dups (from the pre-fix era) stay until
+        // the operator dedupes manually; this prevents NEW
+        // dups from accumulating.
+        let company_id = deterministic_company_id(&tenant, &domain_owned);
         let company = Company {
-            id: CompanyId(format!("co-{}", Uuid::new_v4())),
+            id: company_id,
             tenant_id: TenantIdRef(tenant.clone()),
             domain: domain_owned.clone(),
             name: scraped.name.clone().unwrap_or_else(|| domain_owned.clone()),
@@ -653,6 +707,40 @@ pub async fn handle_inbound_event(
             return HandledOutcome::DecodeFailed(e.to_string());
         }
     };
+
+    // Audit fix #14 — disposable senders now honor the
+    // tenant's `spam_filter.allow_domains` override list. By
+    // default disposable still drops, but the operator can
+    // rescue a flagged domain by adding it to the allow list
+    // (e.g. a SaaS vendor whose domain happens to look
+    // disposable to the SDK's classifier).
+    if parsed.from_domain_kind == DomainKind::Disposable {
+        let domain = parsed.from_email.split_once('@').map(|(_, d)| d.to_string());
+        let allowed = match (spam_filter, domain.as_ref()) {
+            (Some(cache), Some(d)) => {
+                let now_ms = Utc::now().timestamp_millis();
+                let rules = cache.get_or_load(tenant_id.as_str(), now_ms).await;
+                rules.allow_domains.contains(d) || rules.allow_senders.contains(&parsed.from_email)
+            }
+            _ => false,
+        };
+        if !allowed {
+            tracing::info!(
+                target: "plugin.marketing.broker",
+                from = %parsed.from_email,
+                "dropped disposable sender post-decode"
+            );
+            return HandledOutcome::DecodeFailed(format!(
+                "disposable: {}",
+                parsed.from_email
+            ));
+        }
+        tracing::info!(
+            target: "plugin.marketing.broker",
+            from = %parsed.from_email,
+            "disposable sender rescued by tenant allow rule"
+        );
+    }
 
     // Audit fix #5 — unsubscribe detector. Runs BEFORE the
     // existing-thread short-circuit so a customer replying

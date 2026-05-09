@@ -8,4 +8,4 @@
 
 pub mod scraper;
 
-pub use scraper::{ScrapedPage, Scraper, ScraperConfig};
+pub use scraper::{ScrapedPage, Scraper, ScraperConfig, ScraperError};

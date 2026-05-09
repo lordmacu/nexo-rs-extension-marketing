@@ -98,9 +98,13 @@ pub fn decode_inbound_email(
         .filter(|s| !s.is_empty());
 
     let from_kind = classify(&from_email);
-    if from_kind == DomainKind::Disposable {
-        return Err(ParseError::DisposableSender(from_email));
-    }
+    // Audit fix #14 — disposable short-circuit moved to the
+    // broker hop so the operator's tenant-level
+    // `spam_filter.allow_domains` rescue list applies. Decode
+    // remains a pure parse; downstream caller checks
+    // `parsed.from_domain_kind == Disposable` and decides what
+    // to do with the override list in hand.
+    let _ = from_kind; // keep classify() side effect chain
 
     // To addresses.
     let to_emails: Vec<String> = msg
@@ -143,12 +147,20 @@ pub fn decode_inbound_email(
         .unwrap_or_default();
     let body_excerpt = body_excerpt.chars().take(2_000).collect::<String>();
 
+    // Audit fix #13 — pass the message Date header as a
+    // day-bucket disambiguator so two unrelated emails from
+    // the same sender with identical subject ("Hola") on
+    // different days don't collapse into the same synthetic
+    // thread. `mail-parser` exposes Date as a unix timestamp;
+    // fall through to 0 (no bucket) when the header is missing.
+    let date_unix = msg.date().map(|d| d.to_timestamp()).unwrap_or(0);
     let thread_id = derive_thread_id(
         message_id.as_deref(),
         in_reply_to.as_deref(),
         &references,
         &from_email,
         &subject,
+        date_unix,
     );
 
     Ok(ParsedInbound {
@@ -240,6 +252,7 @@ fn derive_thread_id(
     references: &[String],
     from_email: &str,
     subject: &str,
+    date_unix: i64,
 ) -> String {
     // Standard email threading: the first message in a thread
     // is its own root. Replies inherit the root from
@@ -260,7 +273,23 @@ fn derive_thread_id(
     // same subject thread together; two unrelated cold leads
     // get distinct synthetic ids (the previous fallback
     // collapsed every orphan into `"thread-orphan"`).
-    crate::threading::synth_thread_id(from_email, subject)
+    //
+    // Audit fix #13 — append a day-bucket so the same sender
+    // sending the same subject ("Hola") on different days
+    // doesn't end up in one giant cross-day thread. Same-day
+    // continuation without RFC headers (broken mailer)
+    // continues to thread because both messages hash to the
+    // same bucket. `date_unix == 0` skips the suffix so
+    // mail-parser failure to extract a Date doesn't change
+    // the legacy behaviour for those rare messages.
+    let base = crate::threading::synth_thread_id(from_email, subject);
+    if date_unix > 0 {
+        const SECONDS_PER_DAY: i64 = 86_400;
+        let day_bucket = date_unix / SECONDS_PER_DAY;
+        format!("{base}-{day_bucket}")
+    } else {
+        base
+    }
 }
 
 fn strip_html(html: &str) -> String {
@@ -382,11 +411,21 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert_eq!(p.thread_id, "abc-001@acme.com");
     }
 
+    /// Audit fix #14 — the disposable short-circuit moved to
+    /// the broker hop so the operator's allow-list rescue
+    /// applies. Decode now returns `Ok(_)` with
+    /// `from_domain_kind = Disposable` and the broker hop
+    /// decides whether to drop or honor an allow rule.
     #[test]
-    fn decode_disposable_returns_typed_error_pre_pipeline() {
-        let err = decode_inbound_email("acme-ventas", "ventas", 1, &fixture_disposable())
-            .unwrap_err();
-        assert!(matches!(err, ParseError::DisposableSender(_)));
+    fn decode_disposable_now_succeeds_with_disposable_kind() {
+        let parsed = decode_inbound_email(
+            "acme-ventas",
+            "ventas",
+            1,
+            &fixture_disposable(),
+        )
+        .expect("decode no longer errors on disposable; broker hop decides");
+        assert_eq!(parsed.from_domain_kind, DomainKind::Disposable);
     }
 
     #[test]
