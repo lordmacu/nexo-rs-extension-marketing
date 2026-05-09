@@ -1248,6 +1248,16 @@ pub async fn generate_draft_handler(
         .as_deref()
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
+    // Lock key includes tenant so two tenants with the same
+    // signature space don't serialize against each other.
+    let lock_key = format!("{}|{}", tenant_id.as_str(), signature);
+    // Acquire ONLY on the cache-targetable path (no operator
+    // hint). Hint-driven calls bypass lock + cache by design.
+    let _draft_lock = if hint_present {
+        None
+    } else {
+        Some(state.draft_locks.acquire(&lock_key).await)
+    };
     if !hint_present {
         match store
             .find_pending_draft_by_signature(&lead_obj_id, &signature)

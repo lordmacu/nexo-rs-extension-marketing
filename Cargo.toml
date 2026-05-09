@@ -45,6 +45,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # the crate works without /usr/share/zoneinfo present.
 chrono-tz = { version = "0.10", features = ["serde"] }
 uuid   = { version = "1", features = ["v4", "v5", "serde"] }
+# Jitter on follow-up scheduling so cron ticks don't see
+# clusters of leads becoming due at the exact same millisecond.
+rand   = "0.8"
 
 # Error handling + observability
 anyhow    = "1"

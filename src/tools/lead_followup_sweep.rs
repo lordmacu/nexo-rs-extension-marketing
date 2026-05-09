@@ -26,13 +26,26 @@ struct Args {
     #[serde(default)]
     now_ms: Option<i64>,
     /// Cap so a swamped tenant doesn't blow the cron tick.
+    /// Operates as a soft limit — the tool returns up to this
+    /// many leads + a `more_due` flag the agent runtime uses
+    /// to schedule the next tick early.
     #[serde(default = "default_limit")]
     limit: u32,
 }
 
 fn default_limit() -> u32 {
-    100
+    25
 }
+
+/// Suggested gap between this tick and the next when there are
+/// still leads queued. Lets the agent runtime spread a burst
+/// across multiple ticks so the LLM provider doesn't see N
+/// concurrent calls fired at the same instant — combines with
+/// the per-lead jitter on `next_check_at_ms` to keep load smooth.
+const NEXT_TICK_HINT_MS_WHEN_BACKLOG: i64 = 30_000;
+/// Default cadence hint when nothing is due — lets the agent
+/// runtime back off to a slower schedule.
+const NEXT_TICK_HINT_MS_WHEN_IDLE: i64 = 300_000;
 
 pub async fn handle(
     expected_tenant: &TenantId,
@@ -48,15 +61,35 @@ pub async fn handle(
         })));
     }
     let now = parsed.now_ms.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-    let due = store
-        .list_due_for_followup(now, parsed.limit)
+    // Pull `limit + 1` so we know whether there's more queued
+    // beyond the cap. We trim the extra row before returning;
+    // its presence flips `more_due` to surface "schedule next
+    // tick sooner" to the agent runtime.
+    let pull_limit = parsed.limit.saturating_add(1);
+    let mut due = store
+        .list_due_for_followup(now, pull_limit)
         .await
         .map_err(|e| ToolError::Internal(e.to_string()))?;
+    let more_due = due.len() as u32 > parsed.limit;
+    if more_due {
+        due.truncate(parsed.limit as usize);
+    }
+    let next_tick_hint_ms = if more_due {
+        NEXT_TICK_HINT_MS_WHEN_BACKLOG
+    } else {
+        NEXT_TICK_HINT_MS_WHEN_IDLE
+    };
     Ok(ToolReply::ok_json(serde_json::json!({
         "ok": true,
         "result": {
             "due": due,
             "now_ms": now,
+            // Spreading hints — let the agent runtime decide
+            // when to fire next sweep without hardcoding a
+            // schedule on the agent side.
+            "more_due": more_due,
+            "next_tick_hint_ms": next_tick_hint_ms,
+            "limit_applied": parsed.limit,
         }
     })))
 }
@@ -174,6 +207,27 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(r.as_value()["result"]["due"].as_array().unwrap().len(), 2);
+        let v = r.as_value();
+        assert_eq!(v["result"]["due"].as_array().unwrap().len(), 2);
+        // Backlog signal: 3 more queued beyond the limit.
+        assert_eq!(v["result"]["more_due"], true);
+        assert_eq!(v["result"]["next_tick_hint_ms"], NEXT_TICK_HINT_MS_WHEN_BACKLOG);
+        assert_eq!(v["result"]["limit_applied"], 2);
+    }
+
+    #[tokio::test]
+    async fn signals_idle_hint_when_no_backlog() {
+        let s = store_with_due_lead(100).await;
+        let r = handle(
+            &TenantId::new("acme").unwrap(),
+            s,
+            serde_json::json!({ "tenant_id": "acme", "now_ms": 500, "limit": 25 }),
+        )
+        .await
+        .unwrap();
+        let v = r.as_value();
+        assert_eq!(v["result"]["due"].as_array().unwrap().len(), 1);
+        assert_eq!(v["result"]["more_due"], false);
+        assert_eq!(v["result"]["next_tick_hint_ms"], NEXT_TICK_HINT_MS_WHEN_IDLE);
     }
 }

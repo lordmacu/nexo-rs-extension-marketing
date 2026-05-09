@@ -149,6 +149,14 @@ pub struct AdminState {
     /// invalidates the cached entry so subsequent inbounds see
     /// the fresh state. `None` ⇒ `/admin/spam-filter/*` 503s.
     pub spam_filter: Option<crate::spam_filter::RulesCache>,
+    /// In-memory coalescing lock keyed by draft signature
+    /// (option **J**). Two concurrent generate requests for
+    /// the same signature serialize on this lock; the second
+    /// re-checks the DB after acquiring + finds the freshly
+    /// persisted draft → returns cached. Always wired (cheap
+    /// when unused) so handler tests don't have to thread an
+    /// `Option` through.
+    pub draft_locks: crate::draft_lock::DraftLockMap,
 }
 
 impl AdminState {
@@ -172,6 +180,7 @@ impl AdminState {
             companies: None,
             draft_template: None,
             spam_filter: None,
+            draft_locks: crate::draft_lock::DraftLockMap::new(),
         }
     }
 

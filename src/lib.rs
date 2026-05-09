@@ -26,6 +26,7 @@ pub mod broker;
 pub mod compliance;
 pub mod config;
 pub mod draft;
+pub mod draft_lock;
 pub mod duplicate;
 pub mod enrichment;
 pub mod error;

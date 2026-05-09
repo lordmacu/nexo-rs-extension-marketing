@@ -15,6 +15,14 @@ use nexo_tool_meta::marketing::{LeadId, TenantIdRef};
 use crate::lead::LeadStore;
 use crate::tenant::TenantId;
 
+/// Default jitter window applied to scheduled followups so a
+/// burst of identical-cadence followups doesn't all become due
+/// at the same millisecond and overwhelm the next cron tick.
+/// 60 seconds is wide enough to spread out a typical 50-lead
+/// burst across a single 5-min sweep window without delaying
+/// any individual followup meaningfully.
+const DEFAULT_JITTER_WINDOW_MS: u32 = 60_000;
+
 #[derive(Debug, Deserialize)]
 struct Args {
     tenant_id: TenantIdRef,
@@ -27,6 +35,12 @@ struct Args {
     /// "client replied, cancel pending followup".
     #[serde(default)]
     increment_attempts: bool,
+    /// Optional override for the jitter window the store
+    /// applies before persist. Default = 60 s. Pass `0` to
+    /// disable jitter entirely (useful when the agent picks an
+    /// exact time intentionally — a meeting reminder, e.g.).
+    #[serde(default)]
+    jitter_window_ms: Option<u32>,
 }
 
 pub async fn handle(
@@ -43,11 +57,15 @@ pub async fn handle(
             "error": { "code": "tenant_unauthorised" }
         })));
     }
+    let jitter = parsed
+        .jitter_window_ms
+        .unwrap_or(DEFAULT_JITTER_WINDOW_MS);
     let updated = store
-        .set_next_check(
+        .set_next_check_with_jitter(
             &parsed.lead_id,
             parsed.next_check_at_ms,
             parsed.increment_attempts,
+            jitter,
         )
         .await
         .map_err(|e| ToolError::Internal(e.to_string()))?;
@@ -97,6 +115,10 @@ mod tests {
                 "lead_id": "l1",
                 "next_check_at_ms": 12345,
                 "increment_attempts": true,
+                // Disable jitter so the assertion can compare
+                // exactly. Production callers leave this unset
+                // and pick up the 60 s default.
+                "jitter_window_ms": 0,
             }),
         )
         .await
@@ -105,6 +127,31 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["result"]["next_check_at_ms"], 12345);
         assert_eq!(v["result"]["followup_attempts"], 1);
+    }
+
+    #[tokio::test]
+    async fn applies_jitter_within_window() {
+        let s = fresh_store("acme").await;
+        let r = handle(
+            &TenantId::new("acme").unwrap(),
+            s.clone(),
+            serde_json::json!({
+                "tenant_id": "acme",
+                "lead_id": "l1",
+                "next_check_at_ms": 1_700_000_000_000_i64,
+                "increment_attempts": false,
+                "jitter_window_ms": 60_000,
+            }),
+        )
+        .await
+        .unwrap();
+        let v = r.as_value();
+        let got = v["result"]["next_check_at_ms"].as_i64().unwrap();
+        // Within ±30 s of base.
+        assert!(
+            (1_699_999_970_000..=1_700_000_030_000).contains(&got),
+            "expected jitter inside ±30s, got {got}"
+        );
     }
 
     #[tokio::test]

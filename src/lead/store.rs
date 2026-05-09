@@ -323,6 +323,42 @@ impl LeadStore {
             .ok_or_else(|| MarketingError::Sqlite(sqlx::Error::RowNotFound))
     }
 
+    /// Apply uniform jitter inside `[-window/2, +window/2]` to a
+    /// timestamp. Pure-fn over an injectable RNG so tests stay
+    /// deterministic. Used by [`set_next_check_with_jitter`] to
+    /// spread cron-driven followup ticks across a window so a
+    /// burst of inbound traffic doesn't end up with N leads
+    /// becoming due at the exact same millisecond.
+    pub fn jitter_timestamp_ms<R: rand::Rng>(
+        base_ms: i64,
+        window_ms: u32,
+        rng: &mut R,
+    ) -> i64 {
+        if window_ms == 0 {
+            return base_ms;
+        }
+        let half = window_ms as i64 / 2;
+        let offset = rng.gen_range(-half..=half);
+        base_ms.saturating_add(offset)
+    }
+
+    /// Convenience over `set_next_check` that applies uniform
+    /// jitter inside `[-window/2, +window/2]` ms before persist.
+    /// `window_ms = 0` short-circuits to the exact value (used
+    /// by operator-postpone where the timestamp is intentional).
+    pub async fn set_next_check_with_jitter(
+        &self,
+        lead_id: &LeadId,
+        next_check_at_ms: Option<i64>,
+        increment_attempts: bool,
+        jitter_window_ms: u32,
+    ) -> Result<Lead, MarketingError> {
+        let jittered = next_check_at_ms.map(|t| {
+            Self::jitter_timestamp_ms(t, jitter_window_ms, &mut rand::thread_rng())
+        });
+        self.set_next_check(lead_id, jittered, increment_attempts).await
+    }
+
     /// Set / clear the next followup deadline. Pass `None` to
     /// cancel the followup (e.g. client replied + `stop_on_reply`
     /// was true).
@@ -1057,6 +1093,41 @@ mod tests {
     async fn fresh_store(t: &str) -> LeadStore {
         let tenant = TenantId::new(t).unwrap();
         LeadStore::open(PathBuf::from(":memory:"), tenant).await.unwrap()
+    }
+
+    #[test]
+    fn jitter_zero_window_returns_base() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+        let got = LeadStore::jitter_timestamp_ms(100, 0, &mut rng);
+        assert_eq!(got, 100);
+    }
+
+    #[test]
+    fn jitter_stays_within_window() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        for _ in 0..100 {
+            let got = LeadStore::jitter_timestamp_ms(1_000_000, 1000, &mut rng);
+            assert!((1_000_000 - 500..=1_000_000 + 500).contains(&got),
+                "jittered value {got} outside ±500 of base 1_000_000");
+        }
+    }
+
+    #[test]
+    fn jitter_actually_distributes() {
+        use rand::SeedableRng;
+        // Sanity: 100 jitter applications must produce at least
+        // 20 distinct values inside a 1000 ms window. Catches a
+        // future regression where the helper accidentally
+        // returns the base unchanged.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let v = LeadStore::jitter_timestamp_ms(1_000_000, 1000, &mut rng);
+            seen.insert(v);
+        }
+        assert!(seen.len() > 20, "jitter too clustered: {} distinct values", seen.len());
     }
 
     fn input(id: &str, person: &str, seller: &str) -> NewLead {
